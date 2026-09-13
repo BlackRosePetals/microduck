@@ -24,8 +24,11 @@
 //!
 //! The candidate contact points — the "sole corners" — are an [`AnchorSet`],
 //! sampled on the sole mesh by `microduck_rl/scripts/odom_anchor_points.py`
-//! (see [`anchors`]). [`Odometry::alpha`] still uses the legacy v1.5 bbox
-//! ([`V15`]) until the alpha sets have been compared against it.
+//! (see [`anchors`]). [`Odometry::alpha`] uses [`ALPHA16`], a 4x4 grid over
+//! the whole sole on the mesh: in the MuJoCo twin over a 3.2 m walk it drifted
+//! 9 mm where the legacy v1.5 bbox ([`V15`]) drifted 17 mm and the flat
+//! patch's four corners ([`ALPHA4`]) 16 mm, and it stands at the true height
+//! (V15 sat 3.7 mm high). The scan costs about half a microsecond more.
 
 mod anchors;
 
@@ -97,10 +100,9 @@ impl Odometry {
         }
     }
 
-    /// The alpha robot with the legacy [`V15`] corners — today's production
-    /// estimator.
+    /// The alpha robot with the [`ALPHA16`] grid — the production estimator.
     pub fn alpha() -> Self {
-        Self::new(Model::alpha(), &V15)
+        Self::new(Model::alpha(), &ALPHA16)
     }
 
     /// The alpha robot with a chosen anchor set.
