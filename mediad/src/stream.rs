@@ -1,17 +1,18 @@
 //! Frames out to a WebSocket **this robot dials**, for a Space that runs a model on them.
 //!
-//! # Why the robot dials, and why that is the whole idea
+//! # This is the fallback, and WebRTC is the default
 //!
-//! The goal is a Space on Hugging Face hardware processing this camera. The obvious route is the
-//! one `vision-demo` takes — a WebRTC consumer pulls the stream through the rendezvous — and it
-//! runs into the one thing WebRTC cannot do without help: a robot behind a home router and a
-//! container behind a data centre's NAT need a **relay candidate** to pair
-//! (`remote-access-design.md` §6). Signalling crosses; media needs somebody's relay.
+//! **A consumer should use WebRTC**, which carries encrypted media, a control channel on the same
+//! session and a return path, and which reaches a data centre because the robot offers a relay
+//! candidate (`remote-access-design.md` §6). `docs/faq.md` is the decision, in the shape somebody
+//! arrives at it. This module is for the narrow case WebRTC serves badly: a **program** consuming
+//! **frames only** on a **long-running** stream, where a relay's metered bandwidth is the cost
+//! that matters.
 //!
-//! An outbound WebSocket needs nobody's. **The robot already proves this every second it is
-//! reachable**: `relay.rs` holds an outbound HTTPS stream to a Space right now, and nothing about
-//! a home router objects. So the frames go the same way the registration does — outward — and NAT
-//! stops being a participant.
+//! In that case an outbound WebSocket needs nobody's relay. **The robot already proves this every
+//! second it is reachable**: `relay.rs` holds an outbound HTTPS stream to a Space right now, and
+//! nothing about a home router objects. So the frames go the same way the registration does —
+//! outward — and NAT stops being a participant.
 //!
 //! ```text
 //!   Space  ──media.stream {url: "wss://…/frames"}──►  rendezvous  ──►  this robot
@@ -22,18 +23,19 @@
 //! this scale where relaying payload through a shared service would not: one small envelope per
 //! session, on a service the mini fleet also depends on, and the bytes go point to point.
 //!
-//! **This is not a workaround for a relay that does not exist**, and it used to read like one.
-//! `turn.rs` offers relay candidates and they work. The argument above is the argument either
-//! way: a relay is metered per Hugging Face account, so every one of these frames would be spent
-//! against an allowance (§6: 10 GB a month) that the robot's owner also needs for being
-//! *watched* — and the shortest path between a board and a data centre is not through a third
-//! one. A relay is the fallback for a session that cannot be made direct. This one can.
+//! **This was written when the relay endpoint was dead and WebRTC could not connect from a data
+//! centre at all.** That is fixed (§6), so the reason this exists is now the narrow one above and
+//! not "the alternative does not work". What survives of the original argument is the cost: a
+//! relay is metered per Hugging Face account at 10 GB a month, and a stream that runs all day
+//! spends an allowance its owner also needs for being *watched*.
 //!
 //! # What it is not
 //!
-//! Not a replacement for a relay candidate in general. There is no return media path, so nothing
-//! here helps a browser *watch* a robot, carries audio, or closes a teleop loop — a viewer wants
-//! WebRTC and §6 is still what it needs. This is for the case where the consumer is a program.
+//! **Not a replacement for WebRTC, and not the path to reach for first.** There is no return
+//! media path and no control channel, so nothing here helps a browser *watch* a robot, carries
+//! audio, or closes a teleop loop; driving means a separate JSON-RPC call over the rendezvous.
+//! Encryption is the receiver's TLS rather than DTLS-SRTP, terminating at a server instead of at
+//! the peer. A consumer that is not all three of program, frames-only and long-running wants §6.
 //!
 //! # This half is portable, and that is deliberate
 //!
