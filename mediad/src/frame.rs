@@ -313,7 +313,7 @@ mod tests {
     #[tokio::test]
     async fn invalid_utf8_gets_a_parse_error() {
         let (mut client, server) = UnixStream::pair().unwrap();
-        let task = tokio::spawn(handle(server, Frames::default()));
+        let task = tokio::spawn(handle(server, Frames::default(), 90));
         client.write_all(&[255, b'\n']).await.unwrap();
         let mut line = String::new();
         BufReader::new(client).read_line(&mut line).await.unwrap();
@@ -449,7 +449,7 @@ mod tests {
     #[tokio::test]
     async fn a_request_without_a_newline_is_still_bounded() {
         let (mut client, server) = UnixStream::pair().unwrap();
-        let task = tokio::spawn(handle(server, Frames::default()));
+        let task = tokio::spawn(handle(server, Frames::default(), 90));
         client
             .write_all("y".repeat(MAX_REQUEST_BYTES * 4).as_bytes())
             .await
