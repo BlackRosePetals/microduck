@@ -98,7 +98,7 @@ logging.getLogger().addHandler(RING)
 for chatty in ("aioice", "aiortc", "aiohttp", "httpx", "urllib3"):
     logging.getLogger(chatty).setLevel(logging.DEBUG if LEVEL == "DEBUG" else logging.WARNING)
 
-logger = logging.getLogger("shop")
+logger = logging.getLogger("playground")
 
 # How long to hold a policy that declares no length of its own. Perpetual means "until told
 # otherwise", so something has to choose, and `robotctl policy add` refuses rather than guessing —
@@ -208,7 +208,7 @@ class Link:
                 # match would be the place a mini could be handed to a duck's client.
                 peer_id,
                 rpc,
-                label=f"microduck-policy-shop/{os.environ.get('SPACE_ID', 'local')}",
+                label=f"microduck-policy-playground/{os.environ.get('SPACE_ID', 'local')}",
             ),
         )
 
@@ -805,7 +805,7 @@ def open_session(peer_id: str | None, oauth: gr.OAuthToken | None) -> str:
     return LINK.through_rendezvous(token, peer_id, NAMES.get(peer_id, peer_id))
 
 
-with gr.Blocks(title="microduck policy shop") as demo:
+with gr.Blocks(title="microduck policy playground") as demo:
     gr.Markdown(
         """
         # Put a policy on your duck

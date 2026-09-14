@@ -1,5 +1,5 @@
 ---
-title: microduck policy shop
+title: microduck policy playground
 emoji: 🦆
 colorFrom: yellow
 colorTo: pink
@@ -10,13 +10,13 @@ hf_oauth: true
 short_description: Pick a policy off the Hub, put it on your duck, run it.
 ---
 
-# microduck policy shop
+# microduck policy playground
 
 Everything published to the Hub as `microduck-…`, read the way the robot reads it, with a button
 that downloads one onto your duck and runs it — and a box to name one the search did not reach.
 
-**Do not edit this Space directly.** The source is `spaces/policy-shop/` in
-`pollen-robotics/microduck`, and `scripts/publish-space.sh policy-shop` is what puts it here.
+**Do not edit this Space directly.** The source is `spaces/policy-playground/` in
+`pollen-robotics/microduck`, and `scripts/publish-space.sh policy-playground` is what puts it here.
 
 ## The one click
 
