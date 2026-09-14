@@ -850,12 +850,30 @@ consumer behind whatever a cloud provider gives a container, srflx-to-srflx need
 allow a hole to be punched — often they do, and often enough they do not. A relay always works, at
 the cost of somebody's bandwidth, which is why ICE tries it last.
 
-**Only the robot offers one**, and that is the part worth knowing before writing any of it: a
-connection needs *one* relay candidate, not two. If the robot offers one, a consumer that can
-reach the internet uses it — so credentials live on the robot and a consumer needs none. Which
-matters more than it sounds, because `aiortc`'s STUN client works where its TURN client does not,
-so a Python consumer *cannot* be the side that relays. `reachy_mini`'s #1182 established this
+**One relay candidate is enough, and it is not always the robot's.** A connection needs *one*, not
+two, and `aiortc`'s STUN client works where its TURN client does not — so a Python consumer cannot
+be the side that relays, and the robot has to be. `reachy_mini`'s #1182 established that
 arrangement and `mediad::turn` is the same one.
+
+**What that argument left out is whether the two ends can address each other at all**, and an
+iPhone on a mobile network is the case where they cannot. It has no IPv4 socket: it reaches a
+*hostname* through DNS64/NAT64, the STUN server reports an IPv4 reflexive address back, and the
+phone gathers a candidate saying so. But an ICE candidate is a bare literal, and the robot's relay
+candidate is a bare IPv4 literal on a board with no global IPv6 at all — which that phone cannot
+send a packet to. Measured on olducky: six sessions, `offering relay candidates relays=5` every
+time, `Ice connection state … failed` every time, about eight seconds apart.
+
+So **the console offers a relay of its own** (`refreshRelays` in `mediad/webclient/index.html`),
+and only its own allocation can bridge this: `turn.cloudflare.com` is a name, so it resolves over
+IPv6, and the relayed address Cloudflare hands back is IPv4, which the robot can reach. Confirmed
+from the phone before it was written — the same credentials in a Trickle ICE page gathered a
+`relay` candidate with an IPv4 address over 4G, where the robot's own candidates paired with
+nothing.
+
+The page mints them with **the visitor's** token, not the robot's, which is the right way round
+twice over: a robot's allowance should go on being watched rather than on watching, and a browser
+signed in with `hf_oauth` already holds a token of its own. A LAN session asks for none — there
+are host candidates on both sides and nothing would use a relay.
 
 The credentials are Cloudflare's, minted per account by a proxy Hugging Face hosts and
 authenticated with **the same token the relay signs in with** — so a robot that belongs to
