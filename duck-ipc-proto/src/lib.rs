@@ -2905,6 +2905,15 @@ pub struct MediaFrameHeader {
     pub format: String,
     pub bytes: usize,
     pub captured_at_unix_us: u128,
+    /// Degrees clockwise the camera is mounted from upright — the same number `media.video`
+    /// tells a WebRTC peer, and zero when `--flip-in-pipeline` already turned these pixels.
+    ///
+    /// **Carried rather than written down.** The geometry above describes the bytes exactly as
+    /// they are, and a consumer cannot recover the mount from them: a 180° mount is
+    /// indistinguishable from an upright one, and a quarter turn is only a guess from the aspect
+    /// ratio. A recorder building a dataset needs the angle programmatically, and a human
+    /// converting a frame should not have to find a document to learn their picture is sideways.
+    pub rotate: u32,
 }
 impl MediaFrameHeader {
     /// Bound allocation and reject malformed geometry before decoding pixels.
@@ -2913,6 +2922,7 @@ impl MediaFrameHeader {
             && self.height > 0
             && self.width.is_multiple_of(2)
             && self.format == "UYVY"
+            && matches!(self.rotate, 0 | 90 | 180 | 270)
             && self.bytes <= 16 * 1024 * 1024
             && (self.width as usize)
                 .checked_mul(self.height as usize)

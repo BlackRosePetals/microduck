@@ -146,14 +146,24 @@ following, facing, and a chorale where the ducks look at each other while they s
 ### Taking a snapshot
 
 On the robot, `robotctl frame --output frame.uyvy` saves one fresh packed UYVY frame and prints
-its JSON metadata (width, height, bytes and capture timestamp) to stderr. Use those dimensions
-when converting it, for example `ffmpeg -f rawvideo -pixel_format uyvy422 -video_size 1280x720
--i frame.uyvy -frames:v 1 frame.png` for a 1280×720 capture; do not assume that geometry after
-changing the camera mode or rotation. The file is written only after the full response arrives.
+its JSON metadata to stderr: width, height, bytes, capture timestamp, and `rotate` — degrees
+clockwise the camera is mounted from upright, the same number `media.video` tells a WebRTC peer.
+Use those dimensions when converting it, and apply that turn, for example `ffmpeg -f rawvideo
+-pixel_format uyvy422 -video_size 1280x720 -i frame.uyvy -frames:v 1 -vf transpose=1 frame.png`
+for a 1280×720 capture off a 90° mount; do not assume either number after changing the camera
+mode or the mount. The file is written only after the full response arrives.
+
+**The pixels are the ones the sensor delivered, and `rotate` is reported rather than applied** —
+the pipeline stopped turning frames because `videoflip` cost the encoder its zero-copy path and
+the board 22 fps, so every consumer turns for itself. Omit the `-vf` above and the picture is
+sideways with nothing in it to say why, which is exactly what `rotate` exists to prevent. It is
+`0` when `--flip-in-pipeline` already turned them.
 
 From a browser on the robot's LAN, open `http://<robot>:8080/frame`, or save it with
-`curl --fail http://<robot>:8080/frame -o frame.png`. This returns a PNG at the capture geometry,
-with `Cache-Control: no-store`. A stopped or unavailable camera returns HTTP 503, never the
+`curl --fail http://<robot>:8080/frame -o frame.png`. This returns an **upright** PNG, with
+`Cache-Control: no-store`. That route is the exception to the paragraph above, because a PNG has
+nowhere to carry an angle: a quarter-turn mount swaps its width and height against the capture
+geometry, and the cost is one rotation per request rather than one per frame. A stopped or unavailable camera returns HTTP 503, never the
 last good picture. PNG preserves the RGB conversion without JPEG compression; it is not a
 byte-for-byte replacement for the raw UYVY data. This has the same LAN access boundary as the
 existing console and camera stream; there is no additional authentication on this route.

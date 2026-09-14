@@ -443,9 +443,14 @@ fn main() -> ExitCode {
             }
         };
         let frame_source = frames.clone();
+        // The mount angle every frame header carries — and zero when the pipeline was asked to
+        // flip, for the detector's sampler and the JPEG streamer's reason: those pixels arrive
+        // upright already, and turning them twice is a picture on its side with nothing to say why.
+        let frame_rotate = if args.flip_in_pipeline { 0 } else { rotate };
         tokio::spawn(async move {
             let _lock = frame_lock;
-            if let Err(error) = mediad::frame::serve(frame_listener, frame_source).await {
+            if let Err(error) = mediad::frame::serve(frame_listener, frame_source, frame_rotate).await
+            {
                 tracing::error!(error = %format!("{error:#}"), "media.frame endpoint stopped");
             }
         });

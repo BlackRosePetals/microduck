@@ -70,6 +70,7 @@ mod tests {
             format: "UYVY".into(),
             bytes,
             captured_at_unix_us: 1,
+            rotate: 90,
         };
         let mut wire =
             serde_json::to_vec(&proto::Response::ok(Some(proto::Id::Number(2)), &header)).unwrap();

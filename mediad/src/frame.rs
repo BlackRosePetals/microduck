@@ -93,7 +93,10 @@ pub async fn bind(socket: &Path) -> Result<(std::fs::File, UnixListener)> {
 }
 
 /// Bound both simultaneous clients and the lifetime of silent or slow clients.
-pub async fn serve(listener: UnixListener, frames: Frames) -> Result<()> {
+///
+/// `rotate` is degrees clockwise the camera is mounted from upright, reported in every frame
+/// header. It is the caller's business whether the pipeline already applied it.
+pub async fn serve(listener: UnixListener, frames: Frames, rotate: u32) -> Result<()> {
     let slots = Arc::new(tokio::sync::Semaphore::new(16));
     loop {
         match listener.accept().await {
@@ -104,8 +107,11 @@ pub async fn serve(listener: UnixListener, frames: Frames) -> Result<()> {
                 let frames = frames.clone();
                 tokio::spawn(async move {
                     let _permit = permit;
-                    let _ =
-                        tokio::time::timeout(Duration::from_secs(5), handle(stream, frames)).await;
+                    let _ = tokio::time::timeout(
+                        Duration::from_secs(5),
+                        handle(stream, frames, rotate),
+                    )
+                    .await;
                 });
             }
             Err(error) => tracing::warn!(error = %error, "media.frame accept failed"),
@@ -113,7 +119,7 @@ pub async fn serve(listener: UnixListener, frames: Frames) -> Result<()> {
     }
 }
 
-async fn handle(stream: UnixStream, frames: Frames) -> Result<()> {
+async fn handle(stream: UnixStream, frames: Frames, rotate: u32) -> Result<()> {
     let (read, mut write) = stream.into_split();
     // Bounded *before* the line is buffered. Checking the length afterwards would mean a client
     // could make this process hold an arbitrarily long line first, which is the thing the cap is
@@ -212,6 +218,7 @@ async fn handle(stream: UnixStream, frames: Frames) -> Result<()> {
             format: frame.format.to_owned(),
             bytes: frame.data.len(),
             captured_at_unix_us,
+            rotate,
         };
         write_response(&mut write, proto::Response::ok(request.id, &header)).await?;
         write.write_all(&frame.data).await?;
@@ -281,7 +288,7 @@ mod tests {
             },
         );
         let (mut client, server) = UnixStream::pair().unwrap();
-        let task = tokio::spawn(handle(server, frames));
+        let task = tokio::spawn(handle(server, frames, 90));
         client.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"hello\"}\n{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"unknown\"}\n{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"media.frame\"}\n").await.unwrap();
         let mut reader = BufReader::new(client);
         for id in 1..=3 {
@@ -339,7 +346,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("media.sock");
         let listener = UnixListener::bind(&socket).unwrap();
-        let server = tokio::spawn(serve(listener, Frames::default()));
+        let server = tokio::spawn(serve(listener, Frames::default(), 90));
         let mut clients = Vec::new();
         for _ in 0..16 {
             let mut client = UnixStream::connect(&socket).await.unwrap();
@@ -390,7 +397,7 @@ mod tests {
 
     async fn reply(frames: Frames, request: &str) -> proto::Response {
         let (mut client, server) = UnixStream::pair().unwrap();
-        let task = tokio::spawn(handle(server, frames));
+        let task = tokio::spawn(handle(server, frames, 90));
         client.write_all(request.as_bytes()).await.unwrap();
         client.shutdown().await.unwrap();
         let mut text = String::new();
@@ -469,7 +476,7 @@ mod tests {
             },
         );
         let (mut client, server) = UnixStream::pair().unwrap();
-        let task = tokio::spawn(handle(server, frames));
+        let task = tokio::spawn(handle(server, frames, 90));
         client
             .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"media.frame\"}\n")
             .await
@@ -484,6 +491,7 @@ mod tests {
         assert_eq!(result["format"], "UYVY");
         assert_eq!(result["bytes"], 4);
         assert_eq!(result["captured_at_unix_us"], 1_000_000);
+        assert_eq!(result["rotate"], 90);
         let mut pixels = [0; 4];
         reader.read_exact(&mut pixels).await.unwrap();
         assert_eq!(pixels, [128, 32, 128, 64]);

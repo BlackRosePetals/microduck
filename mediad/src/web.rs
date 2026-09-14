@@ -136,8 +136,17 @@ async fn snapshot(socket: PathBuf, slots: Arc<tokio::sync::Semaphore>) -> axum::
 mod tests {
     use super::*;
 
+    /// The PNG comes out upright, because a picture is the one reply with nowhere to carry the
+    /// mount angle. A quarter turn swaps the axes and moves the bright pixel; an upright mount
+    /// leaves both alone, and the same route has to do each.
     #[tokio::test]
-    async fn frame_route_handshakes_and_returns_a_decodable_uncached_png() {
+    async fn frame_route_handshakes_and_returns_a_decodable_uncached_upright_png() {
+        for (rotate, size, bright) in [(0, (2, 1), (1, 0)), (90, (1, 2), (0, 1))] {
+            frame_route_returns(rotate, size, bright).await;
+        }
+    }
+
+    async fn frame_route_returns(rotate: u32, size: (u32, u32), bright: (u32, u32)) {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("media.sock");
@@ -173,6 +182,7 @@ mod tests {
                 format: "UYVY".into(),
                 bytes: 4,
                 captured_at_unix_us: 1,
+                rotate,
             };
             let mut reply = serde_json::to_vec(&proto::Response::ok(request.id, &header)).unwrap();
             reply.push(b'\n');
@@ -195,9 +205,11 @@ mod tests {
         let decoded = image::load_from_memory(&response.bytes().await.unwrap())
             .unwrap()
             .to_rgb8();
-        assert_eq!(decoded.dimensions(), (2, 1));
+        assert_eq!(decoded.dimensions(), size);
+        assert!(decoded.get_pixel(bright.0, bright.1)[0] > 250);
+        // The dark pixel is the frame's first either way round: a clockwise turn takes source
+        // (0, 0) to upright (0, 0), so only the bright one has to move for the turn to be real.
         assert!(decoded.get_pixel(0, 0)[0] < 5);
-        assert!(decoded.get_pixel(1, 0)[0] > 250);
         producer.await.unwrap();
         server.abort();
     }

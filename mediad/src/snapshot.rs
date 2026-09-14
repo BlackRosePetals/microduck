@@ -70,22 +70,38 @@ async fn response(
     response.result.context("camera response has no result")
 }
 
+/// Encode the frame as a PNG, upright.
+///
+/// **This is the one consumer that has nowhere to put the rotation.** A PNG opened in a browser
+/// or piped into a viewer carries no `rotate` alongside it, so a snapshot route that returned the
+/// sensor's own orientation would hand every human a sideways picture and no way to know why. The
+/// raw UYVY path keeps its "told, not applied" contract — the header names the angle and the
+/// recorder turns it — but here the header *is* the thing being thrown away.
+///
+/// It costs nothing the hot path would notice: this runs once per request on a blocking thread,
+/// not thirty times a second in front of the encoder, which is what made `videoflip` expensive.
 pub(crate) fn png(header: proto::MediaFrameHeader, data: Vec<u8>) -> Result<Vec<u8>> {
     use image::ImageEncoder;
+    let turn = duck_detect::Turn::from_degrees(header.rotate)
+        .context("camera reported a mount that is not a quarter turn")?;
     let mut rgb = Vec::new();
-    duck_detect::rgb_from_uyvy(
+    // The turned dimensions, not the header's: a quarter turn swaps the axes, and encoding the
+    // capture geometry over rotated pixels is a diagonally sheared image rather than an error.
+    let (width, height) = duck_detect::rgb_from_uyvy(
         &data,
         header.width as usize,
         header.height as usize,
+        // No downscale. `max` is the same either side of a quarter turn, so this stays the
+        // longest edge whichever way the frame is about to go.
         header.width.max(header.height) as usize,
-        duck_detect::Turn::None,
+        turn,
         &mut rgb,
     );
     let mut encoded = Vec::new();
     image::codecs::png::PngEncoder::new(&mut encoded).write_image(
         &rgb,
-        header.width,
-        header.height,
+        width as u32,
+        height as u32,
         image::ExtendedColorType::Rgb8,
     )?;
     Ok(encoded)
