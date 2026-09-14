@@ -317,6 +317,13 @@ const REMOTE = PARAMS.get("mode")
   ? PARAMS.get("mode") === "remote"
   : !SERVED_BY_ROBOT && location.protocol === "https:";
 
+// Where this page mints its own relay credentials, addressed as the Space it is rather than
+// through `turn.fastrtc.org` — that alias is a dangling delegation and answers nothing
+// (`remote-access-design.md` §6). `?turn=` points this at a local copy or a fake.
+const TURN_CREDENTIALS_URL = PARAMS.get("turn")
+  || "https://fastrtc-turn-service.hf.space/credentials";
+const TURN_TTL_SECONDS = 600;
+
 // The Space the robot's relay registers with. `?rendezvous=` points this at a local copy.
 const RENDEZVOUS = (PARAMS.get("rendezvous")
   || "https://pollen-robotics-reachy-mini-central.hf.space").replace(/\/$/, "");
@@ -429,6 +436,9 @@ let ws = null, pc = null, sessionId = null, control = null;
 // The rendezvous half: the account token, a handle on the open event stream, and which robot of
 // the account's this page is driving.
 let token = null, stream = null, chosen = null;
+// The relay servers this page holds for itself, in the `{urls, username, credential}` shape
+// `RTCPeerConnection` takes. Empty until `refreshRelays` has run, and empty forever on a LAN.
+let relays = [];
 // Whether a session is wanted. Set by a person — the connect button, or picking another robot —
 // and cleared when the robot ends one.
 //
@@ -711,6 +721,10 @@ $("connect").onclick = async () => {
         $("account").hidden = false;
       }
       setState("connecting…");
+      // Before the session rather than during it: `newPeerConnection` runs in a message handler
+      // that cannot wait, and credentials are short-lived enough that minting them per connect
+      // is simpler than keeping a fresh set around.
+      await refreshRelays();
       log("dim", "opening the rendezvous event stream…");
       let spoke = false;
       stream = await openRendezvous((data) => {
@@ -901,6 +915,46 @@ async function onSignalling(raw) {
     }
 }
 
+/// Mint relay credentials for **this visitor**, so the page can offer a relay of its own.
+///
+/// §6 of `remote-access-design.md` argued only the robot needs to offer one: a connection needs
+/// one relay candidate and not two, and `aiortc`'s TURN client does not work, so a Python
+/// consumer could never be the side that relays. Both halves are still true, and the conclusion
+/// was still wrong for a browser — because it assumed the two ends can address each other at all.
+///
+/// **An iPhone on a mobile network has no IPv4 socket.** It reaches a *hostname* through
+/// DNS64/NAT64 and the STUN server reports an IPv4 reflexive address back, so it looks like it
+/// has IPv4 and gathers a candidate saying so. But an ICE candidate is a bare literal, and the
+/// robot's relay candidate is a bare IPv4 literal, which that phone cannot send a packet to.
+/// Six sessions negotiated perfectly and carried nothing, which is the same symptom a missing
+/// relay gives and a different cause.
+///
+/// Its own allocation is what bridges the two, and only its own can: `turn.cloudflare.com` is a
+/// name, so it resolves over IPv6, and the relayed address Cloudflare hands back is IPv4 — which
+/// the robot can reach. One relay candidate is still enough. It just has to be this end's.
+///
+/// Metered against the visitor's account rather than the robot owner's, which is the right way
+/// round: a robot's allowance should go on being watched, not on watching.
+async function refreshRelays() {
+  relays = [];
+  if (!REMOTE || !token) return;
+  try {
+    const response = await fetch(`${TURN_CREDENTIALS_URL}?ttl=${TURN_TTL_SECONDS}`, {
+      headers: { authorization: `Bearer ${token}` },
+    });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const offered = (await response.json()).iceServers || [];
+    // A `stun:` entry has no credentials and is not a relay; the STUN server is set below.
+    relays = offered.filter((server) => server.username && server.credential);
+    log("dim", `relay credentials: ${relays.length} server(s)`);
+  } catch (e) {
+    // Best effort, always. Without a relay this page still reaches every robot it could reach
+    // before, which is most of them — so this is a line in the log and not a failed connect.
+    log("bad", "!! no relay credentials:", e.message || String(e),
+               "— a session from a mobile network may negotiate and carry nothing");
+  }
+}
+
 function newPeerConnection() {
   // **STUN only when it is needed, which is when this page is not on the robot's network.**
   //
@@ -912,11 +966,15 @@ function newPeerConnection() {
   // nothing.
   //
   // `stun.l.google.com` is what `webrtcsink` already defaults to on the robot side, so the two
-  // ends use one server rather than two. TURN is the next thing this needs — see
-  // `remote-access-design.md` §6, and `reachy_mini`'s #1182, where the *robot* fetches
-  // short-lived Cloudflare credentials with its own HF token.
+  // ends use one server rather than two.
+  //
+  // **And this page's own relay servers, when `refreshRelays` got any.** Reading them here rather
+  // than fetching is the same rule the robot follows in its `consumer-added` handler: this runs
+  // inside a signalling message handler, and an HTTP request in it would delay the answer to
+  // every session, including the LAN ones that will never use a relay. `relays` is filled on the
+  // connect path, which is already asynchronous and already says "connecting…".
   pc = new RTCPeerConnection(REMOTE
-    ? { iceServers: [{ urls: "stun:stun.l.google.com:19302" }] }
+    ? { iceServers: [{ urls: "stun:stun.l.google.com:19302" }, ...relays] }
     : undefined);
 
   pc.ontrack = (event) => {

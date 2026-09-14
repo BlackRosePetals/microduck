@@ -39,6 +39,16 @@ pub const RELEASE_DIR: &str = "/opt/robot/daemon/current";
 /// atomically. See `docs/design/policy-channel-design.md` §9.
 pub const POLICY_DIR: &str = "/opt/robot/policies/current";
 
+/// Where the duck detector lives — outside the release, the way [`POLICY_DIR`] is, and for the
+/// same reason: the model is trained and published elsewhere (`pollen-robotics/duck_detector`,
+/// on the Hub as `pollen-robotics/microduck-duck-detector`), a retrain is a tag rather than a
+/// daemon release, and a daemon fix should not re-ship fourteen megabytes of unchanged weights.
+///
+/// Seeded by the release's own `scripts/seed-detector.sh`, moved past with
+/// `robotctl duck-detector update`; `current` is a symlink beside a `releases/` directory, the layout
+/// the policies use and the updater swaps atomically.
+pub const DETECTOR_DIR: &str = "/opt/robot/detector/current";
+
 /// Where policies fetched from the Hub one at a time live — `robotctl policy load <slot> <repo>`.
 ///
 /// Outside every release directory, per `updater-design.md` §5.7: a policy somebody chose has to
@@ -60,13 +70,25 @@ pub struct Params {
     pub safety: SafetyParams,
     pub audio: AudioParams,
     pub theremin: ThereminParams,
+    pub head_imu: HeadImuParams,
     pub chorale: ChoraleParams,
     pub media: MediaParams,
-    pub detect: DetectParams,
+    ///
+    /// `[detect]` until 2026-09: in `robotctl configure` that read as "detect what?", one line
+    /// from `chorale.accept`. Named for what it detects. The alias keeps a file written under the
+    /// old name loading; the editor renames the section the next time it saves that file.
+    #[serde(alias = "detect")]
+    pub duck_detector: DuckDetectorParams,
     /// Which pad button runs which skill. `padd` reads this, not `robotd`.
     pub pad: PadParams,
     /// Posing the head from the pad's own IMU. `padd` reads this too.
-    pub imu_head: ImuHeadParams,
+    ///
+    /// Named for what it is, in full, because `[head_imu]` is two sections up and is the IMU *in*
+    /// the robot's head: the two were `imu_head` and `head_imu` for a while, and that is a name
+    /// apart, not a difference. The alias keeps a file written under the old name loading; the
+    /// editor renames the section the next time it saves that file.
+    #[serde(alias = "imu_head")]
+    pub pad_imu_head_control: PadImuHeadControlParams,
 }
 
 /// Controller-IMU head control: pose the head by tilting the pad.
@@ -82,7 +104,7 @@ pub struct Params {
 /// Off, or on a pad with no IMU, Y is what it always was. Nothing else about the pad changes.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
-pub struct ImuHeadParams {
+pub struct PadImuHeadControlParams {
     /// Whether Y engages IMU head control on a pad that has an IMU.
     pub enabled: bool,
     /// Head radians per pad radian. One is "the head turns as far as the pad did"; more makes a
@@ -90,7 +112,7 @@ pub struct ImuHeadParams {
     pub gain: f64,
 }
 
-impl Default for ImuHeadParams {
+impl Default for PadImuHeadControlParams {
     fn default() -> Self {
         Self {
             enabled: false,
@@ -328,6 +350,61 @@ impl CongestionControl {
     }
 }
 
+/// Where `mediad`'s video comes from.
+///
+/// **This was `camera: bool`, and the boolean was the problem.** `camera = false` does not mean
+/// "no video" — the WebRTC control channel rides the video track, so a pipeline that never starts
+/// costs a robot its control surface along with its picture (`remote-webrtc.md`). What it means is
+/// "a test pattern instead", and nothing in the key said so: a board set up with no camera streamed
+/// 720p30 of synthetic video, which is how the pattern came to cost five times what the camera it
+/// stands in for does. A name that says what you get is the fix for the next person reading it.
+///
+/// `--sim-camera` is not a value here. It carries an address, so it is a flag, and it overrides
+/// this the way it always has.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MediaSource {
+    /// The head camera, at [`Quality`]. What every robot with a camera wants, and the default.
+    #[default]
+    Camera,
+    /// A test pattern at [`TEST_PATTERN_GEOMETRY`], for a board with no camera: the session
+    /// exists, so signalling, negotiation, the datachannel and the control API are all reachable.
+    Test,
+}
+
+/// Every source, in the order an editor cycles them — and the strings the file uses.
+///
+/// One list, for [`QUALITY_LABELS`]'s reason; [`tests::every_media_source_label_round_trips`]
+/// pins it to the enum in both directions.
+pub const MEDIA_SOURCE_LABELS: &[&str] = &["camera", "test"];
+
+impl MediaSource {
+    /// The sources, in [`MEDIA_SOURCE_LABELS`] order.
+    pub const ALL: [MediaSource; 2] = [MediaSource::Camera, MediaSource::Test];
+
+    /// The name this source has in the file.
+    pub fn label(self) -> &'static str {
+        match self {
+            MediaSource::Camera => "camera",
+            MediaSource::Test => "test",
+        }
+    }
+}
+
+/// What a test pattern runs at, whatever `[media] quality` says — width, height, frames a second.
+///
+/// **A test pattern is not video anybody watches.** It exists so a board with no camera still has
+/// a whole session — signalling, negotiation, the datachannel, the control API — and none of that
+/// needs the rung a camera streams at. Running it at the configured rung instead is what an idle
+/// radxa-zero3 was measured doing: **29.4% of a core against the real camera's 6.1%** on the same
+/// board, with nothing connected. A camera's frames arrive off the ISP in hardware, while a test
+/// pattern is drawn by the CPU — at 720p30, 1.84 MB of packed UYVY thirty times a second, every
+/// frame discarded unread. This is 73 KB five times a second: 0.7% of that pixel rate.
+///
+/// 16:9 with both axes a multiple of 8, for [`Quality::size`]'s reason. Five frames a second is
+/// still a live stream — enough to prove the path end to end, which is all it is for.
+pub const TEST_PATTERN_GEOMETRY: (u32, u32, u32) = (256, 144, 5);
+
 /// `[media]` — what `mediad` streams.
 ///
 /// **These were command-line flags in `mediad.service`, and that is why this section exists.**
@@ -347,9 +424,9 @@ impl CongestionControl {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct MediaParams {
-    /// Stream the head camera. `false` streams a test pattern instead, which is what a board
-    /// with no camera wants: the pipeline starts, so the WebRTC control channel exists.
-    pub camera: bool,
+    /// Where the video comes from: the head camera, or a test pattern for a board without one.
+    /// [`MediaSource`] says why this is a name rather than a boolean.
+    pub source: MediaSource,
     /// Frame size and rate, as one name. [`Quality`] says why it is one key and not four.
     pub quality: Quality,
     /// Starting video bitrate, bits per second. Unset follows the quality —
@@ -431,12 +508,16 @@ impl CameraIntrinsics {
     }
 }
 
+// Derivable since `camera: bool` became `source: MediaSource`, and still written out: every line
+// of it is a decision with a reason beside it, and `#[derive(Default)]` would delete the reasons
+// while keeping the values. The next field added here should have to say what its default is for.
+#[allow(clippy::derivable_impls)]
 impl Default for MediaParams {
     fn default() -> Self {
         Self {
-            // On, because a robot with a camera is the case, and a board without one shows a
-            // test pattern rather than nothing only if somebody turns this off.
-            camera: true,
+            // The camera, because a robot with a camera is the case. A board without one shows a
+            // test pattern instead, and only if somebody names it.
+            source: MediaSource::Camera,
             quality: Quality::default(),
             bitrate: None,
             // Only a per-robot solve goes here; the family calibration is `mediad`'s fallback.
@@ -449,7 +530,7 @@ impl Default for MediaParams {
     }
 }
 
-/// `[detect]` — finding other ducks in the camera.
+/// `[duck_detector]` — finding other ducks in the camera.
 ///
 /// **Read by `mediad`, not by `robotd`**, which is a first for this file: the frames are on
 /// `mediad`'s tee and perception belongs next to the sensor. It lives here anyway, because this is
@@ -458,12 +539,13 @@ impl Default for MediaParams {
 /// find.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
-pub struct DetectParams {
-    /// Off by default. The detector costs a model in the release, ~50 ms of CPU per frame and some
-    /// heat; a robot that nothing asks to look for ducks should not be paying for it.
+pub struct DuckDetectorParams {
+    /// Off by default. The detector costs ~50 ms of CPU per frame and some heat; a robot that
+    /// nothing asks to look for ducks should not be paying for it.
     pub enabled: bool,
     /// Where to look, and therefore *what runs it*: a `.rknn` goes to the NPU, an `.onnx` runs on
-    /// the CPU. Absent means the release's own model, NPU first — see [`DetectParams::model`].
+    /// the CPU. Absent means the installed set under [`DETECTOR_DIR`], NPU first — see
+    /// [`DuckDetectorParams::models`].
     pub model: Option<PathBuf>,
     /// Frames per second to run the detector at.
     ///
@@ -479,7 +561,7 @@ pub struct DetectParams {
     pub threshold: f32,
 }
 
-impl Default for DetectParams {
+impl Default for DuckDetectorParams {
     fn default() -> Self {
         Self {
             enabled: false,
@@ -496,9 +578,25 @@ impl MediaParams {
         self.bitrate
             .unwrap_or_else(|| self.quality.default_bitrate())
     }
+
+    /// Frame size and rate the pipeline will actually run at — width, height, frames a second.
+    ///
+    /// [`Quality`], except for the test pattern, which gets [`TEST_PATTERN_GEOMETRY`] instead.
+    /// A simulated camera is a camera: `--sim-camera` renders the configured rung, and `mediad`
+    /// applies that precedence where it picks the source.
+    pub fn geometry(&self) -> (u32, u32, u32) {
+        match self.source {
+            MediaSource::Camera => (
+                self.quality.width(),
+                self.quality.height(),
+                self.quality.fps(),
+            ),
+            MediaSource::Test => TEST_PATTERN_GEOMETRY,
+        }
+    }
 }
 
-impl DetectParams {
+impl DuckDetectorParams {
     /// The models to try, best first. Empty when the detector is off.
     ///
     /// **A list, not a choice**, because whether the NPU works is not something this file can know.
@@ -508,6 +606,11 @@ impl DetectParams {
     /// board still sees, on the CPU, instead of logging one warning and doing nothing for ever.
     ///
     /// An explicit `model` is the operator being specific, so it is tried alone.
+    ///
+    /// **Not filtered on existence.** A board whose set was never seeded — first install with no
+    /// network — has neither file, and an empty list here would read as "detector off" in
+    /// `mediad`'s journal when the truth is "detector on, model missing". Letting the loader fail
+    /// on the path names the directory and what fills it.
     pub fn models(&self) -> Vec<PathBuf> {
         if !self.enabled {
             return Vec::new();
@@ -518,16 +621,15 @@ impl DetectParams {
             }
             return vec![path.clone()];
         }
-        let release = PathBuf::from(RELEASE_DIR).join("models");
-        [
-            release.join("duck_detect.rknn"),
-            release.join("duck_detect.onnx"),
-        ]
-        .into_iter()
-        .filter(|path| path.exists())
-        .collect()
+        let set = PathBuf::from(DETECTOR_DIR);
+        DETECTOR_FILES.iter().map(|name| set.join(name)).collect()
     }
 }
+
+/// The two files a detector set holds, NPU first. `scripts/seed-detector.sh` and
+/// `updater::policy::DETECTOR_FILES` download exactly this list, and a test in each place holds
+/// them together.
+pub const DETECTOR_FILES: [&str; 2] = ["duck_detect.rknn", "duck_detect.onnx"];
 
 /// `[chorale]` — several ducks singing one piece.
 ///
@@ -603,6 +705,27 @@ impl ThereminParams {
             hold: std::time::Duration::from_millis(self.hold_ms),
         }
     }
+}
+
+/// `[head_imu]` — the BMI088 on the head module, read by `tofd` and served as
+/// `head_imu.stream`.
+///
+/// **One switch, and it is off.** Reading this chip at 100 Hz costs ~3.5–4.5% of a core on an
+/// RK3566, and a bench that isolates the parts says none of it is fixable in the loop: being
+/// woken a hundred times a second is 0.7 points of it, the Madgwick fusion 0.3, and the rest is
+/// the two I²C transactions a sample takes. Fewer bytes is not on offer — a gyro and an
+/// accelerometer sample *is* twelve bytes — so what is left is not reading it, which is this
+/// key, or reading it less often, which is `tofd --imu-hz`.
+///
+/// It stays off until something subscribes to the stream, because for now nothing does: it was
+/// added for the mapping work, and a duck that is not mapping was paying for it from boot.
+/// `docs/project/tof-on-demand.md` is the measurement and the reasoning.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct HeadImuParams {
+    /// Read the head IMU at all. `false` — and derived rather than written out, so the default
+    /// cannot be changed by editing one word. `tofd --imu` overrides it for a session.
+    pub enabled: bool,
 }
 
 /// `[audio]` — the voice and the microphone. All optional equipment: a robot without a
@@ -766,7 +889,7 @@ pub struct PolicyParams {
     pub skills: Vec<SkillDef>,
     /// Scale actions with battery voltage: effective scale × (nominal / measured). The
     /// servos' effective kP tracks their supply, so this holds the robot's response steady
-    /// as the pack sags. Off by default, as in the prototype.
+    /// as the pack sags. On by default since 2026-09-14 (the prototype ran without it).
     pub voltage_adapt: bool,
     /// Reference voltage for `voltage_adapt` — the supply the gains were identified at.
     pub nominal_voltage: f64,
@@ -1453,9 +1576,13 @@ impl PolicyParams {
         };
 
         let (walk_default, stand, sitstand, ground_pick) = match self.mode {
+            // The velstand gait (set v5) walks on a twist and stands still at zero command,
+            // so no standing network is loaded by default: with `stand` unset the walking
+            // policy runs at every velocity. `alpha_walking.onnx` + `alpha_stand.onnx` stay
+            // in the set for a board that loads them back by hand.
             Mode::Walk => (
-                "alpha_walking.onnx",
-                Some("alpha_stand.onnx"),
+                "velstand.onnx",
+                None,
                 Some("alpha_sitstand.onnx"),
                 Some("alpha_ground_pick.onnx"),
             ),
@@ -1564,9 +1691,9 @@ pub struct SafetyParams {
     pub battery_empty_shutdown: bool,
 
     /// Go limp *while falling*, to land soft instead of fighting the floor all the way
-    /// down. **On by default** since it was validated on a robot — the whole point is that
-    /// the fleet lands soft, and a mode every board has to opt into individually is a mode
-    /// most boards do not have.
+    /// down. **Off by default** since the velstand gait became the default walk (set v5):
+    /// the hand-back it ends with is to the standing network, which the default configuration
+    /// no longer loads. Turn it on with a robot that runs a standing policy.
     ///
     /// The only thing the daemon does about a fall. Drop to `gain_limp`, let the robot
     /// collapse, pose it back to standing once it has landed, then hand it to the standing
@@ -1627,7 +1754,7 @@ impl Default for PolicyParams {
             ground_pick_action_scale: None,
             ground_pick_gain_ratio: 1.0,
             skills: Vec::new(),
-            voltage_adapt: false,
+            voltage_adapt: true,
             nominal_voltage: 7.4,
         }
     }
@@ -1641,7 +1768,7 @@ impl Default for SafetyParams {
             deadman_ms: 500,
             gain_limp: 50,
             battery_empty_shutdown: true,
-            limp_fall: true,
+            limp_fall: false,
             limp_fall_tilt_z: -0.90,
             limp_fall_predict_z: -0.5,
             limp_fall_lookahead_ms: 300,
@@ -2646,7 +2773,7 @@ mod tests {
         params.set_slot(Slot::Walk, None);
         assert_eq!(
             params.resolved().walk,
-            std::path::Path::new(super::POLICY_DIR).join("alpha_walking.onnx"),
+            std::path::Path::new(super::POLICY_DIR).join("velstand.onnx"),
             "reset must restore the default, not empty the slot"
         );
     }
@@ -2749,6 +2876,42 @@ mod tests {
         }
     }
 
+    /// [`MEDIA_SOURCE_LABELS`] is what the registry offers and what the file may contain, and
+    /// [`MediaSource::ALL`] is what `mediad` can build. A name in one and not the other is either
+    /// a choice the editor writes and `mediad` cannot read, or a source nobody can select.
+    #[test]
+    fn every_media_source_label_round_trips() {
+        assert_eq!(MEDIA_SOURCE_LABELS.len(), MediaSource::ALL.len());
+        for (label, source) in MEDIA_SOURCE_LABELS.iter().zip(MediaSource::ALL) {
+            assert_eq!(*label, source.label());
+            let parsed: Params =
+                toml::from_str(&format!("[media]\nsource = \"{label}\"\n")).expect("parses");
+            assert_eq!(parsed.media.source, source);
+        }
+    }
+
+    /// **The key that was replaced must not come back as a silent default.** A robot carrying the
+    /// old `camera = false` gets the unknown-key warning and this build's default — the camera —
+    /// which is a board that starts using a camera it may not have. Better than refusing to boot
+    /// over an inert key (the `[chorale]` rule), and only defensible if the warning names it, so
+    /// this pins that the key is *ignored* rather than parsed into something.
+    #[test]
+    fn the_retired_camera_boolean_is_ignored_and_named() {
+        let (_, ignored) = without_unknown_keys("[media]\ncamera = false\n").unwrap();
+        assert_eq!(ignored, ["media.camera"]);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = write(dir.path(), "[media]\ncamera = false\n");
+        let media = Params::load(&path, true)
+            .expect("an inert key must not stop the robot")
+            .media;
+        assert_eq!(
+            media.source,
+            MediaSource::Camera,
+            "the retired key must not still be steering the source"
+        );
+    }
+
     /// The labels are `webrtcsink`'s own property nicknames — the strings that get set on the
     /// element. `gcc`, not `googcc`: a nickname this file spelled its own way would be a config
     /// key that parses, validates, saves, and then silently leaves the element on its default.
@@ -2783,6 +2946,57 @@ mod tests {
         assert_eq!(media.bitrate_resolved(), 3_000_000);
     }
 
+    /// **A camera runs at the configured rung and a test pattern does not**, which is the whole
+    /// of [`MediaParams::geometry`]. Every rung, so a `quality` edit cannot start reaching the
+    /// pattern by accident.
+    #[test]
+    fn only_a_camera_runs_at_the_configured_quality() {
+        let mut media = MediaParams::default();
+        for quality in Quality::ALL {
+            media.quality = quality;
+
+            media.source = MediaSource::Camera;
+            assert_eq!(
+                media.geometry(),
+                (quality.width(), quality.height(), quality.fps()),
+                "a camera streams {}",
+                quality.label()
+            );
+
+            media.source = MediaSource::Test;
+            assert_eq!(
+                media.geometry(),
+                TEST_PATTERN_GEOMETRY,
+                "a test pattern ignores {}",
+                quality.label()
+            );
+        }
+    }
+
+    /// The pattern's geometry has to satisfy the same two constraints every [`Quality`] rung does
+    /// — 16:9, and both axes a multiple of 8 for the encoder's macroblocks — because it goes
+    /// through the same capsfilter and the same encoder. A rate of zero would be a still image.
+    #[test]
+    fn the_test_pattern_is_16_9_and_encodable() {
+        let (width, height, fps) = TEST_PATTERN_GEOMETRY;
+        assert_eq!(width % 8, 0, "width {width} is not a multiple of 8");
+        assert_eq!(height % 8, 0, "height {height} is not a multiple of 8");
+        assert_eq!(width * 9, height * 16, "{width}x{height} is not 16:9");
+        assert!(fps > 0, "a test pattern with no frame rate is a photograph");
+
+        // And it is worth having: a pattern as expensive as the rung it replaces would be this
+        // constant written the long way.
+        let (w, h, f) = MediaParams {
+            source: MediaSource::Camera,
+            ..MediaParams::default()
+        }
+        .geometry();
+        assert!(
+            width * height * fps * 4 < w * h * f,
+            "{width}x{height}@{fps} is not materially cheaper than the default {w}x{h}@{f}"
+        );
+    }
+
     /// A bitrate in the wrong unit is the mistake this band exists to catch: `2000` is somebody
     /// who meant kilobits, and it would produce a stream with no picture in it.
     #[test]
@@ -2803,7 +3017,11 @@ mod tests {
     #[test]
     fn the_defaults_are_what_mediad_streamed_before_the_section_existed() {
         let media = Params::default().media;
-        assert!(media.camera, "mediad.service carried --camera");
+        assert_eq!(
+            media.source,
+            MediaSource::Camera,
+            "mediad.service carried --camera"
+        );
         assert_eq!(media.quality.size(), (1280, 720));
         assert_eq!(media.quality.fps(), 30);
         assert_eq!(media.bitrate_resolved(), 2_000_000);
@@ -2840,7 +3058,7 @@ mod tests {
             from_file.update_gate.max_consecutive_errors,
             built_in.update_gate.max_consecutive_errors
         );
-        assert_eq!(from_file.media.camera, built_in.media.camera);
+        assert_eq!(from_file.media.source, built_in.media.source);
         assert_eq!(from_file.media.quality, built_in.media.quality);
         assert_eq!(
             from_file.media.bitrate_resolved(),
@@ -2893,7 +3111,7 @@ mod tests {
         );
         assert!(skill("roulade").chain, "holding the button chains rolls");
         assert!(!skill("kick_left").chain);
-        assert!(!p.voltage_adapt, "off by default in the prototype");
+        assert!(p.voltage_adapt, "on by default since 2026-09-14");
         assert_eq!(p.nominal_voltage, 7.4);
 
         let name = |p: &Option<std::path::PathBuf>| {
@@ -2901,8 +3119,11 @@ mod tests {
                 .and_then(|p| p.file_name())
                 .map(|n| n.to_string_lossy().into_owned())
         };
-        assert_eq!(p.walk, PathBuf::from(POLICY_DIR).join("alpha_walking.onnx"));
-        assert_eq!(name(&p.stand).as_deref(), Some("alpha_stand.onnx"));
+        assert_eq!(p.walk, PathBuf::from(POLICY_DIR).join("velstand.onnx"));
+        assert!(
+            p.stand.is_none(),
+            "velstand stands on its own; no standing network by default"
+        );
         assert_eq!(name(&p.sitstand).as_deref(), Some("alpha_sitstand.onnx"));
         assert_eq!(
             name(&p.ground_pick).as_deref(),

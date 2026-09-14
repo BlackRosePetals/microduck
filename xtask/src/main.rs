@@ -1173,7 +1173,7 @@ mod tests {
         let link = std::fs::read_link(root.join("current"))
             .ok()
             .map(|p| p.display().to_string());
-        let content = std::fs::read_to_string(root.join("current/alpha_walking.onnx")).ok();
+        let content = std::fs::read_to_string(root.join("current/velstand.onnx")).ok();
         (link, content)
     }
 
@@ -1208,6 +1208,193 @@ mod tests {
                 "seed-policies.sh must carry the line {expected:?}"
             );
         }
+    }
+
+    /// **The detector's pin is in two places too**, for the same reason: `seed-detector.sh` runs
+    /// from inside a release and cannot read Cargo.toml.
+    #[test]
+    fn seed_detector_pins_the_same_detector() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let manifest: toml::Value =
+            toml::from_str(&std::fs::read_to_string(root.join("Cargo.toml")).unwrap()).unwrap();
+        let meta = &manifest["workspace"]["metadata"]["detector"];
+        let version = meta["version"].as_str().unwrap();
+        let repo = meta["repo"].as_str().unwrap();
+
+        let script = std::fs::read_to_string(root.join("scripts/seed-detector.sh")).unwrap();
+        for expected in [
+            format!("DETECTOR_VERSION=\"${{DETECTOR_VERSION:-{version}}}\""),
+            format!("DETECTOR_REPO=\"${{DETECTOR_REPO:-{repo}}}\""),
+        ] {
+            assert!(
+                script.contains(&expected),
+                "seed-detector.sh must carry the line {expected:?}"
+            );
+        }
+    }
+
+    /// **The detector's file list lives in three places and they must agree**: what the seeder
+    /// downloads, what `robotctl duck-detector update` downloads, and what `mediad` looks for. A name
+    /// missing from either downloader is a detector that is installed and cannot be found; a
+    /// name only the downloaders know is dead weight on the eMMC.
+    #[test]
+    fn the_detector_file_list_is_the_same_everywhere() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let expected: Vec<String> = robotd_params::DETECTOR_FILES
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect();
+
+        let script = std::fs::read_to_string(root.join("scripts/seed-detector.sh")).unwrap();
+        let line = script
+            .lines()
+            .find(|l| l.starts_with("DETECTOR_FILES="))
+            .expect("seed-detector.sh must declare DETECTOR_FILES");
+        let listed: Vec<String> = line
+            .trim_start_matches("DETECTOR_FILES=")
+            .trim_matches('"')
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(
+            listed, expected,
+            "seed-detector.sh and robotd_params have drifted"
+        );
+
+        // `updater` cannot depend on `robotd-params`, so its copy is checked as text.
+        let updater = std::fs::read_to_string(root.join("updater/src/policy.rs")).unwrap();
+        let rendered = format!(
+            "pub const DETECTOR_FILES: [&str; {}] = [{}];",
+            expected.len(),
+            expected
+                .iter()
+                .map(|f| format!("{f:?}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        assert!(
+            updater.contains(&rendered),
+            "updater/src/policy.rs must carry {rendered}"
+        );
+    }
+
+    /// Run `scripts/seed-detector.sh` against a throwaway tree, with the Hub faked by a directory.
+    fn seed_detector(
+        root: &std::path::Path,
+        version: &str,
+        base_url: Option<&std::path::Path>,
+    ) -> (Option<String>, Option<String>) {
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("xtask/ has a parent");
+        let url = match base_url {
+            Some(dir) => format!("file://{}", dir.display()),
+            None => "file:///nonexistent-hub".to_owned(),
+        };
+        let status = std::process::Command::new("sh")
+            .arg(repo_root.join("scripts/seed-detector.sh"))
+            .arg(root)
+            .env("DETECTOR_VERSION", version)
+            .env("DETECTOR_BASE_URL", url)
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("sh");
+        assert!(status.success(), "the seeder must never fail an update");
+
+        let link = std::fs::read_link(root.join("current"))
+            .ok()
+            .map(|p| p.display().to_string());
+        let content = std::fs::read_to_string(root.join("current/duck_detect.rknn")).ok();
+        (link, content)
+    }
+
+    fn fake_detector_hub(dir: &std::path::Path, marker: &str) {
+        std::fs::create_dir_all(dir).expect("mkdir");
+        for name in robotd_params::DETECTOR_FILES {
+            std::fs::write(dir.join(name), format!("{marker}-{name}")).expect("model");
+        }
+    }
+
+    /// Nothing installed, the Hub reachable: both files arrive, `current` points at the pin,
+    /// and the provenance record names the repo `robotctl duck-detector check` will ask.
+    #[test]
+    fn the_pinned_detector_is_downloaded_from_the_hub() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hub = tmp.path().join("hub");
+        let root = tmp.path().join("detector");
+        fake_detector_hub(&hub, "hub");
+        std::fs::create_dir_all(&root).unwrap();
+
+        let (link, content) = seed_detector(&root, "duck-v1", Some(&hub));
+        assert_eq!(link.as_deref(), Some("releases/seed-duck-v1"));
+        assert_eq!(content.as_deref(), Some("hub-duck_detect.rknn"));
+        for name in robotd_params::DETECTOR_FILES {
+            assert!(root.join("current").join(name).exists(), "{name} missing");
+        }
+        let source = std::fs::read_to_string(root.join("current/.source")).unwrap();
+        assert!(
+            source.contains("repo=pollen-robotics/microduck-duck-detector"),
+            "{source}"
+        );
+        assert!(source.contains("version=duck-v1"), "{source}");
+    }
+
+    /// A revision missing the CPU fallback is not installed at all: half a set is worse than
+    /// none, because a board whose NPU is off would have a detector that exists and never loads.
+    #[test]
+    fn a_detector_revision_missing_a_file_is_not_installed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hub = tmp.path().join("hub");
+        let root = tmp.path().join("detector");
+        std::fs::create_dir_all(&hub).unwrap();
+        std::fs::write(hub.join("duck_detect.rknn"), "npu only").unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+
+        let (link, _) = seed_detector(&root, "duck-v1", Some(&hub));
+        assert_eq!(link, None, "nothing partial goes live");
+        assert!(
+            !root.join("releases/.staging").exists(),
+            "staging is cleaned up"
+        );
+    }
+
+    /// The rule the handover rests on: a set already installed — the pin, a newer one from
+    /// `robotctl duck-detector update`, or somebody else's — is never replaced by a daemon update.
+    #[test]
+    fn an_installed_detector_is_left_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hub = tmp.path().join("hub");
+        let root = tmp.path().join("detector");
+        fake_detector_hub(&hub, "one");
+        std::fs::create_dir_all(&root).unwrap();
+        seed_detector(&root, "duck-v1", Some(&hub));
+
+        fake_detector_hub(&hub, "two");
+        let (link, content) = seed_detector(&root, "duck-v2", Some(&hub));
+        assert_eq!(
+            link.as_deref(),
+            Some("releases/seed-duck-v1"),
+            "the newer pin is a floor"
+        );
+        assert_eq!(content.as_deref(), Some("one-duck_detect.rknn"));
+
+        // Something else's set, under a name that is not ours.
+        let theirs = root.join("releases/theirs");
+        std::fs::create_dir_all(&theirs).unwrap();
+        std::fs::remove_file(root.join("current")).unwrap();
+        std::os::unix::fs::symlink("releases/theirs", root.join("current")).unwrap();
+        let (link, _) = seed_detector(&root, "duck-v2", Some(&hub));
+        assert_eq!(link.as_deref(), Some("releases/theirs"));
+    }
+
+    /// A board that cannot reach the Hub ends up with no detector, and the update is not failed.
+    #[test]
+    fn an_unreachable_hub_leaves_the_board_without_a_detector() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("detector");
+        std::fs::create_dir_all(&root).unwrap();
+        let (link, _) = seed_detector(&root, "duck-v1", None);
+        assert_eq!(link, None);
     }
 
     /// **The fallback list must still be what `robotd` can ask for.**
@@ -1320,7 +1507,7 @@ mod tests {
 
         let (link, content) = seed(&root, "v1", Some(&hub));
         assert_eq!(link.as_deref(), Some("releases/seed-v1"));
-        assert_eq!(content.as_deref(), Some("hub-alpha_walking.onnx"));
+        assert_eq!(content.as_deref(), Some("hub-velstand.onnx"));
 
         let mut installed: Vec<String> = std::fs::read_dir(root.join("releases/seed-v1"))
             .unwrap()
@@ -1354,7 +1541,7 @@ mod tests {
             serde_json::to_string_pretty(&serde_json::json!({
                 "schema_version": 1,
                 "policies": [
-                    { "file": "alpha_walking.onnx", "kind": "perpetual" },
+                    { "file": "velstand.onnx", "kind": "perpetual" },
                     { "file": escape },
                 ]
             }))
@@ -1366,7 +1553,7 @@ mod tests {
 
         let (link, content) = seed(&root, "v1", Some(&hub));
         assert_eq!(link.as_deref(), Some("releases/seed-v1"));
-        assert_eq!(content.as_deref(), Some("hub-alpha_walking.onnx"));
+        assert_eq!(content.as_deref(), Some("hub-velstand.onnx"));
         assert!(
             !root.join("escaped.onnx").exists() && !tmp.path().join("escaped.onnx").exists(),
             "nothing was written outside the set"
@@ -1439,16 +1626,17 @@ mod tests {
         );
     }
 
-    /// **An installed set is never replaced, whatever the pin says.**
+    /// **A set past the pin is never moved back to it.**
     ///
-    /// The pin is a floor — what a board with nothing gets — and not a ceiling. This used to
-    /// replace an older set on the reasoning that a daemon update was still how a retrained gait
-    /// reached a board; `robotctl policy update` is now how, and the old rule became a trap. A
-    /// board moved forward to v2 by hand had `current -> releases/seed-v2`, which matches the
-    /// `seed-*` the seeder called its own, so the next unrelated daemon update would have put v1
-    /// back — silently reverting somebody's gait as a side effect of a binary update.
+    /// The pin is a minimum — what a board with nothing gets, and the oldest set the daemon runs
+    /// with — and not a ceiling. This used to replace any older set on the reasoning that a daemon
+    /// update was still how a retrained gait reached a board; `robotctl policy update` is now how,
+    /// and that rule was a trap. A board moved forward to v2 by hand had `current ->
+    /// releases/seed-v2`, which matches the `seed-*` the seeder called its own, so the next
+    /// unrelated daemon update would have put v1 back — silently reverting somebody's gait as a
+    /// side effect of a binary update.
     #[test]
-    fn a_set_already_installed_is_left_alone_whatever_the_pin_says() {
+    fn a_set_past_the_pin_is_left_alone() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("policies");
         std::fs::create_dir_all(&root).unwrap();
@@ -1463,7 +1651,95 @@ mod tests {
         let (link, content) = seed(&root, "v1", Some(&v1));
 
         assert_eq!(link.as_deref(), Some("releases/seed-v2"));
-        assert_eq!(content.as_deref(), Some("chosen-alpha_walking.onnx"));
+        assert_eq!(content.as_deref(), Some("chosen-velstand.onnx"));
+    }
+
+    /// **A set below the pin is moved up to it.** The daemon's slot defaults name files, and a
+    /// default that names a file only the newer set carries — v5's `velstand.onnx` — would leave a
+    /// board that updated the daemon but not its set unable to load its gait, unhealthy, and
+    /// rolled back. So the pin is the minimum the daemon runs with, and the hook enforces it.
+    #[test]
+    fn a_set_below_the_pin_is_moved_up_to_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("policies");
+        std::fs::create_dir_all(&root).unwrap();
+
+        let v4 = tmp.path().join("hub-v4");
+        fake_hub(&v4, "old");
+        seed(&root, "v4", Some(&v4));
+
+        let v5 = tmp.path().join("hub-v5");
+        fake_hub(&v5, "pinned");
+        let (link, content) = seed(&root, "v5", Some(&v5));
+
+        assert_eq!(link.as_deref(), Some("releases/seed-v5"));
+        assert_eq!(content.as_deref(), Some("pinned-velstand.onnx"));
+        let record = std::fs::read_to_string(root.join("current/.source")).unwrap();
+        assert!(record.contains("version=v5"), "{record}");
+        assert!(
+            root.join("releases/seed-v4/velstand.onnx").exists(),
+            "the set it came from is kept, the way the updater keeps a predecessor"
+        );
+    }
+
+    /// The comparison is on numbers, so `v10` is past `v9` and not below it.
+    #[test]
+    fn the_minimum_compares_versions_as_numbers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("policies");
+        std::fs::create_dir_all(&root).unwrap();
+
+        let v10 = tmp.path().join("hub-v10");
+        fake_hub(&v10, "ten");
+        seed(&root, "v10", Some(&v10));
+
+        let v9 = tmp.path().join("hub-v9");
+        fake_hub(&v9, "nine");
+        let (link, content) = seed(&root, "v9", Some(&v9));
+
+        assert_eq!(link.as_deref(), Some("releases/seed-v10"));
+        assert_eq!(content.as_deref(), Some("ten-velstand.onnx"));
+    }
+
+    /// Only *our* sets move. One whose record names another repo is somebody's choice, whatever
+    /// its version says, and the minimum has nothing to say about it.
+    #[test]
+    fn a_set_from_another_repo_is_left_alone_below_the_pin() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("policies");
+        std::fs::create_dir_all(root.join("releases/seed-v1")).unwrap();
+        std::fs::write(root.join("releases/seed-v1/velstand.onnx"), "theirs").unwrap();
+        std::fs::write(
+            root.join("releases/seed-v1/.source"),
+            "repo=someone/microduck-policies\nversion=v1\nfetched=2026-01-01T00:00:00Z\n",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink("releases/seed-v1", root.join("current")).unwrap();
+
+        let hub = tmp.path().join("hub");
+        fake_hub(&hub, "pinned");
+        let (link, content) = seed(&root, "v5", Some(&hub));
+
+        assert_eq!(link.as_deref(), Some("releases/seed-v1"));
+        assert_eq!(content.as_deref(), Some("theirs"));
+    }
+
+    /// A board below the minimum that cannot reach the Hub stays where it is — nothing partial,
+    /// nothing removed, and the seeder still does not fail. What happens next is `robotd`'s to
+    /// report: a default it cannot load is unhealthy, and the update rolls back with the reason.
+    #[test]
+    fn a_set_below_the_pin_stays_when_the_hub_is_unreachable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("policies");
+        std::fs::create_dir_all(&root).unwrap();
+
+        let v4 = tmp.path().join("hub-v4");
+        fake_hub(&v4, "old");
+        seed(&root, "v4", Some(&v4));
+
+        let (link, content) = seed(&root, "v5", None);
+        assert_eq!(link.as_deref(), Some("releases/seed-v4"));
+        assert_eq!(content.as_deref(), Some("old-velstand.onnx"));
     }
 
     /// A board that cannot reach the Hub on a first install ends up with no policies, and that
@@ -1493,7 +1769,7 @@ mod tests {
         fake_hub(&hub, "hub");
         std::fs::create_dir_all(root.join("releases/from-a-tool")).unwrap();
         std::fs::write(
-            root.join("releases/from-a-tool/alpha_walking.onnx"),
+            root.join("releases/from-a-tool/velstand.onnx"),
             "installed-by-something-else",
         )
         .unwrap();
@@ -1530,7 +1806,7 @@ mod tests {
         );
         assert_eq!(
             content.as_deref(),
-            Some("one-alpha_walking.onnx"),
+            Some("one-velstand.onnx"),
             "and the board keeps something that works"
         );
     }
@@ -1555,6 +1831,33 @@ mod tests {
             assert!(
                 text.contains("=models/pet_detect.onnx"),
                 "{site} does not package the petting classifier"
+            );
+        }
+    }
+
+    /// The duck detector left the release the way the policies did: it is seeded from the Hub
+    /// by a script the release carries, and the model files themselves are no longer vendored.
+    /// A site that still packages `models/duck_detect.*` would ship fourteen megabytes nothing
+    /// reads; one that forgets the seeder leaves fresh boards with a detector that cannot start.
+    #[test]
+    fn the_detector_seeder_is_packaged_and_the_model_is_not() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("xtask/ has a parent");
+        assert!(
+            !root.join("duck-detect/models").exists(),
+            "the detector model is vendored again; it belongs on the Hub"
+        );
+        for site in PACKAGING_SITES {
+            let text =
+                std::fs::read_to_string(root.join(site)).unwrap_or_else(|e| panic!("{site}: {e}"));
+            assert!(
+                text.contains("=scripts/seed-detector.sh"),
+                "{site} does not package the detector seeder"
+            );
+            assert!(
+                !text.contains("duck_detect"),
+                "{site} still packages the detector model inside the release"
             );
         }
     }

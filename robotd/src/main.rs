@@ -54,7 +54,8 @@ type PowerOff = Arc<dyn Fn() + Send + Sync>;
 
 /// Model API version this build implements (`updater-design.md` §5.5). Bump when the
 /// sensor-input / actuator-output contract a model sees changes.
-const MODEL_API: u32 = 1;
+// API 2 adds explicit recurrent state; API 1 feed-forward models remain supported.
+const MODEL_API: u32 = 2;
 
 /// Socket mode. Same reasoning as `updaterd`'s: the group decides who may ask.
 const SOCKET_MODE: u32 = 0o660;
@@ -2766,6 +2767,11 @@ async fn control_loop<T: RobotIo>(
         if was_driving && !driving {
             stopped_driving_at = Some(tick_start);
             if !snapshot.enabled {
+                // Even a brief explicit disable ends the recurrent episode. The resume
+                // grace period below is for dropped sensor reads, not a user's stop.
+                if let Some(controller) = controller.as_mut() {
+                    controller.reset();
+                }
                 // A deliberate stop returns to the home pose — the prototype's Start-off
                 // ("policy DISABLED - returning to default pose"). Commanded directly, no
                 // ramp: the servos do the travel at their own speed, and the robot is
@@ -3328,18 +3334,28 @@ async fn claim_socket(socket_path: &Path) -> std::io::Result<(std::fs::File, Uni
     use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 
     let lock = claim_lock(socket_path)?;
+    // Before bind, not after it. A regular file or a symlink at the path is a typo, and it is
+    // refused here on every platform rather than left to the kernel: Linux fails to bind over
+    // either, which is what made this look enforced, but macOS follows a dangling symlink and
+    // creates the socket at its target, so a daemon there came up serving through a path nobody
+    // asked for. That is the one platform `cargo test --workspace` is promised on.
+    match std::fs::symlink_metadata(socket_path) {
+        Ok(existing) if !existing.file_type().is_socket() => {
+            return Err(std::io::Error::new(
+                ErrorKind::AddrInUse,
+                "the socket path exists and is not a socket; refusing to bind over it",
+            ));
+        }
+        Ok(_) => (),
+        Err(e) if e.kind() == ErrorKind::NotFound => (),
+        Err(e) => return Err(e),
+    }
     let listener = match UnixListener::bind(socket_path) {
         Ok(listener) => listener,
         Err(e) if e.kind() == ErrorKind::AddrInUse => {
             // An older daemon may own the socket without holding our new lock. Only a
-            // real socket that refuses connections is stale; a timeout, permission error,
-            // regular file or symlink is not permission to remove somebody else's path.
-            if !std::fs::symlink_metadata(socket_path)?
-                .file_type()
-                .is_socket()
-            {
-                return Err(e);
-            }
+            // real socket that refuses connections is stale; a timeout or a permission error
+            // is not permission to remove somebody else's path.
             match tokio::time::timeout(Duration::from_secs(1), UnixStream::connect(socket_path))
                 .await
             {
@@ -5134,15 +5150,19 @@ mod tests {
         );
     }
 
-    /// Limp-fall ships ON, and it must refuse a fallen robot nothing.
+    /// Limp-fall ships OFF (the default gait has no standing network to hand back to), and
+    /// switched on it must refuse a fallen robot nothing.
     ///
     /// This is the contract that answers "I booted it face-down and pressed Start": enable
-    /// and init are never refused for gravity, whatever the mode is set to. It matters more
-    /// now the mode is a default than it did when it was opt-in — every robot has it.
+    /// and init are never refused for gravity, whatever the mode is set to.
     #[test]
-    fn limp_fall_ships_on_and_refuses_nothing() {
-        let params = Params::default();
-        assert!(params.safety.limp_fall, "on by default, fleet-wide");
+    fn limp_fall_ships_off_and_refuses_nothing() {
+        let mut params = Params::default();
+        assert!(
+            !params.safety.limp_fall,
+            "off by default: velstand loads no standing policy"
+        );
+        params.safety.limp_fall = true;
 
         let s = RobotState::new(
             &params,
@@ -5352,8 +5372,10 @@ mod tests {
     /// crouch that roller mode does have.
     #[test]
     fn the_published_policy_names_are_one_modes_answer() {
-        let walk = PolicyNames::of(&Params::default().policy.resolved());
-        assert!(walk.stand.is_some(), "walking has a standing network");
+        let mut walking = Params::default();
+        walking.policy.stand = Some(PathBuf::from("/srv/alpha_stand.onnx"));
+        let walk = PolicyNames::of(&walking.policy.resolved());
+        assert!(walk.stand.is_some(), "walking can carry a standing network");
 
         let mut rolling = Params::default();
         rolling.policy.mode = Mode::Roller;
@@ -6845,7 +6867,7 @@ mod tests {
         assert!(policy.slot(Slot::Walk).is_none(), "the override is dropped");
         assert_eq!(
             policy.resolved().walk,
-            PathBuf::from(params::POLICY_DIR).join("alpha_walking.onnx"),
+            PathBuf::from(params::POLICY_DIR).join("velstand.onnx"),
             "and the slot resolves to this robot's own policy"
         );
         let reason = errors.get(Slot::Walk).expect("the reason is kept");
@@ -7610,9 +7632,12 @@ mod tests {
         assert!(result.enabled);
         assert_eq!(result.slots.len(), Slot::ALL.len());
         for slot in &result.slots {
+            // `stand` is the empty row by default — velstand stands on its own — and an
+            // empty slot has no file to have come from anywhere.
+            let expected = (slot.slot != "stand").then_some("official");
             assert_eq!(
                 slot.origin.as_deref(),
-                Some("official"),
+                expected,
                 "a default robot runs the release's own set: {slot:?}"
             );
             assert!(!slot.overridden, "{slot:?}");
