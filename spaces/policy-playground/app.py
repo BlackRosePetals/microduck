@@ -994,4 +994,14 @@ with gr.Blocks(title="microduck policy playground") as demo:
 
 
 if __name__ == "__main__":
-    demo.launch(server_name="0.0.0.0", server_port=int(os.environ.get("PORT", 7860)))
+    # **`ssr_mode=False`, and the Space would not stay up without it.** Gradio's server-side
+    # rendering puts a Node proxy on 7860 in front of Python on 7861, and on this Space it
+    # started, served nothing, and stopped ten seconds later — `Stopping Node.js server...` and no
+    # traceback, which is a failure with nowhere to look. SSR buys SEO for a page that sits behind
+    # a sign-in, so the second process is all cost; `vision-demo`'s Dockerfile rules it out with
+    # `GRADIO_SSR_MODE=false` for the different reason that its image has no Node at all.
+    demo.launch(
+        server_name="0.0.0.0",
+        server_port=int(os.environ.get("PORT", 7860)),
+        ssr_mode=False,
+    )
