@@ -530,6 +530,55 @@ that removed it.
 This must be closed — the flag flipped, and defaulted on — before anything is handed to anyone. A robot whose provisioning secret is readable by a
 bystander is not a robot you can hand to a stranger.
 
+#### iOS is not macOS, and that is all that was established  · **measured** (2026-09-14)
+
+A short A/B on olducky, phone against board, `btd` restarted between runs through a systemd drop-in
+so the unit's `SupplementaryGroups` were the real ones.
+
+With `--require-pairing` **off** — which is Reachy Mini's configuration exactly, see below — an
+iPhone connected and discovered the service without complaint. With it **on**, iOS put up its
+pairing prompt. That is the part worth recording: **CoreBluetooth on a phone begins SMP where
+CoreBluetooth on a laptop does not**, so the hang §5.5 measured is not a property of the stack in
+general, and "no bond is possible" is not what is happening.
+
+What was *not* established, because the run was stopped there: whether the encrypted read then
+completed, and what `bluetoothctl info` said about the bond. `version read` never appeared in the
+journal — but that line is `debug!` and the unit sets `RUST_LOG=info`, so its absence is not
+evidence either. Anyone picking this up starts by adding `Environment=RUST_LOG=debug` to the same
+drop-in, connecting, and tapping the read rather than the connect.
+
+#### The reference implementation does not use link-layer encryption at all
+
+Worth knowing before anyone spends another day on the flag. `reachy_mini`'s BLE provisioning service
+(`daemon/app/services/bluetooth/bluetooth_service.py`) declares its characteristics `["write"]` and
+`["read", "notify"]` — no encryption flag anywhere. It registers a `NoInputNoOutput` agent and sets
+`Pairable`, so a central *may* bond, but nothing ever requires it. That is why it works on iOS: the
+phone is never asked to encrypt anything.
+
+Their reasoning is ours, reached first and answered differently:
+
+> BLE pairing here is Just-Works (the robot is `NoInputNoOutput` hardware, so MITM-protected pairing
+> isn't possible) — so we encrypt at the application layer and mix the device PIN into the key
+> derivation.
+
+The same dead end `crate::pairing` documents. Where this page concluded *fix the link layer*, they
+concluded *stop asking the link layer for confidentiality and seal the one secret that matters*:
+`x25519-hkdf-sha256-aesgcm`, ephemeral ECDH against a rotating robot key, HKDF salted with the PIN,
+AES-256-GCM with the SSID as AAD. It defeats a passive sniffer and does not defeat an active MITM
+present during setup; they say so, and track a PAKE as follow-up.
+
+**So §8.1 has a third candidate fix, and one caveat that is ours alone.** The property that matters —
+a bystander cannot recover the owner's wifi passphrase — comes from the ephemeral ECDH, not from the
+PIN. The PIN-as-salt is what stops a wrong-PIN peer producing a decryptable blob, and at `000000` it
+buys nothing here. Their per-robot PIN is the serial's last five characters, printed on the robot,
+which works because *their* advertisement is anonymous — every robot advertises `ReachyMini`. Ours
+advertises a name derived from the serial (§8.2), so that particular trick is closed to us by a
+choice made for a better reason.
+
+**Deferred, deliberately, and not dismissed.** Nothing is shipped and nobody has been handed a
+robot, so the link stays open and `--require-pairing` stays off and stays the default. The gate is
+unchanged: this closes before a robot goes to anyone.
+
 ### 5.6 Open
 
 - **Bond revocation.** Nothing un-pairs a phone; `bluetoothctl untrust` is the manual escape. Needs
@@ -647,10 +696,21 @@ Ordered by what blocks what, not by size.
 
 §5.5 in full. The link is unencrypted **by default** — `--require-pairing` exists and is off, because
 requiring it makes every client hang — so the PIN and every wifi passphrase cross in clear. Closing
-this means making the secure configuration work *and* flipping the default; doing only the first
-leaves every board insecure. One fact decides the fix and is not yet known: whether a bond exists at all (`bluetoothctl info <mac>` on
-the robot). *Bonded but not encrypting* and *never bonded* need opposite repairs, and shipping the
-wrong one leaves the problem in place while looking solved.
+this means making the confidential configuration work *and* making it the default; doing only the
+first leaves every board insecure.
+
+Three candidate fixes now, where this section used to assume one:
+
+| | |
+|---|---|
+| **Fix the link layer** | What this page assumed. If it works, the whole routed surface is confidential rather than one field, and we write no crypto. Against it: the bond can only ever be just-works, so `encrypt_authenticated_write` is unreachable whatever else changes (§5.5) |
+| **Seal at the application layer** | Reachy Mini's answer, in production on both phone platforms and through App Review. Protects the passphrase against a passive sniffer with no bond at all. Against it: it protects only what someone remembers to seal, and this transport now carries a device code, journal lines and the PIN itself (§3.1) |
+| **Seal the session rather than the call** | The same crypto established once after `hello`, covering every frame after it. More work than the row above and the only one that covers `system.authenticate`, so a method added later cannot be the one nobody sealed |
+
+The fact that would decide the first row is still not known — whether a bond exists at all
+(`bluetoothctl info <mac>` on the robot). *Bonded but not encrypting* and *never bonded* need
+opposite repairs, and shipping the wrong one leaves the problem in place while looking solved. §5.5
+records how far the iPhone run got and where to resume it.
 
 ### 8.2 Telling robots apart — three people, three robots, one room  · **built**
 

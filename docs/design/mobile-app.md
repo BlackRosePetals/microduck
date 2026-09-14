@@ -108,10 +108,11 @@ What is worth taking is the plumbing, which is where the expensive knowledge is:
 
 | take as code | take as a rule | leave |
 |---|---|---|
-| `tauri-plugin-blec` wiring, including the vendored `btleplug` patch and keeping the crate and the npm bindings in lock-step | scan unfiltered and discriminate your own candidates — their scan core and §3.3 arrived at this separately, which is the evidence it is real | TanStack Query: it caches server state over HTTP, and this app has none |
+| `tauri-plugin-blec` wiring, and the vendored `btleplug` patch — not a nicety: btleplug `.expect()`s on *"Got descriptors for a characteristic we don't know about"* and takes the BLE event loop down on connect (deviceplug/btleplug#397). It hits macOS and iOS both, since `blec` only has a native backend on Android, so `duckctl` is exposed to it too | scan unfiltered and discriminate your own candidates — their scan core and §3.3 arrived at this separately, which is the evidence it is real | TanStack Query: it caches server state over HTTP, and this app has none |
 | the Android BLE runtime-permission handling, which is the reason to use `blec` over `btleplug` bare | poll for a candidate rather than taking one snapshot after a sleep (§3.4) | the setup-wizard state machine — §4 |
 | edge-to-edge, `viewport-fit=cover`, safe-area insets, the portrait lock | every error carries the step it recovers to, so "try again" does not restart the flow | the string-matched error taxonomy: `configd` returns `BadKey` and `NotFound` as types, and a version skew names itself `METHOD_NOT_FOUND` or `INVALID_PARAMS` (§3) |
 | the release workflow's shape — unsigned simulator `.app` and debug `.apk` on the release, signed TestFlight and Play Internal alongside | a BLE drop while the app is backgrounded is expected, not a fault: iOS tears the GATT link down | |
+| the `x25519-hkdf-sha256-aesgcm` sealed-password scheme, if §8.1 lands on sealing rather than on the link layer — the wire format is documented on their side and there is a working client to test an implementation against | | |
 | their App Store compliance and review notes, which are written once and cost a rejection to learn | a failed connect can look like a success and then hang at subscribe; force a fresh discovery by disconnecting and reconnecting | |
 
 ## 3. The protocol lives in Rust
@@ -203,15 +204,17 @@ to want the same, and §3's caveat is the reason it might.
 ## 6. The spike that comes first
 
 One throwaway build, on a real iPhone and a real Android: scan, connect, subscribe, `hello`,
-`system.authenticate`, `system.info` — with `--require-pairing` **on**.
+`system.authenticate`, `system.info` — against the link the robot actually serves, which is
+`--require-pairing` **off** (§5.5).
 
 Four open questions have the same answer:
 
-- **Does iOS hang on `encrypt_read` the way macOS does?** §5.5 is the blocker and it is still a fact
-  about CoreBluetooth on a laptop. Nobody has asked a phone, and a phone is the client this is for.
-  The answer decides whether the fix is moving the requirement to the write or something else
-  entirely — and §5.5 names the thing that has to be established first either way, which is whether
-  a bond exists at all.
+- **Does iOS hang on `encrypt_read` the way macOS does?** Half-answered, and off the critical path.
+  An iPhone against olducky with `--require-pairing` on put up its pairing prompt, where macOS
+  begins no SMP at all — so the hang is not a property of CoreBluetooth generally. The read was not
+  confirmed either way before the run was stopped; §5.5 records exactly how far it got and what to
+  set before resuming. It is no longer a blocker on the app because §8.1 gained two fixes that need
+  no bond, so the app can be built against the open link the robot already serves.
 - **Are both platforms happy with one characteristic that reads, writes and notifies?** It reads
   oddly in nRF Connect (§3), which is a cosmetic cost; a phone stack refusing it would not be.
 - **What MTU does a phone actually negotiate?** Half of this is now answered on the robot side: §3.6
@@ -232,8 +235,8 @@ they are all app-facing. It is shorter than it was — three rows were settled i
 
 | | |
 |---|---|
-| **Encryption** — §5.5, §8.1 | The blocker, and unchanged. An app whose job is writing a wifi passphrase cannot ship over a link that carries it in clear. `--require-pairing` exists and is off, because requiring it makes every client hang. §6 above is how we learn what the fix is |
-| **`identify`** — §8.2 | Make *this* robot do something, so a list of three names becomes the duck in your hands. Partly answered by accident: `robot.do` is routed now, so a skill can be the signal — but §8.2's second requirement stands, that it has to work *before* authentication, since requiring the PIN first is circular when aiming the PIN at the right robot is the problem |
+| **Encryption** — §5.5, §8.1 | Still the thing that has to close before a robot goes to anyone: an app whose job is writing a wifi passphrase cannot *ship* over a link that carries it in clear. It no longer blocks *building*, which is the change. §8.1 now has three candidate fixes and two of them need no bond, so the app is written against the open link either way and the choice can be made while it is being written |
+| **`identify`** — §8.2 | Make *this* robot do something, so a list of three names becomes the duck in your hands. Two thirds solved already: `robot.do` is routed, and §8.2's claim that nothing in the tree drives a speaker is stale — there is a `sounds` crate, and `robot.sound` is refused rather than missing. What is left is §8.2's second requirement, that it work *before* authentication, since requiring the PIN first is circular when aiming the PIN at the right robot is the problem. Reachy Mini's answer is the shape to copy: `PLAY_SOUND` is an explicitly public, no-PIN command played straight from the scan list |
 | **A per-robot PIN** — §5.3, §8.2 | Nothing generates, prints or records one, and it cannot be derived from the identity because the identity is advertised. Waits on hardware. Until then, see §8 |
 | **Bond revocation** — §5.6 | "Forget this phone" is a settings-app staple and there is no API for it. `bluetoothctl untrust` is the manual escape |
 | **Factory reset** — §8.2 | Nothing clears `configd`'s config, so a provisioned name and a user rename are indistinguishable |
