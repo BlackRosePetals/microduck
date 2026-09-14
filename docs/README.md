@@ -3,6 +3,10 @@
 The [README](../README.md) is the front door — what a microduck is, and where to go. If you have
 one in front of you and want to drive it, start at the [cheat sheet](robot/cheatsheet.md).
 
+[`faq.md`](faq.md) is the other front door: task-shaped questions from somebody building
+*against* a duck rather than changing it — running a model too heavy for the board, getting the
+camera into their own program, why a Space cannot connect.
+
 It is also where a **publisher** starts: [`policy-manifest.md`](policy-manifest.md) is the
 contract for a `manifest.json` beside a microduck `.onnx`, and it owns every field. The design
 docs give the reasoning and point at it.
