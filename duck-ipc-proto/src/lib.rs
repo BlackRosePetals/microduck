@@ -395,6 +395,10 @@ pub mod socket {
     /// Under `/run/tofd/` for the same reason as the pad's: it is that unit's
     /// `RuntimeDirectory=`, so systemd removes the socket when the daemon stops.
     pub const TOF: &str = "/run/tofd/tof.sock";
+
+    /// `mediad`'s on-demand raw-frame endpoint. It is local-only: a raw camera frame is for a
+    /// recorder or perception process on the robot, not a multi-megabyte WebRTC control reply.
+    pub const MEDIA: &str = "/run/mediad/media.sock";
 }
 
 /// Where each daemon publishes what it is running: `/run/<service>/identity.json`.
@@ -451,6 +455,12 @@ pub const JOINT_NAMES: [&str; 15] = [
 /// with `update.*`. [`Call`] is the typed form.
 pub mod method {
     pub const HELLO: &str = "hello";
+
+    /// One raw camera frame. `mediad` answers the JSON-RPC header, followed immediately by the
+    /// bytes named in that header, on its local Unix socket.
+    /// Deliberately not a `Call`: its binary tail must never enter Service/Lane routing
+    /// or the WebRTC control datachannel. Local clients dial `socket::MEDIA` explicitly.
+    pub const MEDIA_FRAME: &str = "media.frame";
 
     pub const CHECK: &str = "update.check";
     pub const APPLY: &str = "update.apply";
@@ -2885,6 +2895,40 @@ pub struct HelloResult {
     /// from CI (someone's laptop). Always serialised, including as `null`, so the wire
     /// shape does not depend on the value.
     pub revision: Option<String>,
+}
+
+/// Metadata preceding the binary tail of a local `media.frame` response.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MediaFrameHeader {
+    pub width: u32,
+    pub height: u32,
+    pub format: String,
+    pub bytes: usize,
+    pub captured_at_unix_us: u128,
+    /// Degrees clockwise the camera is mounted from upright — the same number `media.video`
+    /// tells a WebRTC peer, and zero when `--flip-in-pipeline` already turned these pixels.
+    ///
+    /// **Carried rather than written down.** The geometry above describes the bytes exactly as
+    /// they are, and a consumer cannot recover the mount from them: a 180° mount is
+    /// indistinguishable from an upright one, and a quarter turn is only a guess from the aspect
+    /// ratio. A recorder building a dataset needs the angle programmatically, and a human
+    /// converting a frame should not have to find a document to learn their picture is sideways.
+    pub rotate: u32,
+}
+impl MediaFrameHeader {
+    /// Bound allocation and reject malformed geometry before decoding pixels.
+    pub fn valid_uyvy(&self) -> bool {
+        self.width > 0
+            && self.height > 0
+            && self.width.is_multiple_of(2)
+            && self.format == "UYVY"
+            && matches!(self.rotate, 0 | 90 | 180 | 270)
+            && self.bytes <= 16 * 1024 * 1024
+            && (self.width as usize)
+                .checked_mul(self.height as usize)
+                .and_then(|n| n.checked_mul(2))
+                == Some(self.bytes)
+    }
 }
 
 /// Where an in-flight update has got to. Mirrors the state machine in
