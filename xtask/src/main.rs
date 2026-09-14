@@ -1173,7 +1173,7 @@ mod tests {
         let link = std::fs::read_link(root.join("current"))
             .ok()
             .map(|p| p.display().to_string());
-        let content = std::fs::read_to_string(root.join("current/alpha_walking.onnx")).ok();
+        let content = std::fs::read_to_string(root.join("current/velstand.onnx")).ok();
         (link, content)
     }
 
@@ -1507,7 +1507,7 @@ mod tests {
 
         let (link, content) = seed(&root, "v1", Some(&hub));
         assert_eq!(link.as_deref(), Some("releases/seed-v1"));
-        assert_eq!(content.as_deref(), Some("hub-alpha_walking.onnx"));
+        assert_eq!(content.as_deref(), Some("hub-velstand.onnx"));
 
         let mut installed: Vec<String> = std::fs::read_dir(root.join("releases/seed-v1"))
             .unwrap()
@@ -1541,7 +1541,7 @@ mod tests {
             serde_json::to_string_pretty(&serde_json::json!({
                 "schema_version": 1,
                 "policies": [
-                    { "file": "alpha_walking.onnx", "kind": "perpetual" },
+                    { "file": "velstand.onnx", "kind": "perpetual" },
                     { "file": escape },
                 ]
             }))
@@ -1553,7 +1553,7 @@ mod tests {
 
         let (link, content) = seed(&root, "v1", Some(&hub));
         assert_eq!(link.as_deref(), Some("releases/seed-v1"));
-        assert_eq!(content.as_deref(), Some("hub-alpha_walking.onnx"));
+        assert_eq!(content.as_deref(), Some("hub-velstand.onnx"));
         assert!(
             !root.join("escaped.onnx").exists() && !tmp.path().join("escaped.onnx").exists(),
             "nothing was written outside the set"
@@ -1626,16 +1626,17 @@ mod tests {
         );
     }
 
-    /// **An installed set is never replaced, whatever the pin says.**
+    /// **A set past the pin is never moved back to it.**
     ///
-    /// The pin is a floor — what a board with nothing gets — and not a ceiling. This used to
-    /// replace an older set on the reasoning that a daemon update was still how a retrained gait
-    /// reached a board; `robotctl policy update` is now how, and the old rule became a trap. A
-    /// board moved forward to v2 by hand had `current -> releases/seed-v2`, which matches the
-    /// `seed-*` the seeder called its own, so the next unrelated daemon update would have put v1
-    /// back — silently reverting somebody's gait as a side effect of a binary update.
+    /// The pin is a minimum — what a board with nothing gets, and the oldest set the daemon runs
+    /// with — and not a ceiling. This used to replace any older set on the reasoning that a daemon
+    /// update was still how a retrained gait reached a board; `robotctl policy update` is now how,
+    /// and that rule was a trap. A board moved forward to v2 by hand had `current ->
+    /// releases/seed-v2`, which matches the `seed-*` the seeder called its own, so the next
+    /// unrelated daemon update would have put v1 back — silently reverting somebody's gait as a
+    /// side effect of a binary update.
     #[test]
-    fn a_set_already_installed_is_left_alone_whatever_the_pin_says() {
+    fn a_set_past_the_pin_is_left_alone() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("policies");
         std::fs::create_dir_all(&root).unwrap();
@@ -1650,7 +1651,95 @@ mod tests {
         let (link, content) = seed(&root, "v1", Some(&v1));
 
         assert_eq!(link.as_deref(), Some("releases/seed-v2"));
-        assert_eq!(content.as_deref(), Some("chosen-alpha_walking.onnx"));
+        assert_eq!(content.as_deref(), Some("chosen-velstand.onnx"));
+    }
+
+    /// **A set below the pin is moved up to it.** The daemon's slot defaults name files, and a
+    /// default that names a file only the newer set carries — v5's `velstand.onnx` — would leave a
+    /// board that updated the daemon but not its set unable to load its gait, unhealthy, and
+    /// rolled back. So the pin is the minimum the daemon runs with, and the hook enforces it.
+    #[test]
+    fn a_set_below_the_pin_is_moved_up_to_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("policies");
+        std::fs::create_dir_all(&root).unwrap();
+
+        let v4 = tmp.path().join("hub-v4");
+        fake_hub(&v4, "old");
+        seed(&root, "v4", Some(&v4));
+
+        let v5 = tmp.path().join("hub-v5");
+        fake_hub(&v5, "pinned");
+        let (link, content) = seed(&root, "v5", Some(&v5));
+
+        assert_eq!(link.as_deref(), Some("releases/seed-v5"));
+        assert_eq!(content.as_deref(), Some("pinned-velstand.onnx"));
+        let record = std::fs::read_to_string(root.join("current/.source")).unwrap();
+        assert!(record.contains("version=v5"), "{record}");
+        assert!(
+            root.join("releases/seed-v4/velstand.onnx").exists(),
+            "the set it came from is kept, the way the updater keeps a predecessor"
+        );
+    }
+
+    /// The comparison is on numbers, so `v10` is past `v9` and not below it.
+    #[test]
+    fn the_minimum_compares_versions_as_numbers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("policies");
+        std::fs::create_dir_all(&root).unwrap();
+
+        let v10 = tmp.path().join("hub-v10");
+        fake_hub(&v10, "ten");
+        seed(&root, "v10", Some(&v10));
+
+        let v9 = tmp.path().join("hub-v9");
+        fake_hub(&v9, "nine");
+        let (link, content) = seed(&root, "v9", Some(&v9));
+
+        assert_eq!(link.as_deref(), Some("releases/seed-v10"));
+        assert_eq!(content.as_deref(), Some("ten-velstand.onnx"));
+    }
+
+    /// Only *our* sets move. One whose record names another repo is somebody's choice, whatever
+    /// its version says, and the minimum has nothing to say about it.
+    #[test]
+    fn a_set_from_another_repo_is_left_alone_below_the_pin() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("policies");
+        std::fs::create_dir_all(root.join("releases/seed-v1")).unwrap();
+        std::fs::write(root.join("releases/seed-v1/velstand.onnx"), "theirs").unwrap();
+        std::fs::write(
+            root.join("releases/seed-v1/.source"),
+            "repo=someone/microduck-policies\nversion=v1\nfetched=2026-01-01T00:00:00Z\n",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink("releases/seed-v1", root.join("current")).unwrap();
+
+        let hub = tmp.path().join("hub");
+        fake_hub(&hub, "pinned");
+        let (link, content) = seed(&root, "v5", Some(&hub));
+
+        assert_eq!(link.as_deref(), Some("releases/seed-v1"));
+        assert_eq!(content.as_deref(), Some("theirs"));
+    }
+
+    /// A board below the minimum that cannot reach the Hub stays where it is — nothing partial,
+    /// nothing removed, and the seeder still does not fail. What happens next is `robotd`'s to
+    /// report: a default it cannot load is unhealthy, and the update rolls back with the reason.
+    #[test]
+    fn a_set_below_the_pin_stays_when_the_hub_is_unreachable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("policies");
+        std::fs::create_dir_all(&root).unwrap();
+
+        let v4 = tmp.path().join("hub-v4");
+        fake_hub(&v4, "old");
+        seed(&root, "v4", Some(&v4));
+
+        let (link, content) = seed(&root, "v5", None);
+        assert_eq!(link.as_deref(), Some("releases/seed-v4"));
+        assert_eq!(content.as_deref(), Some("old-velstand.onnx"));
     }
 
     /// A board that cannot reach the Hub on a first install ends up with no policies, and that
@@ -1680,7 +1769,7 @@ mod tests {
         fake_hub(&hub, "hub");
         std::fs::create_dir_all(root.join("releases/from-a-tool")).unwrap();
         std::fs::write(
-            root.join("releases/from-a-tool/alpha_walking.onnx"),
+            root.join("releases/from-a-tool/velstand.onnx"),
             "installed-by-something-else",
         )
         .unwrap();
@@ -1717,7 +1806,7 @@ mod tests {
         );
         assert_eq!(
             content.as_deref(),
-            Some("one-alpha_walking.onnx"),
+            Some("one-velstand.onnx"),
             "and the board keeps something that works"
         );
     }

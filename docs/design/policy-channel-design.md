@@ -280,12 +280,17 @@ manifest, since its two files have fixed names (`docs/project/npu-bringup.md`). 
 and as literals in the script, with a test asserting they agree — `setup-gstreamer.sh`'s trap,
 because a script that runs from inside a release cannot read the manifest.
 
-**The pin is a floor, not a ceiling**, and that distinction is load-bearing. It ships inside the
-daemon release, so bumping it *does* need a daemon release — an earlier draft of this section
-claimed otherwise and was simply wrong. What the pin decides is what a *freshly provisioned* board
-installs. Moving past it is `robotctl policy update` (§9.1), which is the thing that makes a
-retrained gait reach a robot without a daemon release, and therefore the thing that makes this
-whole channel worth having.
+**The pin is a minimum, not a ceiling**, and that distinction is load-bearing. It ships inside
+the daemon release, so bumping it *does* need a daemon release — an earlier draft of this section
+claimed otherwise and was simply wrong. The pin decides two things: what a *freshly provisioned*
+board installs, and the oldest official set this daemon runs with. A board whose set is from our
+repo and below the pin is moved up to it by the post-install hook — the daemon's slot defaults
+name files, and a default that names a file only a newer set carries (v5's `velstand.onnx`) would
+otherwise leave a board that updated the daemon alone unable to load its gait, unhealthy, and
+rolled back. A set past the pin, from another repo, or without a `.source` record is left alone.
+Moving past it is `robotctl policy update` (§9.1), which is the thing that makes a retrained gait
+reach a robot without a daemon release, and therefore the thing that makes this whole channel
+worth having.
 
 Three things it does not do. It does not re-download a set it already has, so an update whose pin
 is unchanged touches no network — which matters because the post-install hook runs under a
@@ -660,7 +665,8 @@ dereferencing the symlinks that repository uses to give stable names to particul
 
 | in the set | upstream | role |
 | --- | --- | --- |
-| `alpha_walking.onnx` | `BEST_alpha_walking_rough.onnx` | walking / velstand |
+| `alpha_walking.onnx` | `BEST_alpha_walking_rough.onnx` | walking / velstand (default `walk` until set v5) |
+| `velstand.onnx` | `pollen-robotics/microduck_rl` `velstand_best.onnx` (2026-09-14) | walking + standing at zero command; default `walk` from set v5, `stand` unset |
 | `alpha_stand.onnx` | `BEST_alpha_stand_body_control.onnx` | standing + body-pose |
 | `alpha_sitstand.onnx` | `BEST_alpha_sitstand.onnx` | sit ↔ stand (posture flag) |
 | `alpha_ground_pick.onnx` | `alpha_ground_pick.onnx` | ground pick (phase command) |
@@ -706,7 +712,7 @@ its meaning for the things that genuinely are models and not control policies, s
 | Seeding never overwrites a set it did not install | The handover needs no flag: the first real install ends it (§9) |
 | The set is downloaded, not shipped | Same as ONNX Runtime and the plugins; bumping the pin ships a gait (§9) |
 | A failed fetch keeps the set already installed | A half-published revision must not downgrade a working gait (§9) |
-| The pin is a floor; `policy update` moves past it | Otherwise a gait still needs a daemon release, which is the thing this channel is for (§9.1) |
+| The pin is a minimum; `policy update` moves past it | A default that names a newer set's file must not roll the daemon back on boards behind it; a gait still needs no daemon release (§9.1) |
 | A set records the repo it came from | One writer, one copy, nothing to configure twice or drift (§9.1) |
 | Reload is a third thing, not reset-all | They look identical from outside and conflating them discards every override (§9.1) |
 | One-shot skills are config, not code | Kicks and roulade were the same arm with different numbers; a community one is a fifth set (§10) |

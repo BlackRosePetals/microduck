@@ -5140,15 +5140,19 @@ mod tests {
         );
     }
 
-    /// Limp-fall ships ON, and it must refuse a fallen robot nothing.
+    /// Limp-fall ships OFF (the default gait has no standing network to hand back to), and
+    /// switched on it must refuse a fallen robot nothing.
     ///
     /// This is the contract that answers "I booted it face-down and pressed Start": enable
-    /// and init are never refused for gravity, whatever the mode is set to. It matters more
-    /// now the mode is a default than it did when it was opt-in — every robot has it.
+    /// and init are never refused for gravity, whatever the mode is set to.
     #[test]
-    fn limp_fall_ships_on_and_refuses_nothing() {
-        let params = Params::default();
-        assert!(params.safety.limp_fall, "on by default, fleet-wide");
+    fn limp_fall_ships_off_and_refuses_nothing() {
+        let mut params = Params::default();
+        assert!(
+            !params.safety.limp_fall,
+            "off by default: velstand loads no standing policy"
+        );
+        params.safety.limp_fall = true;
 
         let s = RobotState::new(
             &params,
@@ -5358,8 +5362,10 @@ mod tests {
     /// crouch that roller mode does have.
     #[test]
     fn the_published_policy_names_are_one_modes_answer() {
-        let walk = PolicyNames::of(&Params::default().policy.resolved());
-        assert!(walk.stand.is_some(), "walking has a standing network");
+        let mut walking = Params::default();
+        walking.policy.stand = Some(PathBuf::from("/srv/alpha_stand.onnx"));
+        let walk = PolicyNames::of(&walking.policy.resolved());
+        assert!(walk.stand.is_some(), "walking can carry a standing network");
 
         let mut rolling = Params::default();
         rolling.policy.mode = Mode::Roller;
@@ -6851,7 +6857,7 @@ mod tests {
         assert!(policy.slot(Slot::Walk).is_none(), "the override is dropped");
         assert_eq!(
             policy.resolved().walk,
-            PathBuf::from(params::POLICY_DIR).join("alpha_walking.onnx"),
+            PathBuf::from(params::POLICY_DIR).join("velstand.onnx"),
             "and the slot resolves to this robot's own policy"
         );
         let reason = errors.get(Slot::Walk).expect("the reason is kept");
@@ -7616,9 +7622,12 @@ mod tests {
         assert!(result.enabled);
         assert_eq!(result.slots.len(), Slot::ALL.len());
         for slot in &result.slots {
+            // `stand` is the empty row by default — velstand stands on its own — and an
+            // empty slot has no file to have come from anywhere.
+            let expected = (slot.slot != "stand").then_some("official");
             assert_eq!(
                 slot.origin.as_deref(),
-                Some("official"),
+                expected,
                 "a default robot runs the release's own set: {slot:?}"
             );
             assert!(!slot.overridden, "{slot:?}");

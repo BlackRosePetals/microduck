@@ -14,7 +14,7 @@ skill that gets written comes from the robot's own reading of the manifest it do
 is what will actually run.
 
 **Two shapes, one vocabulary.** A single-policy repo carries one `policy.onnx` with the fields at
-the top level; the official set carries nine files and the same fields once per entry under
+the top level; the official set carries ten files and the same fields once per entry under
 `policies`. `policy.fetch` takes a `file`, so an entry out of the set is one click like any other.
 
 Runnable on its own — `uv run catalogue.py` prints what a duck would be offered — which is how

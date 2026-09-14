@@ -717,7 +717,8 @@ mod tests {
         let find = |key: &str| rows.iter().find(|r| r.entry.key == key).expect("known");
         assert_eq!(find("control.hz").effective(), "50");
         assert_eq!(find("policy.mode").effective(), "walk");
-        assert_eq!(find("safety.limp_fall").effective(), "true");
+        assert_eq!(find("safety.limp_fall").effective(), "false");
+        assert_eq!(find("policy.voltage_adapt").effective(), "true");
         assert_eq!(find("audio.pet_detect").effective(), "unset");
     }
 
@@ -954,7 +955,7 @@ mod tests {
                 .clone()
         };
         let walk = hint(&m, "policy.walk").expect("resolves");
-        assert!(walk.contains("alpha_walking"), "{walk}");
+        assert!(walk.contains("velstand"), "{walk}");
         assert_eq!(hint(&m, "policy.legs_lowpass").as_deref(), Some("0.7"));
         assert_eq!(
             hint(&m, "audio.pet_detect").as_deref(),
