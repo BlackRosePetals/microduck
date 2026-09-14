@@ -49,12 +49,14 @@ runtime = "v2.3.2"
 # inside a release and cannot read this file, so it carries the literals and a test asserts the
 # two agree.
 #
-# `version` is a tag in the Hub repo, and it is a *floor*: it decides what a freshly provisioned
-# board installs, not what every board runs. Moving past it is `robotctl policy update`, which
-# needs no daemon release — bumping this does, since it ships inside one.
+# `version` is a tag in the Hub repo, and it is a *minimum*: what a freshly provisioned board
+# installs, and the oldest official set this daemon's defaults load — a board below it is moved
+# up to it by the post-install hook, one past it is left alone. Moving past it is `robotctl
+# policy update`, which needs no daemon release — bumping this does, since it ships inside one,
+# and it is bumped when a slot's default names a file only the new set carries.
 [workspace.metadata.policies]
 repo    = "pollen-robotics/microduck-policies"
-version = "v1"
+version = "v5"
 
 # The duck detector, the same way: trained in pollen-robotics/duck_detector, published on the Hub,
 # and seeded onto a board by `scripts/seed-detector.sh` from this pin — a floor, moved past with

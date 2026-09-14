@@ -7,7 +7,7 @@
 //! an HTTP client because it is the tool that has to work when everything else is broken.
 //!
 //! **Why it exists.** A board installs its set from a pin that ships inside the daemon release
-//! (`scripts/seed-policies.sh`), which makes the pin a *floor* rather than a ceiling: without
+//! (`scripts/seed-policies.sh`), which makes the pin a *minimum* rather than a ceiling: without
 //! something to move past it, a retrained gait would still need a daemon release to reach a
 //! robot, which is the thing the whole channel was meant to stop. This is that something.
 //!

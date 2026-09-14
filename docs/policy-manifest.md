@@ -3,7 +3,7 @@
 What a `manifest.json` beside a microduck `.onnx` says, and what the robot does with each field.
 One vocabulary for two shapes: a **single-policy repo** (`<user>/microduck-<name>` on the Hub,
 one `policy.onnx`, the fields at the top level) and the **official set**
-(`pollen-robotics/microduck-policies`, nine files, the same fields once per entry under
+(`pollen-robotics/microduck-policies`, ten files, the same fields once per entry under
 `policies`). One reader understands both, and asking a publisher for something is "add a field",
 never "adopt our format".
 

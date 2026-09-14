@@ -889,7 +889,7 @@ pub struct PolicyParams {
     pub skills: Vec<SkillDef>,
     /// Scale actions with battery voltage: effective scale × (nominal / measured). The
     /// servos' effective kP tracks their supply, so this holds the robot's response steady
-    /// as the pack sags. Off by default, as in the prototype.
+    /// as the pack sags. On by default since 2026-09-14 (the prototype ran without it).
     pub voltage_adapt: bool,
     /// Reference voltage for `voltage_adapt` — the supply the gains were identified at.
     pub nominal_voltage: f64,
@@ -1576,9 +1576,13 @@ impl PolicyParams {
         };
 
         let (walk_default, stand, sitstand, ground_pick) = match self.mode {
+            // The velstand gait (set v5) walks on a twist and stands still at zero command,
+            // so no standing network is loaded by default: with `stand` unset the walking
+            // policy runs at every velocity. `alpha_walking.onnx` + `alpha_stand.onnx` stay
+            // in the set for a board that loads them back by hand.
             Mode::Walk => (
-                "alpha_walking.onnx",
-                Some("alpha_stand.onnx"),
+                "velstand.onnx",
+                None,
                 Some("alpha_sitstand.onnx"),
                 Some("alpha_ground_pick.onnx"),
             ),
@@ -1687,9 +1691,9 @@ pub struct SafetyParams {
     pub battery_empty_shutdown: bool,
 
     /// Go limp *while falling*, to land soft instead of fighting the floor all the way
-    /// down. **On by default** since it was validated on a robot — the whole point is that
-    /// the fleet lands soft, and a mode every board has to opt into individually is a mode
-    /// most boards do not have.
+    /// down. **Off by default** since the velstand gait became the default walk (set v5):
+    /// the hand-back it ends with is to the standing network, which the default configuration
+    /// no longer loads. Turn it on with a robot that runs a standing policy.
     ///
     /// The only thing the daemon does about a fall. Drop to `gain_limp`, let the robot
     /// collapse, pose it back to standing once it has landed, then hand it to the standing
@@ -1750,7 +1754,7 @@ impl Default for PolicyParams {
             ground_pick_action_scale: None,
             ground_pick_gain_ratio: 1.0,
             skills: Vec::new(),
-            voltage_adapt: false,
+            voltage_adapt: true,
             nominal_voltage: 7.4,
         }
     }
@@ -1764,7 +1768,7 @@ impl Default for SafetyParams {
             deadman_ms: 500,
             gain_limp: 50,
             battery_empty_shutdown: true,
-            limp_fall: true,
+            limp_fall: false,
             limp_fall_tilt_z: -0.90,
             limp_fall_predict_z: -0.5,
             limp_fall_lookahead_ms: 300,
@@ -2769,7 +2773,7 @@ mod tests {
         params.set_slot(Slot::Walk, None);
         assert_eq!(
             params.resolved().walk,
-            std::path::Path::new(super::POLICY_DIR).join("alpha_walking.onnx"),
+            std::path::Path::new(super::POLICY_DIR).join("velstand.onnx"),
             "reset must restore the default, not empty the slot"
         );
     }
@@ -3107,7 +3111,7 @@ mod tests {
         );
         assert!(skill("roulade").chain, "holding the button chains rolls");
         assert!(!skill("kick_left").chain);
-        assert!(!p.voltage_adapt, "off by default in the prototype");
+        assert!(p.voltage_adapt, "on by default since 2026-09-14");
         assert_eq!(p.nominal_voltage, 7.4);
 
         let name = |p: &Option<std::path::PathBuf>| {
@@ -3115,8 +3119,11 @@ mod tests {
                 .and_then(|p| p.file_name())
                 .map(|n| n.to_string_lossy().into_owned())
         };
-        assert_eq!(p.walk, PathBuf::from(POLICY_DIR).join("alpha_walking.onnx"));
-        assert_eq!(name(&p.stand).as_deref(), Some("alpha_stand.onnx"));
+        assert_eq!(p.walk, PathBuf::from(POLICY_DIR).join("velstand.onnx"));
+        assert!(
+            p.stand.is_none(),
+            "velstand stands on its own; no standing network by default"
+        );
         assert_eq!(name(&p.sitstand).as_deref(), Some("alpha_sitstand.onnx"));
         assert_eq!(
             name(&p.ground_pick).as_deref(),
