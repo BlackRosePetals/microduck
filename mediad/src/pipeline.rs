@@ -1910,7 +1910,10 @@ fn wire_consumers(
 
         // Before the datachannel, because this is what the *offer* needs and the offer is
         // generated as soon as this handler returns. §6 of `remote-access-design.md`.
-        offer_relay_candidates(&webrtcbin, &peer, &relays);
+        let turn_servers = offer_relay_candidates(&webrtcbin, &peer, &relays);
+        // And before the offer too, for the same reason: gathering starts when the offer is
+        // built, so a listener attached after this handler returns can miss the early candidates.
+        count_gathered_candidates(&webrtcbin, &peer, turn_servers);
 
         match open_control_channel(&webrtcbin, &peer, &runtime) {
             Ok(channel) => {
@@ -1927,7 +1930,11 @@ fn wire_consumers(
     Ok(())
 }
 
-/// Add this robot's TURN servers to one consumer's `webrtcbin`, so its offer carries a `relay`.
+/// Add this robot's TURN servers to one consumer's `webrtcbin`, and answer how many it took.
+///
+/// **The count is of servers accepted, not of relay candidates gathered**, and the difference is
+/// the whole reason [`count_gathered_candidates`] exists. This runs before any allocation has been
+/// attempted, so it cannot know whether one will succeed.
 ///
 /// **Runs on the thread that builds the offer, and must not block it.** `Relays::uris` reads a
 /// cache and never does I/O for exactly this reason: a fetch here would delay every consumer's
@@ -1937,11 +1944,15 @@ fn wire_consumers(
 ///
 /// Nothing here is fatal. A robot that cannot offer a relay is reachable from most places; one
 /// whose negotiation broke because a credential was malformed is reachable from none.
-fn offer_relay_candidates(webrtcbin: &gst::Element, peer: &str, relays: &Arc<crate::turn::Relays>) {
+fn offer_relay_candidates(
+    webrtcbin: &gst::Element,
+    peer: &str,
+    relays: &Arc<crate::turn::Relays>,
+) -> usize {
     let uris = relays.uris();
     if uris.is_empty() {
         tracing::debug!(peer, "no relay servers held; offering host and srflx only");
-        return;
+        return 0;
     }
     // Checked before it is emitted, for the reason `open_control_channel` checks its own signal:
     // `emit_by_name` panics when a signal is absent or its signature has changed, and a panic in
@@ -1951,7 +1962,7 @@ fn offer_relay_candidates(webrtcbin: &gst::Element, peer: &str, relays: &Arc<cra
             peer,
             "webrtcbin has no add-turn-server signal; this consumer gets no relay candidate"
         );
-        return;
+        return 0;
     }
     let mut added = 0;
     for uri in uris.iter() {
@@ -1965,7 +1976,141 @@ fn offer_relay_candidates(webrtcbin: &gst::Element, peer: &str, relays: &Arc<cra
             tracing::warn!(peer, "a relay server was refused by webrtcbin");
         }
     }
-    tracing::info!(peer, relays = added, "offering relay candidates");
+    // **Named for what it counted.** It said "offering relay candidates" once, and six sessions
+    // that gathered no relay at all were read as proof the relay path was working.
+    tracing::info!(
+        peer,
+        servers = added,
+        "added TURN servers for this consumer"
+    );
+    added
+}
+
+/// What one consumer's ICE gathering actually produced, by candidate type.
+#[derive(Debug, Default)]
+struct Candidates {
+    host: usize,
+    srflx: usize,
+    prflx: usize,
+    relay: usize,
+    /// A candidate line with no `typ` in it, which is this parser being wrong rather than ICE.
+    unparsed: usize,
+}
+
+impl Candidates {
+    /// Count one `candidate:…` line by the token after `typ`.
+    ///
+    /// Read positionally rather than by index: the prefix differs between stacks — some hand over
+    /// `candidate:1 1 UDP …`, some the bare `1 1 UDP …` — and the extensions after the type are
+    /// open-ended. `typ` is the one fixture in the grammar (RFC 5245 §15.1).
+    fn count(&mut self, candidate: &str) {
+        match candidate
+            .split_whitespace()
+            .skip_while(|token| *token != "typ")
+            .nth(1)
+        {
+            Some("host") => self.host += 1,
+            Some("srflx") => self.srflx += 1,
+            Some("prflx") => self.prflx += 1,
+            Some("relay") => self.relay += 1,
+            _ => self.unparsed += 1,
+        }
+    }
+}
+
+/// Say what this consumer gathered, once gathering is over.
+///
+/// **`added TURN servers for this consumer` is not evidence that a relay candidate exists**, and
+/// this function is here because that was once read as though it were. That line counts the URIs
+/// `webrtcbin` accepted, inside `consumer-added`, before any allocation has been attempted — so a
+/// robot whose allocation fails every time, for a spent monthly allowance or a transport `libnice`
+/// will not use, logs exactly what a working robot logs. Six sessions on olducky were diagnosed
+/// against that line and `remote-access-design.md` §6 records the conclusion it led to.
+///
+/// So the journal now carries the other half: how many candidates of each type actually came back.
+/// `relay=0` on a robot that added servers is the failure that has no other symptom — ICE simply
+/// finds no pair and the session negotiates perfectly and carries nothing, which is also what a
+/// robot that was never offered a relay looks like.
+///
+/// **A candidate line carries no secret.** The relayed address is not one, and the host and srflx
+/// addresses are in the SDP the peer is about to receive anyway — unlike a TURN *URI*, which
+/// carries a password and is why `offer_relay_candidates` logs no URI at all. So the whole line is
+/// loggable, at debug, where it answers "which relayed address, over which transport".
+fn count_gathered_candidates(webrtcbin: &gst::Element, peer: &str, turn_servers: usize) {
+    // Both guarded before use, for the reason every other signal here is: `connect` and
+    // `connect_notify` panic on a name that is absent or has changed, and a panic in a C closure
+    // aborts the process rather than unwinding. An upstream rename should cost the journal a line,
+    // not take the daemon down.
+    if glib::subclass::signal::SignalId::lookup("on-ice-candidate", webrtcbin.type_()).is_none() {
+        tracing::warn!(
+            peer,
+            "webrtcbin has no on-ice-candidate signal; this session's candidate types will not \
+             be in the journal"
+        );
+        return;
+    }
+    if webrtcbin.find_property("ice-gathering-state").is_none() {
+        tracing::warn!(
+            peer,
+            "webrtcbin has no ice-gathering-state property; this session's candidate types will \
+             not be in the journal"
+        );
+        return;
+    }
+
+    let tally = Arc::new(Mutex::new(Candidates::default()));
+
+    let counting = Arc::clone(&tally);
+    let owner = peer.to_owned();
+    webrtcbin.connect("on-ice-candidate", false, move |values| {
+        // (webrtcbin, mline_index, candidate).
+        let Some(candidate) = values.get(2).and_then(|value| value.get::<String>().ok()) else {
+            return None;
+        };
+        // An empty string is how several stacks say "that was the last one"; it is not a candidate
+        // and must not count as one this parser failed to read.
+        if candidate.trim().is_empty() {
+            return None;
+        }
+        tracing::debug!(peer = %owner, %candidate, "gathered an ICE candidate");
+        if let Ok(mut counting) = counting.lock() {
+            counting.count(&candidate);
+        }
+        None
+    });
+
+    let owner = peer.to_owned();
+    webrtcbin.connect_notify(Some("ice-gathering-state"), move |webrtcbin, _| {
+        let state =
+            webrtcbin.property::<gst_webrtc::WebRTCICEGatheringState>("ice-gathering-state");
+        if state != gst_webrtc::WebRTCICEGatheringState::Complete {
+            return;
+        }
+        let Ok(tally) = tally.lock() else {
+            return;
+        };
+        tracing::info!(
+            peer = %owner,
+            host = tally.host,
+            srflx = tally.srflx,
+            prflx = tally.prflx,
+            relay = tally.relay,
+            unparsed = tally.unparsed,
+            "gathered ICE candidates"
+        );
+        // The one combination that is silent otherwise, and the one worth waking up for: the
+        // credentials were there, `webrtcbin` took them, and the allocation still produced
+        // nothing. A consumer that needs a relay has no path, and every other line looks healthy.
+        if turn_servers > 0 && tally.relay == 0 {
+            tracing::warn!(
+                peer = %owner,
+                servers = turn_servers,
+                "TURN servers were added and no relay candidate came back, so a consumer that \
+                 cannot reach this robot directly has no path to it; the allocation failed rather \
+                 than the credentials being missing"
+            );
+        }
+    });
 }
 
 /// Create the `control` datachannel on one peer's `webrtcbin` and bridge it to channels.
@@ -2098,6 +2243,57 @@ mod tests {
         assert_eq!((frame.width, frame.height), (320, 240));
         assert_eq!(frame.format, CAPTURE_FORMAT);
         assert_eq!(frame.data.len(), 320 * 240 * 2, "packed UYVY");
+    }
+
+    /// The four types ICE defines, in the shape `webrtcbin` hands them over.
+    ///
+    /// Real lines, because the fields after the type are what a naive index-based parser trips on:
+    /// an srflx and a relay both carry `raddr`/`rport` after `typ`, and a TCP candidate carries a
+    /// `tcptype` that a fixed offset would read as the type.
+    #[test]
+    fn every_candidate_type_is_counted_as_itself() {
+        let mut tally = Candidates::default();
+        for line in [
+            "candidate:1 1 UDP 2015363327 192.168.10.116 47078 typ host",
+            "candidate:3 1 TCP 1518149375 192.168.10.116 9 typ host tcptype active",
+            "candidate:2 1 UDP 1677729535 45.80.22.227 47078 typ srflx raddr 192.168.10.116 \
+             rport 47078",
+            "candidate:4 1 UDP 92216575 141.101.90.1 60000 typ relay raddr 45.80.22.227 \
+             rport 47078",
+            "candidate:5 1 UDP 1845501695 10.0.0.9 51000 typ prflx",
+        ] {
+            tally.count(line);
+        }
+
+        assert_eq!(
+            (tally.host, tally.srflx, tally.prflx, tally.relay),
+            (2, 1, 1, 1)
+        );
+        assert_eq!(tally.unparsed, 0, "every line above has a `typ`");
+    }
+
+    /// Some stacks hand over the bare attribute and some keep the `candidate:` prefix, and the
+    /// type is read by position relative to `typ` rather than to the start of the line.
+    #[test]
+    fn the_prefix_is_not_what_locates_the_type() {
+        let mut tally = Candidates::default();
+        tally.count("candidate:1 1 UDP 2015363327 192.168.10.116 47078 typ relay");
+        tally.count("1 1 UDP 2015363327 192.168.10.116 47078 typ relay");
+        assert_eq!(tally.relay, 2);
+    }
+
+    /// **A line this parser cannot read is counted apart from the types**, so a grammar change
+    /// upstream shows up as `unparsed=N` rather than as a robot that gathered nothing.
+    #[test]
+    fn a_line_without_a_type_is_counted_as_unparsed_and_not_as_absent() {
+        let mut tally = Candidates::default();
+        tally.count("candidate:1 1 UDP 2015363327 192.168.10.116 47078");
+        tally.count("typ");
+        assert_eq!(tally.unparsed, 2, "a trailing `typ` names nothing either");
+        assert_eq!(
+            (tally.host, tally.srflx, tally.prflx, tally.relay),
+            (0, 0, 0, 0)
+        );
     }
 
     /// A frame whose every byte is `tag`, so a test can say *which* capture came back.

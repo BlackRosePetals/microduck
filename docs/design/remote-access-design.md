@@ -863,6 +863,23 @@ candidate is a bare IPv4 literal on a board with no global IPv6 at all — which
 send a packet to. Measured on olducky: six sessions, `offering relay candidates relays=5` every
 time, `Ice connection state … failed` every time, about eight seconds apart.
 
+**That measurement cannot carry the weight it was given, and the phone turned out to have IPv4.**
+`relays=5` counted the TURN server URIs `webrtcbin` accepted inside `consumer-added`, before any
+allocation had been attempted — not relay candidates gathered. A robot whose allocation fails every
+time logs it identically to one whose allocation succeeds, so those six sessions are equally
+consistent with the ordinary explanation: no relay candidate on either end. The line is now named
+`added TURN servers for this consumer servers=N` for what it counts, and `count_gathered_candidates`
+logs the half that was missing, once per consumer when gathering completes:
+
+```
+gathered ICE candidates host=2 srflx=1 prflx=0 relay=0 unparsed=0
+TURN servers were added and no relay candidate came back …
+```
+
+`relay=0` beside a non-zero `servers` is the failure with no other symptom, and the second line
+fires only on that pair. Until a robot has produced one of these, the cause above is unconfirmed
+and the DNS64/NAT64 paragraph should be read as the hypothesis it was, not a finding.
+
 So **the console offers a relay of its own** (`refreshRelays` in `mediad/webclient/index.html`),
 and only its own allocation can bridge this: `turn.cloudflare.com` is a name, so it resolves over
 IPv6, and the relayed address Cloudflare hands back is IPv4, which the robot can reach. Confirmed
