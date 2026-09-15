@@ -89,7 +89,7 @@
 //! naming the arity rather than as an abort.
 
 use std::sync::{Arc, Mutex};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result, anyhow, bail};
 use duck_ipc_proto as proto;
@@ -1913,7 +1913,7 @@ fn wire_consumers(
         let turn_servers = offer_relay_candidates(&webrtcbin, &peer, &relays);
         // And before the offer too, for the same reason: gathering starts when the offer is
         // built, so a listener attached after this handler returns can miss the early candidates.
-        count_gathered_candidates(&webrtcbin, &peer, turn_servers);
+        count_gathered_candidates(&webrtcbin, &peer, turn_servers, &runtime);
 
         match open_control_channel(&webrtcbin, &peer, &runtime) {
             Ok(channel) => {
@@ -2018,7 +2018,17 @@ impl Candidates {
     }
 }
 
-/// Say what this consumer gathered, once gathering is over.
+/// How long to wait for gathering to finish before reporting what there is anyway.
+///
+/// **A tally that only lands when gathering completes is no use**, which a first run on a board
+/// proved: `ice-gathering-state` had not reached `Complete` by the time a ten-second session tore
+/// down — five TURN servers is five allocations, and the last relay candidate arrived after the
+/// control channel had already done its work — so the line that was supposed to settle the
+/// question never appeared at all. The failure being diagnosed is a session that dies early, so
+/// the diagnostic cannot be the one thing that needs it to live.
+const CANDIDATE_REPORT_AFTER: Duration = Duration::from_secs(8);
+
+/// Say what this consumer gathered: once, when gathering finishes or the deadline passes.
 ///
 /// **`added TURN servers for this consumer` is not evidence that a relay candidate exists**, and
 /// this function is here because that was once read as though it were. That line counts the URIs
@@ -2032,11 +2042,20 @@ impl Candidates {
 /// finds no pair and the session negotiates perfectly and carries nothing, which is also what a
 /// robot that was never offered a relay looks like.
 ///
+/// `complete=false` marks a tally taken at [`CANDIDATE_REPORT_AFTER`] rather than at the end of
+/// gathering; more candidates may still have been coming. It is the ordinary case for a short
+/// session and it is still the answer to "was there a relay in there", which is what this is for.
+///
 /// **A candidate line carries no secret.** The relayed address is not one, and the host and srflx
 /// addresses are in the SDP the peer is about to receive anyway — unlike a TURN *URI*, which
 /// carries a password and is why `offer_relay_candidates` logs no URI at all. So the whole line is
 /// loggable, at debug, where it answers "which relayed address, over which transport".
-fn count_gathered_candidates(webrtcbin: &gst::Element, peer: &str, turn_servers: usize) {
+fn count_gathered_candidates(
+    webrtcbin: &gst::Element,
+    peer: &str,
+    turn_servers: usize,
+    runtime: &tokio::runtime::Handle,
+) {
     // Both guarded before use, for the reason every other signal here is: `connect` and
     // `connect_notify` panic on a name that is absent or has changed, and a panic in a C closure
     // aborts the process rather than unwinding. An upstream rename should cost the journal a line,
@@ -2053,12 +2072,13 @@ fn count_gathered_candidates(webrtcbin: &gst::Element, peer: &str, turn_servers:
         tracing::warn!(
             peer,
             "webrtcbin has no ice-gathering-state property; this session's candidate types will \
-             not be in the journal"
+             be reported on the deadline alone"
         );
-        return;
     }
 
     let tally = Arc::new(Mutex::new(Candidates::default()));
+    // Whoever gets there first reports; the other finds it already said and does nothing.
+    let said = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     let counting = Arc::clone(&tally);
     let owner = peer.to_owned();
@@ -2079,38 +2099,67 @@ fn count_gathered_candidates(webrtcbin: &gst::Element, peer: &str, turn_servers:
         None
     });
 
-    let owner = peer.to_owned();
-    webrtcbin.connect_notify(Some("ice-gathering-state"), move |webrtcbin, _| {
-        let state =
-            webrtcbin.property::<gst_webrtc::WebRTCICEGatheringState>("ice-gathering-state");
-        if state != gst_webrtc::WebRTCICEGatheringState::Complete {
-            return;
-        }
-        let Ok(tally) = tally.lock() else {
-            return;
-        };
-        tracing::info!(
-            peer = %owner,
-            host = tally.host,
-            srflx = tally.srflx,
-            prflx = tally.prflx,
-            relay = tally.relay,
-            unparsed = tally.unparsed,
-            "gathered ICE candidates"
-        );
-        // The one combination that is silent otherwise, and the one worth waking up for: the
-        // credentials were there, `webrtcbin` took them, and the allocation still produced
-        // nothing. A consumer that needs a relay has no path, and every other line looks healthy.
-        if turn_servers > 0 && tally.relay == 0 {
-            tracing::warn!(
-                peer = %owner,
-                servers = turn_servers,
-                "TURN servers were added and no relay candidate came back, so a consumer that \
-                 cannot reach this robot directly has no path to it; the allocation failed rather \
-                 than the credentials being missing"
-            );
-        }
+    if webrtcbin.find_property("ice-gathering-state").is_some() {
+        let (finished, done, owner) = (Arc::clone(&tally), Arc::clone(&said), peer.to_owned());
+        webrtcbin.connect_notify(Some("ice-gathering-state"), move |webrtcbin, _| {
+            let state =
+                webrtcbin.property::<gst_webrtc::WebRTCICEGatheringState>("ice-gathering-state");
+            if state == gst_webrtc::WebRTCICEGatheringState::Complete {
+                report_candidates(&finished, &done, &owner, turn_servers, true);
+            }
+        });
+    }
+
+    // The deadline, on the tokio runtime this daemon already has rather than a GLib timeout: a
+    // consumer that never finishes gathering — or never lives long enough to — still gets a line.
+    let (pending, done, owner) = (tally, said, peer.to_owned());
+    runtime.spawn(async move {
+        tokio::time::sleep(CANDIDATE_REPORT_AFTER).await;
+        report_candidates(&pending, &done, &owner, turn_servers, false);
     });
+}
+
+/// Log one consumer's tally, the first time anybody asks.
+fn report_candidates(
+    tally: &Mutex<Candidates>,
+    said: &std::sync::atomic::AtomicBool,
+    peer: &str,
+    turn_servers: usize,
+    complete: bool,
+) {
+    use std::sync::atomic::Ordering;
+    if said
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return;
+    }
+    let Ok(tally) = tally.lock() else {
+        return;
+    };
+    tracing::info!(
+        peer,
+        host = tally.host,
+        srflx = tally.srflx,
+        prflx = tally.prflx,
+        relay = tally.relay,
+        unparsed = tally.unparsed,
+        complete,
+        "gathered ICE candidates"
+    );
+    // The one combination that is silent otherwise, and the one worth waking up for: the
+    // credentials were there, `webrtcbin` took them, and the allocation still produced nothing.
+    // A consumer that needs a relay has no path, and every other line looks healthy.
+    if turn_servers > 0 && tally.relay == 0 {
+        tracing::warn!(
+            peer,
+            servers = turn_servers,
+            complete,
+            "TURN servers were added and no relay candidate came back, so a consumer that cannot \
+             reach this robot directly has no path to it; the allocation failed rather than the \
+             credentials being missing"
+        );
+    }
 }
 
 /// Create the `control` datachannel on one peer's `webrtcbin` and bridge it to channels.
