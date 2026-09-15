@@ -422,6 +422,19 @@ Three changes, none of them a real solution, because the model has no readiness 
 What would solve it properly is the IO model's `sendable()`, and that stays out of reach: it serves
 only the `Acquire*` fd paths, which a CoreBluetooth central does not drive.
 
+**A phone negotiates 515, and that changes the size of the problem**  · **measured** (2026-09-15).
+Everything above was measured from a Mac. An iPhone 17 on iOS 26.6.2, through `tauri-plugin-blec`,
+reports an ATT MTU of **515** — CoreBluetooth's `maximumWriteValueLength` of 512 plus the three-byte
+header, which is the same arithmetic this daemon undoes to get its payload. So `btd` sizes a
+notification at **512 bytes rather than 20**, from the session's first inbound write onward.
+
+Applied to the two rows above: the ~5 KiB journal tail that took ≈265 notifications and 1.83 s
+becomes about eleven of them, and the ~7 KiB reply that tore the notification session down at ≈350
+becomes about fourteen. The tear-down is not fixed by this — the three changes above are still what
+stands between us and it — but the queue pressure that produced it came from firing hundreds of
+chunks at a link that could not say when it was ready, and a phone does not get near that. It is the
+difference between `system.logs` being a call an app may offer and one it may not.
+
 ## 5. Pairing: just-works, and a PIN the transport checks
 
 A six-digit PIN, stored by `configd`, checked by `btd` before it serves anything. **Not** by the

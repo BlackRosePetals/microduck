@@ -108,7 +108,7 @@ What is worth taking is the plumbing, which is where the expensive knowledge is:
 
 | take as code | take as a rule | leave |
 |---|---|---|
-| `tauri-plugin-blec` wiring, and the vendored `btleplug` patch — not a nicety: btleplug `.expect()`s on *"Got descriptors for a characteristic we don't know about"* and takes the BLE event loop down on connect (deviceplug/btleplug#397). It hits macOS and iOS both, since `blec` only has a native backend on Android, so `duckctl` is exposed to it too | scan unfiltered and discriminate your own candidates — their scan core and §3.3 arrived at this separately, which is the evidence it is real | TanStack Query: it caches server state over HTTP, and this app has none |
+| `tauri-plugin-blec` wiring — but **not** their vendored `btleplug` patch, and not their npm bindings. The CoreBluetooth crash on connect it exists for (deviceplug/btleplug#397) is fixed upstream in `btleplug` 0.13, which `blec` 0.14 is built on; their 0.8 predates it. And the crate-to-npm lock-step they have to maintain never reaches a client driven from Rust, because the webview does not call BLE. `duckctl` is still on a `btleplug` that has the crash | scan unfiltered and discriminate your own candidates — their scan core and §3.3 arrived at this separately, which is the evidence it is real | TanStack Query: it caches server state over HTTP, and this app has none |
 | the Android BLE runtime-permission handling, which is the reason to use `blec` over `btleplug` bare | poll for a candidate rather than taking one snapshot after a sleep (§3.4) | the setup-wizard state machine — §4 |
 | edge-to-edge, `viewport-fit=cover`, safe-area insets, the portrait lock | every error carries the step it recovers to, so "try again" does not restart the flow | the string-matched error taxonomy: `configd` returns `BadKey` and `NotFound` as types, and a version skew names itself `METHOD_NOT_FOUND` or `INVALID_PARAMS` (§3) |
 | the release workflow's shape — unsigned simulator `.app` and debug `.apk` on the release, signed TestFlight and Play Internal alongside | a BLE drop while the app is backgrounded is expected, not a fault: iOS tears the GATT link down | |
@@ -186,47 +186,57 @@ re-subscribes, and is told where things got to.
 
 That layer is the app's actual core. It has no counterpart to copy.
 
-## 5. Its own repo, and what that costs
+## 5. Its own repo  · **done**
 
 The daemon workspace co-versions because everything in it ships in one artifact. The app ships to
-app stores on a different cadence and does not belong to that version line, so it gets its own
-repository.
+app stores on a different cadence and does not belong to that version line, so it got its own:
+[`microduck-app`](https://github.com/pollen-robotics/microduck-app), private.
 
-The consequence to accept up front: `duck-ipc-proto` and whatever carries `framing` become a git
-dependency on a private repo, so the app's CI needs a token. Publishing `duck-ipc-proto` is the
-other way and can wait — a git dependency is reversible and needs no decision about what we are
-willing to support in public.
+**The cost this section used to warn about is not real.** It said `duck-ipc-proto` and whatever
+carries `framing` would be git dependencies on a private repo, so the app's CI would need a token.
+`microduck` is public, so they are ordinary git dependencies and nothing needs a credential.
+Publishing `duck-ipc-proto` to crates.io stays the other way and stays unnecessary.
 
 `hf-robot-account` is the precedent for the other direction: it was extracted from this workspace to
 crates.io because a second consumer wanted it. That is the shape to reach for if `framing` turns out
-to want the same, and §3's caveat is the reason it might.
+to want the same, and §3's caveat is the reason it might — the app now being that second consumer is
+what makes the extraction answerable against a real list rather than a guess.
 
-## 6. The spike that comes first
+## 6. The spike, which has now run  · **measured** (2026-09-15)
 
-One throwaway build, on a real iPhone and a real Android: scan, connect, subscribe, `hello`,
-`system.authenticate`, `system.info` — against the link the robot actually serves, which is
-`--require-pairing` **off** (§5.5).
+One throwaway build: scan, connect, subscribe, `hello`, `system.authenticate`, `system.info`,
+against the link the robot actually serves — `--require-pairing` **off** (§5.5). It lives in
+[`microduck-app`](https://github.com/pollen-robotics/microduck-app) as its first commit.
 
-Four open questions have the same answer:
+**It ran green on an iPhone 17, iOS 26.6.2, against olducky.** Every step: the unfiltered scan found
+the robot, the advertisement's name and IPv4 reached the first screen without connecting to
+anything, and `system.info` answered — which is the step that matters, because it is refused before
+`system.authenticate` and therefore proves the session gate opened rather than merely that the link
+came up.
 
-- **Does iOS hang on `encrypt_read` the way macOS does?** Half-answered, and off the critical path.
-  An iPhone against olducky with `--require-pairing` on put up its pairing prompt, where macOS
-  begins no SMP at all — so the hang is not a property of CoreBluetooth generally. The read was not
-  confirmed either way before the run was stopped; §5.5 records exactly how far it got and what to
-  set before resuming. It is no longer a blocker on the app because §8.1 gained two fixes that need
-  no bond, so the app can be built against the open link the robot already serves.
-- **Are both platforms happy with one characteristic that reads, writes and notifies?** It reads
-  oddly in nRF Connect (§3), which is a cosmetic cost; a phone stack refusing it would not be.
-- **What MTU does a phone actually negotiate?** Half of this is now answered on the robot side: §3.6
-  has `btd` reading the negotiated MTU off every inbound write and sizing replies from it, measured
-  from a Mac. What is unmeasured is what a phone offers, and it is the number that decides whether
-  `net.scan` and `system.logs` feel instant or feel slow — and those are the two calls someone
-  stares at.
-- **Does a stored peripheral identifier survive as §3.3 hopes**, through `blec`'s abstraction rather
-  than `retrievePeripherals(withIdentifiers:)` directly?
+It also proves the thing this whole page is an argument for: the protocol ran in Rust on a phone,
+through `duck-ipc-proto` and `btd::framing`, which are the daemon's own. `cargo check` for
+`aarch64-apple-ios` is the static half of that and a green `system.info` is the other.
 
-Two days, thrown away afterwards. Either it de-risks the app or it says the protocol needs a change
-before any screen is designed — and the second answer is far cheaper now than after a UI exists.
+Two open questions went with it, one did not, and one was never this run's to answer:
+
+- **Is iOS happy with one characteristic that reads, writes and notifies?** **Yes.** It reads oddly
+  in nRF Connect (§3), and that stays a cosmetic cost rather than the real one it would have been if
+  a phone stack had refused it.
+- **What MTU does a phone actually negotiate?** **515**, which is the answer this run existed for.
+  CoreBluetooth reports a `maximumWriteValueLength` of 512 and `btleplug` adds the three-byte header
+  to get an ATT MTU; `btd` subtracts the same three, so a notification carries **512 bytes rather
+  than 20**. §3.6 has what that does to the two replies it measured from a Mac. Short version:
+  `system.logs` over a radio is a call an app may offer.
+- **Does iOS hang on `encrypt_read` the way macOS does?** Still open, and deliberately not this
+  run's question — §5.5 has where the separate attempt got to, and §8.1 why it no longer blocks
+  building.
+- **Does a stored peripheral identifier survive as §3.3 hopes?** Still open. The spike scans every
+  time, so it never exercised the fast path. Cheap to answer whenever the session layer (§4) needs
+  it, which is the first thing that will.
+
+Thrown away now, as intended. What it bought is that the two questions that could have forced a
+protocol change before any screen exists did not.
 
 ## 7. What the robot still owes the app
 
