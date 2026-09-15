@@ -908,6 +908,28 @@ blocks (a `try_read` that yields nothing rather than waiting) and never fails. A
 the ordinary state for the first few seconds after boot and forever on a robot with no account,
 and it means host and srflx only, which is all anything on the same network needs.
 
+**`reachy_mini` main is not a working reference to copy from — it is the same arrangement,
+unverified in the same way.** Read against `mediad` at `9d364df`: `webrtc_utils.TurnCredentials`
+and `media_server._apply_turn_servers` match `turn.rs` and `offer_relay_candidates` point for
+point — the same Space endpoint, the same 600 s TTL refreshed at half, the same 30 s retry after a
+transient failure only, the same `stun:`/no-credential entries skipped, the same percent-encoded
+`turn://user:pass@host:port`, the same `add-turn-server` inside `consumer-added` before the offer,
+the same cached read that never blocks the offer thread. Neither daemon sets `stun-server`, so both
+take `webrtcsink`'s default. **And neither observes a candidate**: no `on-ice-candidate` and no
+`ice-gathering-state` anywhere in `src/reachy_mini/`, so "the patched daemon offers its own relay"
+— `rf-detr-realtime-webcam`'s `app.py` says it while passing STUN-only for the robot leg — rests on
+the same `add-turn-server`-returned-cleanly inference §6 made here. So there is no patch to port,
+and the mini working where a duck does not would be an environmental difference (allowance, board
+network, `libnice` build) rather than a code one.
+
+What the mini does have and `mediad` does not is a **negotiation watchdog**: 12 s from
+`consumer-added` to `connection-state == connected`, after which it ends the session with a named
+reason rather than leaving a client spinning. Its comment names the culprit it was written for —
+"`libnice` frozen mid-`CHECKING` (a known crash mode of certain `libnice` versions)" — which is a
+second way a session negotiates perfectly and carries nothing, distinct from having no usable
+candidate pair. Worth having for the same reason the candidate tally is: it separates two failures
+that look identical from outside.
+
 **The proxy is the Space, and the name in front of it was the dead part.** `turn.fastrtc.org` —
 what `fastrtc`'s own code points at and what `reachy_mini` #1182 copied into this arrangement — is
 a dangling delegation, not an outage: the `.org` registry names four Route53 nameservers for the
