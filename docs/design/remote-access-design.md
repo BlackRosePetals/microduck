@@ -927,6 +927,28 @@ test whenever this question comes up again — no rendezvous, no Space, no secon
 What it does not settle is a session that *fails*. The tally has to be read on the robot that is
 failing, during the failure; `relay=6` here means the machinery works, not that every duck's does.
 
+**And a relay carries a real session, end to end.** `lavandiere` on
+`0.12.0-dev.1011.cb17b40`, driven from a private HF Space over the rendezvous:
+
+```
+ICE connection state  state=Checking → Connected (2.0 s) → Completed (2.2 s)
+gathered ICE candidates  host=6 srflx=3 prflx=0 relay=9 unparsed=0 complete=true
+selected candidate pair  local=relay 104.30.144.144:29840/udp via 141.101.90.1
+                         remote=prflx 54.225.144.144:11854/udp
+```
+
+The robot's Cloudflare relay is the local half of the pair that won, so §6's arrangement is not
+merely available — it is what carried the video. The consumer offered no TURN credentials of its
+own and needed none, which is the property the whole section is built on.
+
+The remote half being **`prflx`** is worth reading too: the robot learned the Space's address from
+an inbound STUN check rather than from a signalled candidate, which is the ordinary shape for a
+consumer whose srflx is not usable. Nothing had to be done about it.
+
+So a duck that cannot be reached is a duck to take these three lines from, not a design to revisit.
+The first thing to check remains the build: a robot older than the endpoint fix holds no
+credentials at all and says so every thirty seconds.
+
 **`reachy_mini` main is not a working reference to copy from — it is the same arrangement,
 unverified in the same way.** Read against `mediad` at `9d364df`: `webrtc_utils.TurnCredentials`
 and `media_server._apply_turn_servers` match `turn.rs` and `offer_relay_candidates` point for
