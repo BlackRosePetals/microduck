@@ -32,6 +32,8 @@ anyhow = "1"
 libc = "0.2"
 # The detector itself: the letterbox+turn, the NPU binding, the ONNX fallback and the decoder.
 duck-detect = { path = "../duck-detect" }
+# The sampler both the detector and the snapshot routes take a frame through.
+uyvy = { path = "../uyvy" }
 # JPEG for the frame stream and PNG for lossless console snapshots.
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 # The console's one route. Already in `Cargo.lock` — `updater` uses it for its test mirror — so it
