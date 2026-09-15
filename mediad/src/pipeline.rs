@@ -1914,6 +1914,8 @@ fn wire_consumers(
         // And before the offer too, for the same reason: gathering starts when the offer is
         // built, so a listener attached after this handler returns can miss the early candidates.
         count_gathered_candidates(&webrtcbin, &peer, turn_servers, &runtime);
+        // What was gathered is not what was used; this is the other half.
+        watch_ice_connection(&webrtcbin, &peer);
 
         match open_control_channel(&webrtcbin, &peer, &runtime) {
             Ok(channel) => {
@@ -2117,6 +2119,104 @@ fn count_gathered_candidates(
         tokio::time::sleep(CANDIDATE_REPORT_AFTER).await;
         report_candidates(&pending, &done, &owner, turn_servers, false);
     });
+}
+
+/// Follow one consumer's ICE connection state, and say which pair won when it connects.
+///
+/// **The tally above says what was offered; this says what was used**, and the two answer
+/// different questions. A robot can gather nine relay candidates and still fail, and a robot that
+/// gathers them and connects may be connecting *directly* — which is the ordinary, cheap outcome
+/// and also the one that tells you the relay was never exercised. Neither is visible without this.
+///
+/// The pair is read out of `get-stats` rather than guessed at, and the **raw structures are
+/// logged**. That is deliberate rather than lazy: the field names and enum nicks in
+/// `webrtcbin`'s stats are not something this code should assert from memory, and a summary
+/// built on a wrong field name would print confidently and say nothing — which is exactly the
+/// mistake `relays=N` made. One run against a real consumer turns this into a summary; until
+/// then the journal carries what is actually there.
+fn watch_ice_connection(webrtcbin: &gst::Element, peer: &str) {
+    if webrtcbin.find_property("ice-connection-state").is_none() {
+        tracing::warn!(
+            peer,
+            "webrtcbin has no ice-connection-state property; this session's ICE progress and \
+             selected pair will not be in the journal"
+        );
+        return;
+    }
+
+    // Once: `Connected` and `Completed` both arrive, and a flapping session would ask again on
+    // every transition.
+    let asked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let owner = peer.to_owned();
+    webrtcbin.connect_notify(Some("ice-connection-state"), move |webrtcbin, _| {
+        let state =
+            webrtcbin.property::<gst_webrtc::WebRTCICEConnectionState>("ice-connection-state");
+        tracing::info!(peer = %owner, ?state, "ICE connection state");
+
+        use gst_webrtc::WebRTCICEConnectionState as State;
+        if !matches!(state, State::Connected | State::Completed) {
+            return;
+        }
+        use std::sync::atomic::Ordering;
+        if asked
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return;
+        }
+        report_selected_pair(webrtcbin, &owner);
+    });
+}
+
+/// Ask `webrtcbin` for its stats and log every candidate and candidate pair in them.
+///
+/// Nothing here is fatal and nothing here parses: `get-stats` is asynchronous through a
+/// `Promise`, its reply is borrowed for the duration of the callback, and a reply that never comes
+/// costs a missing line rather than a stuck consumer.
+fn report_selected_pair(webrtcbin: &gst::Element, peer: &str) {
+    if glib::subclass::signal::SignalId::lookup("get-stats", webrtcbin.type_()).is_none() {
+        tracing::warn!(
+            peer,
+            "webrtcbin has no get-stats signal; no selected pair to report"
+        );
+        return;
+    }
+    let owner = peer.to_owned();
+    let promise = gst::Promise::with_change_func(move |reply| {
+        let stats = match reply {
+            Ok(Some(stats)) => stats,
+            Ok(None) => {
+                tracing::warn!(peer = %owner, "get-stats answered with nothing");
+                return;
+            }
+            Err(error) => {
+                tracing::warn!(peer = %owner, ?error, "get-stats failed");
+                return;
+            }
+        };
+        // Every nested structure that has anything to do with candidates, verbatim. A pair names
+        // its two candidate ids, and the candidates carry the type and address, so the selected
+        // path is recoverable from these lines even before anything here knows their shape.
+        let mut said = 0;
+        for (name, value) in stats.iter() {
+            let Ok(nested) = value.get::<gst::Structure>() else {
+                continue;
+            };
+            let text = nested.to_string();
+            if !text.contains("candidate") {
+                continue;
+            }
+            said += 1;
+            tracing::info!(peer = %owner, stat = %name, entry = %text, "ICE stat");
+        }
+        if said == 0 {
+            tracing::warn!(
+                peer = %owner,
+                "get-stats carried no candidate entries; the stats shape has moved"
+            );
+        }
+    });
+    webrtcbin.emit_by_name::<()>("get-stats", &[&None::<gst::Pad>, &promise]);
 }
 
 /// Log one consumer's tally, the first time anybody asks.
