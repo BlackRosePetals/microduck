@@ -2168,11 +2168,18 @@ fn watch_ice_connection(webrtcbin: &gst::Element, peer: &str) {
     });
 }
 
-/// Ask `webrtcbin` for its stats and log every candidate and candidate pair in them.
+/// Ask `webrtcbin` for its stats and say which candidate pair carried the session.
 ///
-/// Nothing here is fatal and nothing here parses: `get-stats` is asynchronous through a
+/// Nothing here is fatal and nothing here blocks: `get-stats` is asynchronous through a
 /// `Promise`, its reply is borrowed for the duration of the callback, and a reply that never comes
 /// costs a missing line rather than a stuck consumer.
+///
+/// The shape below was read off a live session rather than assumed, which is the only reason it is
+/// safe to summarise: the `transport` stat names a `selected-candidate-pair-id`, that pair names a
+/// local and a remote candidate id, and each candidate carries `candidate-type`, `address`, `port`
+/// and `protocol`. A relay candidate also carries `url`, the TURN server that allocated it. When
+/// any of that is missing the raw entries go to the journal instead, so a stats change upstream
+/// degrades to what it did before rather than to silence.
 fn report_selected_pair(webrtcbin: &gst::Element, peer: &str) {
     if glib::subclass::signal::SignalId::lookup("get-stats", webrtcbin.type_()).is_none() {
         tracing::warn!(
@@ -2194,29 +2201,80 @@ fn report_selected_pair(webrtcbin: &gst::Element, peer: &str) {
                 return;
             }
         };
-        // Every nested structure that has anything to do with candidates, verbatim. A pair names
-        // its two candidate ids, and the candidates carry the type and address, so the selected
-        // path is recoverable from these lines even before anything here knows their shape.
-        let mut said = 0;
-        for (name, value) in stats.iter() {
-            let Ok(nested) = value.get::<gst::Structure>() else {
-                continue;
-            };
-            let text = nested.to_string();
-            if !text.contains("candidate") {
-                continue;
+        if !summarise_selected_pair(stats, &owner) {
+            // The shape has moved. Say everything candidate-shaped, verbatim, which is what this
+            // logged before it knew the field names — and is how they were learned.
+            for (name, value) in stats.iter() {
+                let Ok(nested) = value.get::<gst::Structure>() else {
+                    continue;
+                };
+                let text = nested.to_string();
+                if text.contains("candidate") {
+                    tracing::info!(peer = %owner, stat = %name, entry = %text, "ICE stat");
+                }
             }
-            said += 1;
-            tracing::info!(peer = %owner, stat = %name, entry = %text, "ICE stat");
-        }
-        if said == 0 {
-            tracing::warn!(
-                peer = %owner,
-                "get-stats carried no candidate entries; the stats shape has moved"
-            );
         }
     });
     webrtcbin.emit_by_name::<()>("get-stats", &[&None::<gst::Pad>, &promise]);
+}
+
+/// One candidate, as the selected-pair line names it.
+fn describe_candidate(stats: &gst::StructureRef, id: &str) -> Option<String> {
+    let candidate = stats.get::<gst::Structure>(id).ok()?;
+    let kind = candidate
+        .get::<String>("candidate-type")
+        .unwrap_or_else(|_| "?".to_owned());
+    let address = candidate
+        .get::<String>("address")
+        .unwrap_or_else(|_| "?".to_owned());
+    let port = candidate.get::<u32>("port").unwrap_or_default();
+    let protocol = candidate
+        .get::<String>("protocol")
+        .unwrap_or_else(|_| "?".to_owned());
+    // Only a relay candidate has one, and it names the TURN server that allocated the address —
+    // which is the difference between "relayed" and "relayed through whom".
+    match candidate.get::<String>("url") {
+        Ok(url) if !url.is_empty() && url != "none" => {
+            Some(format!("{kind} {address}:{port}/{protocol} via {url}"))
+        }
+        _ => Some(format!("{kind} {address}:{port}/{protocol}")),
+    }
+}
+
+/// The selected pair as one line, or `false` if the stats did not carry one.
+///
+/// **`local=relay …` is the whole point.** A session that negotiated over a relay and one that
+/// found a direct pair look identical everywhere else in this journal, and they mean opposite
+/// things: the first says the relay path works, the second says it was never exercised.
+fn summarise_selected_pair(stats: &gst::StructureRef, peer: &str) -> bool {
+    // The transport names the pair; there is one per DTLS transport and a session has one.
+    let selected = stats.iter().find_map(|(_, value)| {
+        value
+            .get::<gst::Structure>()
+            .ok()?
+            .get::<String>("selected-candidate-pair-id")
+            .ok()
+    });
+    let Some(selected) = selected else {
+        return false;
+    };
+    let Ok(pair) = stats.get::<gst::Structure>(selected.as_str()) else {
+        return false;
+    };
+    let (Ok(local), Ok(remote)) = (
+        pair.get::<String>("local-candidate-id"),
+        pair.get::<String>("remote-candidate-id"),
+    ) else {
+        return false;
+    };
+    let (Some(local), Some(remote)) = (
+        describe_candidate(stats, &local),
+        describe_candidate(stats, &remote),
+    ) else {
+        return false;
+    };
+    tracing::info!(peer, %local, %remote, "selected candidate pair");
+    true
 }
 
 /// Log one consumer's tally, the first time anybody asks.
