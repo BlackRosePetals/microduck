@@ -908,6 +908,25 @@ blocks (a `try_read` that yields nothing rather than waiting) and never fails. A
 the ordinary state for the first few seconds after boot and forever on a robot with no account,
 and it means host and srflx only, which is all anything on the same network needs.
 
+**A duck does gather relay candidates, measured rather than inferred.** On `lavandiere`
+(0.12.0-dev.1007.3c8e681, signed in as `PierreRouanet`), a LAN session over `webrtcsink`'s own
+signalling server:
+
+```
+added TURN servers for this consumer  servers=5
+gathered ICE candidates  host=6 srflx=3 prflx=0 relay=6 unparsed=0 complete=false
+```
+
+with the six `typ relay` lines on `104.30.…` seen independently at the consumer. So
+`add-turn-server` works, `libnice` completes a Cloudflare allocation over the credentials this
+account mints, and nothing in the robot's half of §6 is broken. A **LAN** session settles this
+because gathering does not depend on the peer: a relay candidate is allocated whether or not
+anything will ever pair with it, and only the pairing is remote. That makes it the cheap first
+test whenever this question comes up again — no rendezvous, no Space, no second network.
+
+What it does not settle is a session that *fails*. The tally has to be read on the robot that is
+failing, during the failure; `relay=6` here means the machinery works, not that every duck's does.
+
 **`reachy_mini` main is not a working reference to copy from — it is the same arrangement,
 unverified in the same way.** Read against `mediad` at `9d364df`: `webrtc_utils.TurnCredentials`
 and `media_server._apply_turn_servers` match `turn.rs` and `offer_relay_candidates` point for
