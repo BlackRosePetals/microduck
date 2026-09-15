@@ -24,7 +24,8 @@
 //! reply was more than a few kilobytes. `notify` hands a D-Bus signal to the connection and
 //! returns; nothing here can ask BlueZ whether the radio has caught up, and nothing reports the
 //! notification MTU either. Both gaps are worked around rather than solved: the payload is taken
-//! from what BlueZ reports on inbound writes (one ATT MTU serves both directions), and the pump
+//! from what BlueZ reports on inbound writes (one ATT MTU serves both directions, capped at the
+//! 512-byte limit on a characteristic value — see `framing::notification_payload`), and the pump
 //! pauses every [`NOTIFY_BURST`] chunks. The IO model has the readiness signal this wants and
 //! still cannot be used, for the reason above — it serves only the `Acquire*` paths.
 
@@ -49,21 +50,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use tokio::sync::mpsc;
 
+use crate::framing::{FLOOR_MTU, notification_payload};
 use crate::gatt::{RPC_UUID, SERVICE_UUID};
 use crate::link::Link;
 use crate::session;
 use crate::upstream::{NameChoice, Sockets};
-
-/// Notification payload a session starts with, before any write has reported the negotiated one.
-///
-/// 20 bytes is what every BLE link is required to support, so it is the only safe *first* guess.
-/// It used to be the guess for the whole session — the notify side has no way to ask BlueZ, which
-/// remains true — and that was wrong in two ways. Tenfold more notifications than the link needed
-/// was the visible half; the other half is that a reply above roughly 5 KiB tore the session down
-/// (see [`NOTIFY_BURST`]). The write side does learn the real MTU, BlueZ reports it on every
-/// inbound write, and both directions share one ATT MTU — so the floor now lasts until the
-/// client's first write, which is always `system.authenticate`.
-const FLOOR_MTU: usize = 20;
 
 /// How many notifications to queue before pausing to let the radio drain.
 ///
@@ -416,7 +407,7 @@ async fn serve_on_an_adapter(
                         // free to do so and a central may renegotiate; logged only when it moves,
                         // because the value that matters is the one a reply gets chunked for and
                         // that number had never appeared in the journal at all.
-                        let payload = usize::from(req.mtu).saturating_sub(3).max(FLOOR_MTU);
+                        let payload = notification_payload(req.mtu);
                         let previous = write_mtu.swap(payload, Ordering::Relaxed);
                         let learned = (previous != payload).then_some(payload);
 
