@@ -863,6 +863,23 @@ candidate is a bare IPv4 literal on a board with no global IPv6 at all — which
 send a packet to. Measured on olducky: six sessions, `offering relay candidates relays=5` every
 time, `Ice connection state … failed` every time, about eight seconds apart.
 
+**That measurement cannot carry the weight it was given, and the phone turned out to have IPv4.**
+`relays=5` counted the TURN server URIs `webrtcbin` accepted inside `consumer-added`, before any
+allocation had been attempted — not relay candidates gathered. A robot whose allocation fails every
+time logs it identically to one whose allocation succeeds, so those six sessions are equally
+consistent with the ordinary explanation: no relay candidate on either end. The line is now named
+`added TURN servers for this consumer servers=N` for what it counts, and `count_gathered_candidates`
+logs the half that was missing, once per consumer when gathering completes:
+
+```
+gathered ICE candidates host=2 srflx=1 prflx=0 relay=0 unparsed=0
+TURN servers were added and no relay candidate came back …
+```
+
+`relay=0` beside a non-zero `servers` is the failure with no other symptom, and the second line
+fires only on that pair. Until a robot has produced one of these, the cause above is unconfirmed
+and the DNS64/NAT64 paragraph should be read as the hypothesis it was, not a finding.
+
 So **the console offers a relay of its own** (`refreshRelays` in `mediad/webclient/index.html`),
 and only its own allocation can bridge this: `turn.cloudflare.com` is a name, so it resolves over
 IPv6, and the relayed address Cloudflare hands back is IPv4, which the robot can reach. Confirmed
@@ -890,6 +907,69 @@ relay — by however long the proxy takes to answer. `Relays::uris` therefore re
 blocks (a `try_read` that yields nothing rather than waiting) and never fails. An empty answer is
 the ordinary state for the first few seconds after boot and forever on a robot with no account,
 and it means host and srflx only, which is all anything on the same network needs.
+
+**A duck does gather relay candidates, measured rather than inferred.** On `lavandiere`
+(0.12.0-dev.1007.3c8e681, signed in as `PierreRouanet`), a LAN session over `webrtcsink`'s own
+signalling server:
+
+```
+added TURN servers for this consumer  servers=5
+gathered ICE candidates  host=6 srflx=3 prflx=0 relay=6 unparsed=0 complete=false
+```
+
+with the six `typ relay` lines on `104.30.…` seen independently at the consumer. So
+`add-turn-server` works, `libnice` completes a Cloudflare allocation over the credentials this
+account mints, and nothing in the robot's half of §6 is broken. A **LAN** session settles this
+because gathering does not depend on the peer: a relay candidate is allocated whether or not
+anything will ever pair with it, and only the pairing is remote. That makes it the cheap first
+test whenever this question comes up again — no rendezvous, no Space, no second network.
+
+What it does not settle is a session that *fails*. The tally has to be read on the robot that is
+failing, during the failure; `relay=6` here means the machinery works, not that every duck's does.
+
+**And a relay carries a real session, end to end.** `lavandiere` on
+`0.12.0-dev.1011.cb17b40`, driven from a private HF Space over the rendezvous:
+
+```
+ICE connection state  state=Checking → Connected (2.0 s) → Completed (2.2 s)
+gathered ICE candidates  host=6 srflx=3 prflx=0 relay=9 unparsed=0 complete=true
+selected candidate pair  local=relay 104.30.144.144:29840/udp via 141.101.90.1
+                         remote=prflx 54.225.144.144:11854/udp
+```
+
+The robot's Cloudflare relay is the local half of the pair that won, so §6's arrangement is not
+merely available — it is what carried the video. The consumer offered no TURN credentials of its
+own and needed none, which is the property the whole section is built on.
+
+The remote half being **`prflx`** is worth reading too: the robot learned the Space's address from
+an inbound STUN check rather than from a signalled candidate, which is the ordinary shape for a
+consumer whose srflx is not usable. Nothing had to be done about it.
+
+So a duck that cannot be reached is a duck to take these three lines from, not a design to revisit.
+The first thing to check remains the build: a robot older than the endpoint fix holds no
+credentials at all and says so every thirty seconds.
+
+**`reachy_mini` main is not a working reference to copy from — it is the same arrangement,
+unverified in the same way.** Read against `mediad` at `9d364df`: `webrtc_utils.TurnCredentials`
+and `media_server._apply_turn_servers` match `turn.rs` and `offer_relay_candidates` point for
+point — the same Space endpoint, the same 600 s TTL refreshed at half, the same 30 s retry after a
+transient failure only, the same `stun:`/no-credential entries skipped, the same percent-encoded
+`turn://user:pass@host:port`, the same `add-turn-server` inside `consumer-added` before the offer,
+the same cached read that never blocks the offer thread. Neither daemon sets `stun-server`, so both
+take `webrtcsink`'s default. **And neither observes a candidate**: no `on-ice-candidate` and no
+`ice-gathering-state` anywhere in `src/reachy_mini/`, so "the patched daemon offers its own relay"
+— `rf-detr-realtime-webcam`'s `app.py` says it while passing STUN-only for the robot leg — rests on
+the same `add-turn-server`-returned-cleanly inference §6 made here. So there is no patch to port,
+and the mini working where a duck does not would be an environmental difference (allowance, board
+network, `libnice` build) rather than a code one.
+
+What the mini does have and `mediad` does not is a **negotiation watchdog**: 12 s from
+`consumer-added` to `connection-state == connected`, after which it ends the session with a named
+reason rather than leaving a client spinning. Its comment names the culprit it was written for —
+"`libnice` frozen mid-`CHECKING` (a known crash mode of certain `libnice` versions)" — which is a
+second way a session negotiates perfectly and carries nothing, distinct from having no usable
+candidate pair. Worth having for the same reason the candidate tally is: it separates two failures
+that look identical from outside.
 
 **The proxy is the Space, and the name in front of it was the dead part.** `turn.fastrtc.org` —
 what `fastrtc`'s own code points at and what `reachy_mini` #1182 copied into this arrangement — is
