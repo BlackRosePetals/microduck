@@ -31,7 +31,7 @@ use ratatui::widgets::{
     Block, Cell, Paragraph, RenderDirection, Row, Sparkline, Table, TableState,
 };
 
-use crate::{Client, Failure, duck, exit, imu_view, path_map};
+use crate::{Client, Failure, camera, duck, exit, frame, imu_view, path_map};
 
 /// Tracking error at the edge of a deviation bar, radians.
 ///
@@ -95,6 +95,29 @@ const IMU_REPAINT: Duration = Duration::from_millis(33);
 /// reason, like the pad block, and everything below it moves only when the reader
 /// asks for it with `t`.
 const TOF_HEIGHT: u16 = 10;
+
+/// Rows the camera block occupies while it is open: two borders and fourteen rows of picture.
+///
+/// Sixteen rows is a lot, and it buys a picture 28 pixels tall — which, after the quarter turn
+/// this camera is mounted at, is 16 wide. That is small, and it is enough for what the block is
+/// for: where the head is pointing, whether the room is lit, whether the lens is covered. Fewer
+/// rows and it stops answering those; more and it is the whole terminal.
+///
+/// Fixed, like the pad and ToF blocks and for the same reason — but only while open, and opening
+/// it is a deliberate act.
+const CAMERA_HEIGHT: u16 = 16;
+
+/// Between frames while the camera block is open.
+///
+/// Twice a second, deliberately, and not the camera's 30: every request makes `mediad` copy 1.84
+/// MiB off the capture branch that it would otherwise drop unread, and a picture of a room does
+/// not change faster than a person can look at it.
+const CAMERA_PERIOD: Duration = Duration::from_millis(500);
+
+/// Before asking again after a failed request — a stopped `mediad`, or a camera that did not
+/// produce a frame in time. Long enough that a duck with no camera is not answering a connect
+/// twice a second for as long as the block is open.
+const CAMERA_RETRY: Duration = Duration::from_secs(2);
 
 /// Rows of axis cells the pad block draws.
 ///
@@ -271,6 +294,13 @@ enum Update {
     /// [`Self::PadLost`] is not: it is a third daemon on a third socket, and most
     /// ducks have no ToF fitted at all.
     TofLost(String),
+    /// One frame off `mediad`'s local snapshot endpoint, asked for because the camera block is
+    /// open. Nothing arrives while it is closed — see [`read_camera`].
+    Camera(Box<camera::Shot>),
+    /// Why there is no picture. Not fatal, for the reason [`Self::TofLost`] is not: it is a
+    /// connection of its own to a daemon the state stream does not come from, and a duck whose
+    /// `mediad` is stopped is still a duck worth watching.
+    CameraLost(String),
     /// One answer to `robot.health` — the battery, the temperatures, the bus counters and the
     /// IMU's staleness, none of which is on the state stream.
     Health(Box<proto::HealthResult>),
@@ -288,6 +318,7 @@ pub fn run(
     robot_socket: &Path,
     pad_socket: &Path,
     tof_socket: &Path,
+    media_socket: &Path,
     hz: u32,
     json: bool,
 ) -> Result<(), Failure> {
@@ -327,6 +358,7 @@ pub fn run(
 
     let (tx, rx) = mpsc::channel();
     let pad_tx = tx.clone();
+    let camera_tx = tx.clone();
     let tx_for_tof = tx.clone();
     let health_tx = tx.clone();
     let pad_socket = pad_socket.to_path_buf();
@@ -363,8 +395,10 @@ pub fn run(
     let health_socket = robot_socket.to_path_buf();
     thread::spawn(move || poll_health(&health_socket, &health_tx));
 
+    // The camera has no reader thread yet, and deliberately: `media.frame` is a *request*, and one
+    // is only made while the block is open. `live` owns the toggle, so it owns the thread.
     let mut terminal = ratatui::init();
-    let outcome = live(&mut terminal, &rx, hz, no_robot);
+    let outcome = live(&mut terminal, &rx, camera_tx, hz, no_robot, media_socket);
     ratatui::restore();
     outcome
 }
@@ -599,6 +633,53 @@ fn subscribe_to_tof(socket: &Path, tx: &mpsc::Sender<Update>) -> Result<(), Stri
     }
 }
 
+/// Ask `mediad` for a picture, twice a second, and only while the camera block is open.
+///
+/// **The only reader here that has to be told to read.** The pad tap and the depth stream are
+/// subscriptions: they cost the daemon at the other end nothing extra while nobody is looking,
+/// so they run whether or not their block is open. `media.frame` is a request, and answering one
+/// makes `mediad` copy 1.84 MiB off the capture branch it would otherwise drop unread — so this
+/// thread parks on `asked_for` until the reader presses `c`, and parks again when they press it
+/// twice.
+///
+/// Every failure is a sentence for the block rather than an error for the process, exactly as the
+/// pad and ToF readers treat theirs: most ducks run a camera, and none of them stop being worth
+/// watching because `mediad` is being restarted.
+fn read_camera(socket: &Path, tx: &mpsc::Sender<Update>, asked_for: &Receiver<bool>) {
+    let mut open = false;
+    loop {
+        if !open {
+            match asked_for.recv() {
+                Ok(next) => open = next,
+                Err(_) => return, // the UI is gone
+            }
+            continue;
+        }
+        let asked = Instant::now();
+        let (update, again) = match frame::fetch(socket) {
+            Ok((header, data)) => (
+                Update::Camera(Box::new(camera::Shot {
+                    header,
+                    data,
+                    waited: asked.elapsed(),
+                })),
+                CAMERA_PERIOD,
+            ),
+            Err(why) => (Update::CameraLost(why.to_string()), CAMERA_RETRY),
+        };
+        if tx.send(update).is_err() {
+            return; // the UI is gone
+        }
+        // Waiting on the line rather than sleeping on it: closing the block must stop the asking
+        // now, not at the end of the period.
+        match asked_for.recv_timeout(again) {
+            Ok(next) => open = next,
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => return,
+        }
+    }
+}
+
 /// Ask `robotd` how it is, for as long as the view lives.
 ///
 /// Every way this ends is a sentence for the power row rather than an error for the process,
@@ -822,14 +903,23 @@ fn decode_pad(line: &str) -> Option<Result<proto::PadReport, String>> {
 fn live(
     terminal: &mut DefaultTerminal,
     rx: &Receiver<Update>,
+    tx: mpsc::Sender<Update>,
     hz: u32,
     no_robot: Option<String>,
+    media_socket: &Path,
 ) -> Result<(), Failure> {
     // A frame every `1/hz`, so waiting a fifth of a period keeps the keyboard responsive
     // without spinning. Clamped: `--hz 1000` must not turn this into a busy loop.
     let poll = Duration::from_secs_f64(1.0 / f64::from(hz.clamp(1, 200)) / 5.0);
     let mut view = View::new(hz, no_robot);
     let mut painted = Instant::now();
+
+    // The camera's thread, and the line this loop tells it to start and stop asking on. It sleeps
+    // on that line while the block is shut, which is the whole point: a request is 1.84 MiB
+    // `mediad` would otherwise never have copied.
+    let (wanted, asked_for) = mpsc::channel();
+    let camera_socket = media_socket.to_path_buf();
+    thread::spawn(move || read_camera(&camera_socket, &tx, &asked_for));
 
     loop {
         let mut fresh = false;
@@ -881,6 +971,13 @@ fn live(
                     // them.
                     KeyCode::Char('t') => {
                         view.toggle_tof();
+                        fresh = true;
+                    }
+                    // The camera. Off by default, and the only block that *costs* the robot
+                    // something to have open, so the keypress is also what starts the asking.
+                    KeyCode::Char('c') => {
+                        view.toggle_camera();
+                        let _ = wanted.send(view.show_camera);
                         fresh = true;
                     }
                     // The 3D robot view. On by default — it appears whenever the
@@ -1309,6 +1406,11 @@ struct View {
     tof_lost: Option<String>,
     /// Is the ToF block open? Closed to begin with — see [`TOF_HEIGHT`].
     show_tof: bool,
+    /// The last frame off `mediad`, and the picture drawn from it.
+    camera: camera::CameraView,
+    /// Is the camera block open? Closed to begin with, and unlike every other block that also
+    /// means nothing is being *fetched* — see [`read_camera`].
+    show_camera: bool,
     /// The last answer to `robot.health`: the battery, the temperatures, the bus counters and
     /// how stale the IMU's reads are. None of it is on the state stream.
     health: Option<proto::HealthResult>,
@@ -1344,6 +1446,8 @@ impl View {
             tof_status: None,
             tof_lost: None,
             show_tof: false,
+            camera: camera::CameraView::default(),
+            show_camera: false,
             health: None,
             health_at: None,
             health_lost: None,
@@ -1356,6 +1460,15 @@ impl View {
 
     fn toggle_tof(&mut self) {
         self.show_tof = !self.show_tof;
+    }
+
+    /// Open or close the camera block. Closing forgets the picture: nothing is fetched while it
+    /// is shut, so what is held would be minutes old by the time it was shown again.
+    fn toggle_camera(&mut self) {
+        self.show_camera = !self.show_camera;
+        if !self.show_camera {
+            self.camera.forget();
+        }
     }
 
     fn toggle_pad(&mut self) {
@@ -1428,6 +1541,15 @@ impl View {
                 self.pad.trouble = Some(why);
                 Ok(self.show_pad)
             }
+            // A frame only arrives because the block is open, so it is always worth a repaint.
+            Update::Camera(shot) => {
+                self.camera.absorb(*shot);
+                Ok(true)
+            }
+            Update::CameraLost(why) => {
+                self.camera.lost(why);
+                Ok(self.show_camera)
+            }
             Update::Health(health) => {
                 self.health = Some(*health);
                 self.health_at = Some(Instant::now());
@@ -1480,9 +1602,11 @@ impl View {
             // watching the sticks.
             let pad_height = self.pad_height();
             let tof_height = if self.show_tof { TOF_HEIGHT } else { 0 };
-            let [pad, tof, rest] = Layout::vertical([
+            let camera_height = if self.show_camera { CAMERA_HEIGHT } else { 0 };
+            let [pad, tof, camera, rest] = Layout::vertical([
                 Constraint::Length(pad_height),
                 Constraint::Length(tof_height),
+                Constraint::Length(camera_height),
                 Constraint::Min(3),
             ])
             .areas(area);
@@ -1492,12 +1616,18 @@ impl View {
             if self.show_tof {
                 self.render_tof(frame, tof);
             }
+            // Drawn here too, and this is the case it is most needed in: a camera answers on a
+            // board whose servo power is off, so a picture is one of the few things this frame
+            // can still show when no state will ever arrive.
+            if self.show_camera {
+                self.render_camera(frame, camera);
+            }
             let waiting = match &self.no_robot {
                 // Named rather than folded into "waiting", because waiting for a robot that is
                 // there and waiting for one that is not need different things done about them.
                 Some(why) => {
                     format!(
-                        "no robotd: {why}\nthe pad and tof blocks still work — p and t toggle them"
+                        "no robotd: {why}\nthe pad, tof and camera blocks still work — p, t and c toggle them"
                     )
                 }
                 None => "waiting for robot.state…".to_owned(),
@@ -1537,14 +1667,18 @@ impl View {
         // the order the robot does — sticks, command, joints, loop rate.
         let pad_height = self.pad_height();
         let tof_height = if self.show_tof { TOF_HEIGHT } else { 0 };
+        let camera_height = if self.show_camera { CAMERA_HEIGHT } else { 0 };
         let trace_height = area
             .height
-            .saturating_sub(HEADER_HEIGHT + pad_height + tof_height + rows as u16 + 3)
+            .saturating_sub(
+                HEADER_HEIGHT + pad_height + tof_height + camera_height + rows as u16 + 3,
+            )
             .clamp(3, 6);
-        let [header, pad, tof, joints, trace] = Layout::vertical([
+        let [header, pad, tof, camera, joints, trace] = Layout::vertical([
             Constraint::Length(HEADER_HEIGHT),
             Constraint::Length(pad_height),
             Constraint::Length(tof_height),
+            Constraint::Length(camera_height),
             Constraint::Min(4),
             Constraint::Length(trace_height),
         ])
@@ -1565,6 +1699,11 @@ impl View {
         // the robot does — what it was told, what it sees, what it did.
         if self.show_tof {
             self.render_tof(frame, tof);
+        }
+        // Under the sensors and above the joints, still in the robot's own order: the camera is
+        // another thing it sees, and the joints below are what it did about all of them.
+        if self.show_camera {
+            self.render_camera(frame, camera);
         }
         frame.render_stateful_widget(
             self.joints(state, rows, visible),
@@ -1691,7 +1830,7 @@ impl View {
                 // The robot view is only named here while it is hidden: visible, it
                 // carries its own caption, and this title clips on a narrow terminal.
                 Line::from(format!(
-                    " q quits · ↑↓ scrolls · u {} · p {}{}{} ",
+                    " q quits · ↑↓ scrolls · u {} · p {}{}{}{} ",
                     self.units.toggled().name(),
                     if self.show_pad {
                         "hides the pad"
@@ -1702,6 +1841,11 @@ impl View {
                     // the same reason: open, the block carries its own title, and
                     // every character here is one the left-hand title loses.
                     if self.show_tof { "" } else { " · t the tof" },
+                    if self.show_camera {
+                        ""
+                    } else {
+                        " · c the camera"
+                    },
                     if self.show_duck {
                         ""
                     } else {
@@ -2311,6 +2455,23 @@ impl View {
             })
             .collect();
         frame.render_widget(Paragraph::new(lines), inner);
+    }
+
+    /// The camera frame, drawn in half-blocks. See [`camera`] for what it costs and why it only
+    /// costs it while this block is open.
+    fn render_camera(&self, frame: &mut ratatui::Frame, area: ratatui::layout::Rect) {
+        let block = Block::bordered()
+            .title(Line::from(self.camera.title()))
+            .title_bottom(Line::from(" c hides ".to_owned()).dim())
+            .title_bottom(self.camera.caption().right_aligned());
+        let inner = block.inner(area);
+        let absence = self.camera.absence();
+        frame.render_widget(block, area);
+        if self.camera.has_picture() {
+            self.camera.draw(inner, frame.buffer_mut());
+        } else {
+            frame.render_widget(Paragraph::new(absence).dim(), inner);
+        }
     }
 
     /// The frame's zones through the head FK, when both streams are up: which
@@ -3655,6 +3816,85 @@ mod tests {
         state.movement.requested[2] = 1.0;
         state.movement.applied[2] = 1.0;
         state
+    }
+
+    /// A frame as `mediad` would answer with: flat grey, and the geometry in the header.
+    fn a_picture(rotate: u32) -> camera::Shot {
+        let (width, height) = (8u32, 4u32);
+        let data = [128u8, 180, 128, 180].repeat((width * height / 2) as usize);
+        camera::Shot {
+            header: proto::MediaFrameHeader {
+                width,
+                height,
+                format: "UYVY".to_owned(),
+                bytes: data.len(),
+                captured_at_unix_us: 1,
+                rotate,
+            },
+            data,
+            waited: Duration::from_millis(38),
+        }
+    }
+
+    /// The camera block is `c`'s, and nothing about it is on the frame until it is asked for —
+    /// including, out of this view's sight, the request that makes `mediad` copy a frame at all.
+    #[test]
+    fn the_camera_block_is_drawn_only_once_it_is_asked_for() {
+        let mut view = View::new(20, None);
+        feed(&mut view, Update::State(Box::new(a_state())));
+        feed(&mut view, Update::Camera(Box::new(a_picture(0))));
+        let screen = render_to(&mut view, 80, 40);
+        assert!(
+            !screen.contains("camera 8×4"),
+            "closed, it is not drawn: {screen}"
+        );
+        assert!(
+            screen.contains("c the camera"),
+            "and the key is named: {screen}"
+        );
+
+        view.toggle_camera();
+        let screen = render_to(&mut view, 80, 40);
+        assert!(screen.contains("camera 8×4"), "{screen}");
+        assert!(screen.contains("mount 0°"), "{screen}");
+        assert!(
+            screen.contains('▀'),
+            "the picture is half-block pixels: {screen}"
+        );
+    }
+
+    /// Closing it forgets the frame, because nothing refreshes it while it is shut and a picture
+    /// of a room minutes ago is indistinguishable from one of the room now.
+    #[test]
+    fn closing_the_camera_block_forgets_the_picture() {
+        let mut view = View::new(20, None);
+        view.toggle_camera();
+        feed(&mut view, Update::Camera(Box::new(a_picture(90))));
+        assert!(view.camera.has_picture());
+
+        view.toggle_camera();
+        assert!(!view.camera.has_picture());
+        view.toggle_camera();
+        let screen = render_to(&mut view, 80, 40);
+        assert!(screen.contains("asking mediad for a frame"), "{screen}");
+    }
+
+    /// A stopped `mediad` is a sentence in the block, not the end of the monitor — the same
+    /// treatment the pad tap and the depth stream get, and for the same reason.
+    #[test]
+    fn a_camera_that_does_not_answer_is_named_rather_than_fatal() {
+        let mut view = View::new(20, None);
+        view.toggle_camera();
+        assert!(
+            view.absorb(Update::CameraLost("mediad is not running".to_owned()))
+                .is_ok(),
+            "a camera that is not there is not a failure"
+        );
+        let screen = render_to(&mut view, 80, 40);
+        assert!(
+            screen.contains("no picture: mediad is not running"),
+            "{screen}"
+        );
     }
 
     /// Feed the view one update.

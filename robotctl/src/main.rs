@@ -40,6 +40,8 @@ use clap::{Args, CommandFactory, Parser, Subcommand};
 use duck_ipc_proto as proto;
 use robotd_params::Slot;
 
+mod camera;
+mod cells;
 mod configure;
 mod duck;
 mod frame;
@@ -4535,6 +4537,7 @@ fn run(cli: Cli) -> Result<(), Failure> {
                 &cli.robot_socket,
                 &cli.pad_socket,
                 &cli.tof_socket,
+                &cli.media_socket,
                 hz,
                 json,
             );

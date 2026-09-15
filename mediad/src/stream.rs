@@ -612,7 +612,7 @@ pub fn h264_encoder(branch: crate::pipeline::StreamBranch) -> Encode {
 /// A frame is asked for rather than published, which is the whole design of `Frames`: at 5 fps
 /// this copies five of thirty rather than all thirty.
 #[cfg(target_os = "linux")]
-pub fn jpeg_encoder(frames: crate::pipeline::Frames, turn: duck_detect::Turn) -> Encode {
+pub fn jpeg_encoder(frames: crate::pipeline::Frames, turn: uyvy::Turn) -> Encode {
     // Reused across frames: at 640×480 the RGB buffer is 920 KB, and allocating that five times a
     // second forever is a page fault storm for no reason. A `Mutex` because `Encode` is `Fn` — one
     // thread ever takes it, so it is uncontended by construction.
@@ -633,7 +633,7 @@ pub fn jpeg_encoder(frames: crate::pipeline::Frames, turn: duck_detect::Turn) ->
 
         let mut held = scratch.lock().expect("not poisoned");
         let (rgb, jpeg) = &mut *held;
-        let (width, height) = duck_detect::rgb_from_uyvy(
+        let (width, height) = uyvy::rgb_from_uyvy(
             &frame.data,
             frame.width as usize,
             frame.height as usize,

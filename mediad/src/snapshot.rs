@@ -82,12 +82,12 @@ async fn response(
 /// not thirty times a second in front of the encoder, which is what made `videoflip` expensive.
 pub(crate) fn png(header: proto::MediaFrameHeader, data: Vec<u8>) -> Result<Vec<u8>> {
     use image::ImageEncoder;
-    let turn = duck_detect::Turn::from_degrees(header.rotate)
+    let turn = uyvy::Turn::from_degrees(header.rotate)
         .context("camera reported a mount that is not a quarter turn")?;
     let mut rgb = Vec::new();
     // The turned dimensions, not the header's: a quarter turn swaps the axes, and encoding the
     // capture geometry over rotated pixels is a diagonally sheared image rather than an error.
-    let (width, height) = duck_detect::rgb_from_uyvy(
+    let (width, height) = uyvy::rgb_from_uyvy(
         &data,
         header.width as usize,
         header.height as usize,

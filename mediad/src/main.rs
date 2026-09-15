@@ -273,7 +273,7 @@ fn main() -> ExitCode {
     );
     // The same angle the detector needs, in its own vocabulary: it folds the turn into the
     // resampling it already does, which is why nothing in the pipeline has to.
-    let turn = match duck_detect::Turn::from_degrees(rotate) {
+    let turn = match uyvy::Turn::from_degrees(rotate) {
         Some(turn) => turn,
         None => {
             tracing::error!(degrees = rotate, "mediad cannot start");
@@ -497,7 +497,7 @@ fn main() -> ExitCode {
             // to flip, in which case they are upright already and the sampler must not turn them
             // again.
             let sampler_turn = if args.flip_in_pipeline {
-                duck_detect::Turn::None
+                uyvy::Turn::None
             } else {
                 turn
             };
@@ -571,7 +571,7 @@ fn main() -> ExitCode {
                 jpeg: mediad::stream::jpeg_encoder(
                     frames.clone(),
                     if args.flip_in_pipeline {
-                        duck_detect::Turn::None
+                        uyvy::Turn::None
                     } else {
                         turn
                     },
