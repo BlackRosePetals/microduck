@@ -67,10 +67,11 @@ pub const MAX_ATTRIBUTE_VALUE: usize = 512;
 /// chunk replies — `net.status`, `system.info`, `hello` — were fine throughout, which is what
 /// made it look like a problem with the larger methods rather than with every boundary.
 pub fn notification_payload(mtu: u16) -> usize {
+    // `clamp` rather than `min` then `max`: the two constants are ordered by construction, and
+    // clippy is right that spelling it out this way says so.
     usize::from(mtu)
         .saturating_sub(3)
-        .min(MAX_ATTRIBUTE_VALUE)
-        .max(FLOOR_MTU)
+        .clamp(FLOOR_MTU, MAX_ATTRIBUTE_VALUE)
 }
 
 /// Reassembles inbound chunks into whole lines.
