@@ -2086,9 +2086,7 @@ fn count_gathered_candidates(
     let owner = peer.to_owned();
     webrtcbin.connect("on-ice-candidate", false, move |values| {
         // (webrtcbin, mline_index, candidate).
-        let Some(candidate) = values.get(2).and_then(|value| value.get::<String>().ok()) else {
-            return None;
-        };
+        let candidate = values.get(2).and_then(|value| value.get::<String>().ok())?;
         // An empty string is how several stacks say "that was the last one"; it is not a candidate
         // and must not count as one this parser failed to read.
         if candidate.trim().is_empty() {
