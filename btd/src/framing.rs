@@ -40,6 +40,39 @@ pub const MAX_LINE: usize = 8 * 1024;
 /// 64 KiB is a minute on the air and no answer should take that long.
 pub const MAX_REPLY_LINE: usize = 64 * 1024;
 
+/// Notification payload a session starts with, before any write has reported the negotiated one.
+///
+/// 20 bytes is what every BLE link is required to support, so it is the only safe *first* guess.
+pub const FLOOR_MTU: usize = 20;
+
+/// The largest a GATT characteristic value may be, whatever the MTU says.
+///
+/// **512 octets, from the Core specification** (Vol 3, Part F, §3.2.9), and it is not the same
+/// number as the ATT MTU. An MTU of 517 *is* this limit — 512 bytes of value plus five bytes of
+/// ATT overhead — which is why 517 is the figure every stack converges on, and why subtracting
+/// only the three-byte notification header from it overshoots by two.
+pub const MAX_ATTRIBUTE_VALUE: usize = 512;
+
+/// How large a notification this link will actually carry.
+///
+/// `mtu - 3` is the ATT arithmetic and it is not sufficient on its own: against the 517-byte MTU
+/// a CoreBluetooth central negotiates it yields 514, and a central handed a 514-byte value keeps
+/// the first 512 and discards the rest. **Silently** — no error on either side.
+///
+/// What that looked like before it was understood: two bytes disappearing from the middle of
+/// every reply longer than one chunk, so `{"security":"wpa_psk"}` arrived as
+/// `{"serity":"wpa_psk"}` and a client failed to parse a field the robot had sent correctly.
+/// Worse when the missing pair happened to include the newline, because then the line never
+/// completed and the call waited out its budget against a robot that had already answered. Single
+/// chunk replies — `net.status`, `system.info`, `hello` — were fine throughout, which is what
+/// made it look like a problem with the larger methods rather than with every boundary.
+pub fn notification_payload(mtu: u16) -> usize {
+    usize::from(mtu)
+        .saturating_sub(3)
+        .min(MAX_ATTRIBUTE_VALUE)
+        .max(FLOOR_MTU)
+}
+
 /// Reassembles inbound chunks into whole lines.
 #[derive(Debug)]
 pub struct Reassembler {
@@ -145,9 +178,8 @@ impl Reassembler {
 /// reassembles until newline then needs no notion of "end of message" beyond the one it
 /// already has.
 pub fn chunks(line: &str, mtu: usize) -> Vec<Vec<u8>> {
-    // A zero or absurd MTU would divide by zero or emit one chunk per byte. 20 is the
-    // floor BLE guarantees before any negotiation.
-    let mtu = mtu.max(20);
+    // A zero or absurd MTU would divide by zero or emit one chunk per byte.
+    let mtu = mtu.max(FLOOR_MTU);
 
     let mut bytes = line.as_bytes().to_vec();
     if !bytes.ends_with(b"\n") {
@@ -276,5 +308,40 @@ mod tests {
     #[test]
     fn an_absurd_mtu_falls_back_to_the_ble_floor() {
         assert_eq!(chunks(&"z".repeat(40), 0).len(), 3); // 41 bytes over 20-byte chunks
+    }
+}
+
+#[cfg(test)]
+mod payload_tests {
+    use super::{FLOOR_MTU, MAX_ATTRIBUTE_VALUE, notification_payload};
+
+    /// The regression this exists for. 517 is what a CoreBluetooth central negotiates, and
+    /// `mtu - 3` alone gives 514 — two bytes more than a characteristic value may hold, which
+    /// the central drops without telling anybody.
+    #[test]
+    fn a_corebluetooth_mtu_does_not_exceed_the_value_limit() {
+        assert_eq!(notification_payload(517), MAX_ATTRIBUTE_VALUE);
+    }
+
+    /// Below the cap the ATT arithmetic is the whole answer, and the common small MTUs must not
+    /// be rounded up to it.
+    #[test]
+    fn a_smaller_link_gets_what_its_mtu_allows() {
+        assert_eq!(notification_payload(23), 20);
+        assert_eq!(notification_payload(185), 182);
+        assert_eq!(notification_payload(247), 244);
+    }
+
+    /// A link reporting a huge MTU is still bounded by the value limit.
+    #[test]
+    fn nothing_above_the_cap_gets_through_it() {
+        assert_eq!(notification_payload(u16::MAX), MAX_ATTRIBUTE_VALUE);
+    }
+
+    /// Never below the floor every BLE link is required to carry, whatever is reported.
+    #[test]
+    fn a_nonsense_mtu_falls_back_to_the_floor() {
+        assert_eq!(notification_payload(0), FLOOR_MTU);
+        assert_eq!(notification_payload(3), FLOOR_MTU);
     }
 }
