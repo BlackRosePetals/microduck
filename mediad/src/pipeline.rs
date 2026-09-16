@@ -91,7 +91,11 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow};
+// `bail!` belongs to the sensor-mode search, so it is gated with it rather than left to warn on a
+// build with no v4l2 to talk to.
+#[cfg(target_os = "linux")]
+use anyhow::bail;
 use duck_ipc_proto as proto;
 use gstreamer as gst;
 use gstreamer::prelude::*;
@@ -413,6 +417,8 @@ pub fn start(
     // never arriving — see [`bridge_gstreamer_log`].
     bridge_gstreamer_log();
 
+    prefer_a_usable_h264_encoder();
+
     // **A GStreamer signal handler runs on a GStreamer thread, which is not inside the tokio
     // runtime.** `tokio::spawn` there panics with "there is no reactor running", and a panic
     // crossing the C closure boundary is a non-unwinding abort — the whole daemon dies with
@@ -433,7 +439,18 @@ pub fn start(
             src.set_property("is-live", true);
             src
         }
+        #[cfg(target_os = "linux")]
         Source::Camera(camera) => camera_source(camera, fps)?,
+        // Not "unsupported": `[media] camera = true` off a robot is a config file copied from one,
+        // and the fix is to name whichever of the other two sources was meant.
+        #[cfg(not(target_os = "linux"))]
+        Source::Camera(_) => {
+            return Err(anyhow!(
+                "a head camera is captured with v4l2, which this is not running on. A duck in \
+                 MuJoCo is --sim-camera; a source that needs nothing at all is the default test \
+                 pattern"
+            ));
+        }
         Source::Sim(addr) => sim_source(addr, width, height, fps)?,
     };
 
@@ -1242,6 +1259,36 @@ fn watch_bus(pipeline: &gst::Pipeline) {
         );
 }
 
+/// Get `webrtcsink` off an encoder it cannot drive.
+///
+/// **A rank fix, because the choice is made by rank and on macOS it is a tie.** `webrtcsink` picks
+/// among the H.264 encoders by factory rank, and there `vtenc_h264`, `vtenc_h264_hw` and `x264enc`
+/// all register at `primary` — so the winner is registry order rather than a decision. VideoToolbox
+/// winning it is a broken stream and not a slow one: `webrtcsink` reports `Bitrate handling is not
+/// supported yet for vtenc_h264`, the encoder then fails to negotiate, and the discovery pass dies
+/// with `not-negotiated`. Software H.264 at 640x360 costs a fraction of a laptop core.
+///
+/// The board is untouched, deliberately: there the ranks are not a tie — `mpph264enc` registers at
+/// `primary+1` on purpose — and reaching into that would be changing the one arrangement that was
+/// measured.
+#[cfg(target_os = "macos")]
+fn prefer_a_usable_h264_encoder() {
+    use gst::prelude::*;
+
+    for name in ["vtenc_h264", "vtenc_h264_hw"] {
+        if let Some(factory) = gst::ElementFactory::find(name) {
+            factory.set_rank(gst::Rank::NONE);
+            tracing::info!(
+                encoder = name,
+                "demoted below x264enc: webrtcsink cannot set its bitrate"
+            );
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn prefer_a_usable_h264_encoder() {}
+
 fn make(name: &str) -> Result<gst::Element> {
     gst::ElementFactory::make(name)
         .build()
@@ -1250,11 +1297,16 @@ fn make(name: &str) -> Result<gst::Element> {
 
 /// The head camera as a `v4l2src`, with the one adjustment this driver needs.
 ///
+/// This function, [`CAPTURE_BUFFERS`]/[`raise_capture_buffers`] and the two sensor-mode helpers
+/// below are the whole of what ties this file to Linux. Everything else here is GStreamer, which
+/// runs wherever it is installed.
+///
 /// `v4l2src` rather than a hand-written V4L2 loop. The case for our own capture was that this
 /// driver drops every third frame, and that raw bytes through `fdsrc` need
 /// `rawvideoparse blocksize=…`, which is silently wrong the moment stride padding appears. Both
 /// belong to the *subprocess* shape: `v4l2src` attaches a `GstVideoMeta` describing the real
 /// layout, and the frame loss has a cause with a small fix — see [`raise_capture_buffers`].
+#[cfg(target_os = "linux")]
 fn camera_source(camera: &Camera, fps: u32) -> Result<gst::Element> {
     pin_sensor_mode(fps)?;
 
@@ -1398,6 +1450,7 @@ pub const CAPTURE_FORMAT: &str = "UYVY";
 /// | seconds | 15.2 | 10.3 | 10.3 | 10.3 |
 ///
 /// 19.7 fps against 29.2 from a 30 fps sensor, and `v4l2src` lands on two.
+#[cfg(target_os = "linux")]
 const CAPTURE_BUFFERS: u32 = 4;
 
 /// Get `v4l2src` off two capture buffers, which costs a third of the frames.
@@ -1440,6 +1493,7 @@ const CAPTURE_BUFFERS: u32 = 4;
 /// encoder's zero on the way back. A pad probe fires in both directions, so this rewrites pool 0
 /// every time it sees the query and the last word is ours. That is the bug that made three
 /// earlier versions of this function look like they were being ignored.
+#[cfg(target_os = "linux")]
 fn raise_capture_buffers(src: &gst::Element) -> Result<()> {
     let pad = src
         .static_pad("src")
@@ -1533,6 +1587,7 @@ pub fn sensor_mode() -> Option<crate::camera::SensorMode> {
 /// entity whose name embeds its I2C bus and address (`m00_b_imx219 2-0010`) and therefore has to
 /// be discovered from the topology rather than named. Doing it here rather than in the unit means
 /// a run with `[media] camera` off needs no camera at all.
+#[cfg(target_os = "linux")]
 fn pin_sensor_mode(fps: u32) -> Result<()> {
     let (media, entity) = find_sensor()?;
 
@@ -1570,6 +1625,7 @@ fn pin_sensor_mode(fps: u32) -> Result<()> {
 /// reported "no imx219 entity" for all of them, which sent the first real run chasing the
 /// overlay when the actual cause was `media-ctl` being denied `/dev/media0`. The three cases want
 /// three different fixes and look identical from the outside.
+#[cfg(target_os = "linux")]
 fn find_sensor() -> Result<(String, String)> {
     let mut nodes = 0;
     let mut failures = Vec::new();

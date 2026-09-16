@@ -170,9 +170,9 @@ struct Args {
     frame_socket: std::path::PathBuf,
 }
 
-// Gated with the `main` that calls it: off Linux there is no pipeline, so there is nothing to
-// point at a socket and `-D warnings` would call this dead.
-#[cfg(target_os = "linux")]
+// Gated with the `main` that calls it: without a pipeline there is nothing to point at a socket and
+// `-D warnings` would call this dead.
+#[cfg(any(target_os = "linux", feature = "gstreamer"))]
 impl Args {
     fn sockets(&self) -> mediad::upstream::Sockets {
         let mut s = mediad::upstream::Sockets::default();
@@ -195,7 +195,7 @@ impl Args {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", feature = "gstreamer"))]
 fn main() -> ExitCode {
     let args = Args::parse();
     tracing_subscriber::fmt()
@@ -461,6 +461,9 @@ fn main() -> ExitCode {
         //
         // `_exposure` is the handle that stops the thread; it lives as long as this scope, which is
         // as long as the daemon.
+        // V4L2 controls through `ioctl`, so it exists only where a real camera can. Nothing else
+        // in this function cares: the other two sources have no sensor to meter.
+        #[cfg(target_os = "linux")]
         let _exposure = match (&source, args.no_auto_exposure) {
             (mediad::pipeline::Source::Camera(camera), false) => Some(mediad::exposure::spawn(
                 camera.device.clone(),
@@ -675,12 +678,18 @@ fn main() -> ExitCode {
     })
 }
 
-/// `mediad` is a Linux daemon: it drives GStreamer against a Rockchip VPU and a V4L2 capture path.
-/// The rest of the crate is portable and its tests run anywhere, which is why this is a stub rather
-/// than a `cfg` on the whole crate.
-#[cfg(not(target_os = "linux"))]
+/// Built without a pipeline: the rest of the crate is portable and its tests run anywhere, which is
+/// why this is a stub rather than a `cfg` on the whole crate.
+///
+/// The message names the way out, because the shape of this failure is somebody following the
+/// simulator's instructions and getting a daemon that exits with no picture and no reason.
+#[cfg(not(any(target_os = "linux", feature = "gstreamer")))]
 fn main() -> ExitCode {
     let _ = Args::parse();
-    eprintln!("mediad runs on the robot; this host is not Linux");
+    eprintln!(
+        "this mediad was built without a pipeline, so it has no camera, no console and no \
+         WebRTC.\nOn a robot that cannot happen. Here, build it with GStreamer:\n\n    brew \
+         install gstreamer\n    cargo build -p mediad --features gstreamer\n"
+    );
     ExitCode::FAILURE
 }
