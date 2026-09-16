@@ -30,7 +30,16 @@
 set -eu
 
 STATE="${DUCK_SIM_STATE:-$HOME/.cache/duck-sim}"
-RL="${DUCK_SIM_RL:-$HOME/Pollen/microduck_rl}"
+# Where the other half lives. Beside this repo first, then the old default: two clones of two
+# halves of one robot usually sit next to each other, and a checkout that is already in the right
+# place should need no variable. `DUCK_SIM_RL` still wins over both.
+if [ -n "${DUCK_SIM_RL:-}" ]; then
+    RL="$DUCK_SIM_RL"
+elif [ -d "$(dirname "$0")/../../microduck_rl" ]; then
+    RL="$(cd "$(dirname "$0")/../../microduck_rl" && pwd)"
+else
+    RL="$HOME/Pollen/microduck_rl"
+fi
 PORT="${DUCK_SIM_PORT:-7801}"
 
 # `setsid` is util-linux: Linux has it, a Mac does not. What it buys is a daemon in its own session,
@@ -486,7 +495,24 @@ start_body() {
         $cam_args \
         > "$STATE/body.log" 2>&1 &
     echo $! > "$STATE/body.pid"
-    wait_for_port || die "the simulator did not come up. $STATE/body.log has why."
+    if ! wait_for_port; then
+        # The one failure here that is not about this repo. `--cameras`/`--frame-port` are newer
+        # than the body server, and argparse refuses the whole invocation over an argument it does
+        # not know — so a checkout from before the rendering landed fails with the reason in a log
+        # file and nothing on screen but "did not come up".
+        if grep -q 'unrecognized arguments: --cameras' "$STATE/body.log" 2>/dev/null; then
+            die "$(cat <<WHY
+this microduck_rl has no camera: its body server does not know --cameras.
+
+    git -C $RL checkout develop && git -C $RL pull
+
+The rendering is on develop; a checkout on an older branch has the body and not the eye.
+Or unset DUCK_SIM_CAMERAS, and the duck runs blind.
+WHY
+)"
+        fi
+        die "the simulator did not come up. $STATE/body.log has why."
+    fi
 }
 
 wait_for_port() {
