@@ -2633,6 +2633,12 @@ fn run_system(socket: &Path, command: SystemCommand) -> Result<(), Failure> {
         SystemCommand::Info { .. } => {
             let info: proto::SystemInfoResult = decode(&result)?;
             println!("name    {}", info.name);
+            // First, and only when true. Everything below this line reads the same for a duck in
+            // MuJoCo as for one on the desk — which is the point of the simulator, and is also how
+            // somebody ends up debugging the wrong robot.
+            if info.simulated {
+                println!("body    MuJoCo (this is a simulated duck)");
+            }
             println!(
                 "serial  {}",
                 // A board with no readable SoC serial, not a board nobody provisioned: the

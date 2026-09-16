@@ -533,6 +533,13 @@ fills it in arbitrarily gets subtly wrong behaviour rather than a clear failure:
   falls back to `/etc/machine-id`, stable per *install* rather than per robot. Weaker and still
   correct for the purpose: one machine is listed once, and the producer stays sweepable. `sounds`
   already makes exactly this substitution for exactly this reason.
+- **`simulated`** is ours rather than the server's, and a key it never reads: a duck in MuJoCo
+  registers exactly as a robot does, and a listing that could not tell them apart would end with
+  somebody driving a simulation and wondering why the robot on the shelf is still.
+  `configd --simulated <serial>` is where the fact is declared, and `docs/design/simulation.md` §8
+  is why it is declared only there. That serial is also what makes a simulated duck's `hardware_id`
+  work: the `/etc/machine-id` fallback is per *install*, so ducks sharing a machine would evict each
+  other, and macOS has no such file at all.
 - **`name`** is what the listing shows a person, and the consumer's `name` is what the server
   reports back as `activeApp` to the owner's other devices. `transport` (`"wifi"` / `"usb"`) is a
   mini-ism a duck can leave alone; a `kind` of `microduck` is what lets one client list both

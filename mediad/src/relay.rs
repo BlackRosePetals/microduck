@@ -216,6 +216,17 @@ pub struct Meta {
     /// The release this robot is running, for the reason the local `meta` carries it.
     pub release: String,
     pub api_version: u32,
+    /// This robot is a duck in MuJoCo, and whoever is reading the listing should be told.
+    ///
+    /// **The listing is the one place this genuinely matters.** On a LAN you know what you
+    /// started; in an account's robot list a simulated duck sits next to real ones, and a client
+    /// that cannot tell them apart ends with somebody driving a simulation and wondering why the
+    /// robot on the shelf is still. `meta` is free-form to the service, so this costs nothing
+    /// there — §3.7 names the keys it does read, and this is not one of them.
+    ///
+    /// Absent rather than `false` on a real robot: the key is worth noticing where it appears.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub simulated: bool,
 }
 
 impl Meta {
@@ -226,6 +237,12 @@ impl Meta {
     /// install rather than per robot, which is weaker and still correct for the purpose: it keeps
     /// one machine from being listed twice, and it keeps the producer sweepable. `sounds` makes
     /// exactly this substitution for exactly this reason.
+    ///
+    /// **A simulated duck never reaches that fallback**, and that is why `configd --simulated`
+    /// takes a serial rather than one being invented here. The fallback is per *install*: four
+    /// ducks in one MuJoCo scene share one `/etc/machine-id`, so they would evict each other from
+    /// the listing one at a time — and on macOS there is no such file at all, so none of them
+    /// would register. A serial per duck makes every one of them a robot by the same rules.
     pub fn of(producer: &crate::producer::Producer, machine_id: Option<String>) -> Option<Self> {
         let hardware_id = producer
             .serial
@@ -238,6 +255,7 @@ impl Meta {
             kind: "microduck",
             release: producer.release.clone(),
             api_version: producer.api_version,
+            simulated: producer.simulated,
         })
     }
 }
@@ -1337,6 +1355,7 @@ mod tests {
             kind: "microduck",
             release: "0.10.0".to_owned(),
             api_version: duck_ipc_proto::API_VERSION,
+            simulated: false,
         }
     }
 
@@ -1464,6 +1483,7 @@ mod tests {
             serial: None,
             release: "0.10.0".to_owned(),
             api_version: duck_ipc_proto::API_VERSION,
+            simulated: false,
         };
 
         let meta = Meta::of(&producer, Some("machine-1".to_owned())).expect("a stable id");
@@ -1479,6 +1499,37 @@ mod tests {
                 .hardware_id,
             "3fa1c51b",
             "the serial wins: it survives a reinstall, and the machine id does not"
+        );
+    }
+
+    /// The flag reaches the wire when it is true, and is absent when it is not.
+    ///
+    /// Both halves matter. A simulated duck that registered without it is indistinguishable from
+    /// hardware in its owner's list, which is the whole reason the key exists; and a real robot
+    /// sending `simulated: false` would put a key on every registration on the fleet for the sake
+    /// of the handful of ducks that are not real.
+    #[test]
+    fn a_simulated_duck_says_so_and_a_real_one_says_nothing() {
+        let producer = crate::producer::Producer {
+            name: Some("duck-a".to_owned()),
+            serial: Some("sim-duck-a".to_owned()),
+            release: "0.10.0".to_owned(),
+            api_version: duck_ipc_proto::API_VERSION,
+            simulated: true,
+        };
+
+        let meta = Meta::of(&producer, None).expect("the simulated serial is a stable id");
+        assert_eq!(meta.hardware_id, "sim-duck-a");
+        assert_eq!(serde_json::to_value(&meta).unwrap()["simulated"], true);
+
+        let real = crate::producer::Producer {
+            simulated: false,
+            ..producer
+        };
+        let json = serde_json::to_value(Meta::of(&real, None).unwrap()).unwrap();
+        assert!(
+            json.get("simulated").is_none(),
+            "a real robot sends no such key: {json}"
         );
     }
 

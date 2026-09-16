@@ -337,7 +337,7 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// A new variant on a tagged enum is what a robotctl built before it cannot decode, which is the
 /// one reason this is a bump rather than a note: the tap is still `padd`'s own socket, and every
 /// other client is untouched.
-pub const API_VERSION: u32 = 28;
+pub const API_VERSION: u32 = 29;
 
 /// The observation width every policy this robot family runs is built against.
 ///
@@ -3785,6 +3785,19 @@ pub struct SystemInfoResult {
     /// to its hostname for a name.
     pub serial: Option<String>,
     pub uptime_seconds: u64,
+    /// This robot is a duck in MuJoCo, not a duck on a desk.
+    ///
+    /// **One fact, declared once, so nothing downstream has to infer it.** `mediad` puts it in the
+    /// `meta` it registers with, so a simulated duck is marked as such in its owner's robot list
+    /// rather than sitting there looking like hardware somebody could walk over to; `robotctl`
+    /// says it too. The alternative was every client deciding for itself from a serial that starts
+    /// with `sim-`, which is a convention three places would have to agree on and one of them
+    /// would get wrong.
+    ///
+    /// `serde(default)` for the reason every field here has it: an older daemon does not send it,
+    /// and absent means a real robot — which is right for every robot built so far.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub simulated: bool,
 }
 
 /// Answer to [`Call::SystemSetName`].
