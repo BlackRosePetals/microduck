@@ -39,16 +39,7 @@
 set -eu
 
 STATE="${DUCK_SIM_STATE:-$HOME/.cache/duck-sim}"
-# Where the other half lives. Beside this repo first, then the old default: two clones of two
-# halves of one robot usually sit next to each other, and a checkout that is already in the right
-# place should need no variable. `DUCK_SIM_RL` still wins over both.
-if [ -n "${DUCK_SIM_RL:-}" ]; then
-    RL="$DUCK_SIM_RL"
-elif [ -d "$(dirname "$0")/../../microduck_rl" ]; then
-    RL="$(cd "$(dirname "$0")/../../microduck_rl" && pwd)"
-else
-    RL="$HOME/Pollen/microduck_rl"
-fi
+RL="${DUCK_SIM_RL:-$HOME/Pollen/microduck_rl}"
 PORT="${DUCK_SIM_PORT:-7801}"
 
 # `setsid` is util-linux: Linux has it, a Mac does not. What it buys is a daemon in its own session,
@@ -590,7 +581,7 @@ start_body() {
     [ -d "$RL" ] || die "no simulator at $RL. It is the microduck_rl repo — set DUCK_SIM_RL."
     [ -x "$RL/.venv/bin/python" ] || die "$RL has no .venv. Run \`uv sync\` there first."
     mkdir -p "$STATE"
-    say "starting the body — a MuJoCo window should open"
+    say "starting the body from $RL — a MuJoCo window should open"
     # `DUCK_SIM_VIEWER=0` for a window-less run: watching costs frames, and the daemon's loop is
     # wall-clock, so a simulator that cannot keep up is a robot that cannot balance.
     [ "${DUCK_SIM_VIEWER:-1}" = 0 ] && HEADLESS=--headless || HEADLESS=
