@@ -370,7 +370,12 @@ fn main() -> ExitCode {
                 ),
                 Some(meta) => {
                     if let Some(relay) =
-                        mediad::relay::Relay::new(&args.rendezvous_url, &args.token, meta)
+                        mediad::relay::Relay::new(
+                            &args.rendezvous_url,
+                            &args.token,
+                            meta,
+                            sockets.clone(),
+                        )
                     {
                         // The bridge is a *consumer* of the signalling server this same process
                         // runs, so it has to be told the port `--port` chose rather than assuming
