@@ -223,7 +223,11 @@ mod tests {
             ..Producer::local(build())
         };
         assert_eq!(
-            producer.fields().iter().map(|(k, _)| *k).collect::<Vec<_>>(),
+            producer
+                .fields()
+                .iter()
+                .map(|(k, _)| *k)
+                .collect::<Vec<_>>(),
             ["name", "serial", "simulated", "release", "api_version"]
         );
         assert!(
