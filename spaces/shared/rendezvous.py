@@ -15,6 +15,11 @@ that is about to start a session needs the stream anyway. Peers are keyed by tok
 listed that way could not refresh its list without dropping the session it was holding. This one
 opens nothing.
 
+**A `429` here is not theirs.** `robot_status` is `validate_hf_token` and then a loop over the
+producers — it never calls `check_rate_limit`, whose bucket is 1200 requests a minute keyed on a
+hash of the token, and the only status it raises is `401`. So a 429 on this route was written by
+something in front of the application, and `_who_answered` exists to say which something.
+
 **A `401` here means the token, and nothing else.** Worth stating plainly because the first thing
 that produced one was not a robot problem at all: run outside a Space, Gradio mocks its login and
 hands the app the literal string `mock-oauth-token-for-local-dev`, which `whoami-v2` refuses
@@ -45,6 +50,22 @@ DEFAULT_CENTRAL_URL = os.environ.get(
 DUCK = "microduck"
 
 TIMEOUT = 20
+
+# Headers that say *who* answered. Asked only when the answer is one the application could not
+# have written: an edge or a proxy names itself and carries an id worth quoting, where FastAPI
+# would have sent `application/json` and a `detail`.
+TELLTALE = (
+    "retry-after",
+    "server",
+    "via",
+    "x-request-id",
+    "x-amzn-requestid",
+    "cf-ray",
+    "x-ratelimit-limit",
+    "x-ratelimit-remaining",
+    "x-ratelimit-reset",
+    "content-type",
+)
 
 
 logger = logging.getLogger(__name__)
@@ -84,6 +105,23 @@ class Robot:
         return " — ".join(bits)
 
 
+def _who_answered(answer: requests.Response) -> str:
+    """Which hop produced this status, in the terms the answer itself offers.
+
+    **A status the application cannot produce came from something in front of it**, and the only
+    evidence of which something is what came back: a `server` that names itself, a request id to
+    quote at whoever runs it, a `retry-after` that says whether this is a burst or a wall, and a
+    body that is HTML where FastAPI would have written `{"detail": ...}`.
+
+    The token is never part of this. What is quoted is the answer, which the caller already has.
+    """
+    bits = [f"{name}={answer.headers[name]}" for name in TELLTALE if name in answer.headers]
+    body = " ".join((answer.text or "").split())[:200]
+    if body:
+        bits.append(f"body={body!r}")
+    return ", ".join(bits) or "nothing — no telltale headers and an empty body"
+
+
 def ducks(token: str, base: str = DEFAULT_CENTRAL_URL) -> tuple[list[Robot], list[str]]:
     """This account's ducks, and the names of whatever else was listed.
 
@@ -103,6 +141,11 @@ def ducks(token: str, base: str = DEFAULT_CENTRAL_URL) -> tuple[list[Robot], lis
         raise RendezvousError(f"the rendezvous could not be reached: {e}") from None
 
     logger.info("GET %s/api/robot-status -> HTTP %s", base, answer.status_code)
+    # Logged for every refusal rather than only for the one that raises here, because which hop
+    # answered is the question in all of them and the branches below each throw a different half
+    # of it away.
+    if answer.status_code != 200:
+        logger.info("  answered by: %s", _who_answered(answer))
     if answer.status_code == 401:
         raise RendezvousError(
             "the rendezvous refused this token — `whoami-v2` did not recognise it. On a Space, "
@@ -111,7 +154,11 @@ def ducks(token: str, base: str = DEFAULT_CENTRAL_URL) -> tuple[list[Robot], lis
             "instead — the log line above says which one was used."
         )
     if answer.status_code == 429:
-        raise RendezvousError("the rendezvous is rate-limiting this token; wait a minute.")
+        raise RendezvousError(
+            "something answered 429 before the rendezvous did — `/api/robot-status` raises 401 "
+            "and nothing else, and its rate limiter is not on that route. So this is an edge in "
+            f"front of the Space, and here is what it said: {_who_answered(answer)}"
+        )
     if answer.status_code != 200:
         raise RendezvousError(
             f"the rendezvous answered HTTP {answer.status_code}: {answer.text[:200]}"
