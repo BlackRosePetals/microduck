@@ -79,6 +79,15 @@ WHO="${DUCK_SIM_DUCK:-}"
 # pointed at the wrong path.
 ctl() {
     name="${WHO:-$(duck_name 0)}"
+    # **`configure` edits a file rather than talking to a socket**, and its `--file` is not one of
+    # robotctl's global flags — so it is the one subcommand that has to be told which duck's params
+    # to open, and it cannot simply be added to the list below. Left alone it reads
+    # /etc/robot/robotd.toml, which is right on a robot and on a laptop does not exist: the answer
+    # was "changes nothing — every value is the default", about a file nobody has.
+    if [ "${1:-}" = configure ]; then
+        shift
+        set -- configure --file "$STATE/robotd-$name.toml" "$@"
+    fi
     "$REPO/target/debug/robotctl" \
         --robot-socket "$STATE/$name.sock" \
         --tof-socket "$STATE/$name-tof.sock" \
