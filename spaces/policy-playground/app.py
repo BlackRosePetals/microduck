@@ -653,6 +653,7 @@ def put_on_the_duck(repo: str, revision: str | None, file: str | None, hold: flo
         return f"**added, and the robot could not re-read it:** {after['change_error']}"
 
     skill_name = skill["name"]
+    wait_for_home()
     try:
         ran = LINK.call("robot.do", {"skill": skill_name})
     except RpcError as e:
@@ -672,6 +673,42 @@ def put_on_the_duck(repo: str, revision: str | None, file: str | None, hold: flo
         f"**`{skill_name}` installed and running** — {skill['duration']:g}s from "
         f"`{spec}`{already_note(ran)}{unconfirmed}"
     )
+
+
+# How long to give a robot that is on its way to its home pose. The move itself is about a second;
+# this is generous because the cost of waiting too long is a slow button and the cost of not
+# waiting is a policy that silently never runs.
+HOME_TIMEOUT = 15.0
+
+
+def wait_for_home() -> None:
+    """Block until the robot will accept a skill, or until waiting stops being useful.
+
+    **The install we just did is what makes this necessary.** `robot.setSkill` triggers a policy
+    reload, the reload sends the robot to its home pose, and `robot.do` refuses for as long as that
+    takes — so the page's own previous call is what makes the next one fail. Two policies were
+    installed perfectly this afternoon and neither ran, and the page reported it in a status line
+    two thousand pixels from the button.
+
+    `homed` is the same flag `robot.do` refuses on (`API_VERSION` 30). Asking for it rather than
+    matching on the refusal text means the wait ends when the robot is ready rather than when a
+    timer says so — and `None`, from a robot too old to publish it, is a fact rather than a
+    `False`: there is nothing to wait for, so we do not.
+    """
+    deadline = time.monotonic() + HOME_TIMEOUT
+    while time.monotonic() < deadline:
+        try:
+            homed = (LINK.call("robot.policies") or {}).get("homed")
+        except RpcError:
+            return
+        if homed is None:
+            logger.info("this robot does not publish `homed`, so nothing to wait for")
+            return
+        if homed:
+            return
+        logger.info("waiting: the robot is still going to its home pose")
+        time.sleep(0.5)
+    logger.info("gave up waiting for the home pose after %.0fs", HOME_TIMEOUT)
 
 
 def run_installed(name: str) -> str:
