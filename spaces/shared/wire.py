@@ -46,7 +46,7 @@ from typing import Any
 
 import requests
 
-from rendezvous import DEFAULT_CENTRAL_URL
+from rendezvous import DEFAULT_CENTRAL_URL, USER_AGENT
 
 logger = logging.getLogger(__name__)
 
@@ -86,6 +86,10 @@ class WsConsumer:
         # `startSession` the far end never sees.
         self._streaming = requests.Session()
         self._posting = requests.Session()
+        # Both sessions, once: every call on this lane goes out named. See `rendezvous.USER_AGENT`
+        # for what an unnamed one gets — an `awselb/2.0` 429 that the rendezvous never sees.
+        for session in (self._streaming, self._posting):
+            session.headers["User-Agent"] = USER_AGENT
         self._stream: requests.Response | None = None
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()

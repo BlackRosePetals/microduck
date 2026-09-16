@@ -51,6 +51,23 @@ DUCK = "microduck"
 
 TIMEOUT = 20
 
+# **What we call ourselves, and it is not cosmetic.** `requests` signs every call
+# `python-requests/2.x`, which Hugging Face's edge treats as a bot: from a Space's container the
+# very first `GET /api/robot-status` came back `429` with an HTML page and `server=awselb/2.0`,
+# so the rendezvous never saw it. The reference client — `reachy_mini.media.central_consumer`,
+# which `rf-detr-realtime-webcam` runs server-side from its own Space against this same host and
+# route — sends no `User-Agent` of its own either, but it is built on `aiohttp` and inherits that
+# library's signature instead. The difference between the two calls was the client, and nothing
+# else: same URL, same `Authorization`, same everything.
+#
+# So this names the page honestly rather than imitating a browser. A caller that says who it is
+# and carries a link is what a rate limiter is meant to let through, and it is the half of this
+# that stays true if the rule ever changes.
+USER_AGENT = (
+    "microduck-policy-playground/1.0 "
+    "(+https://huggingface.co/spaces/pollen-robotics/microduck-policy-playground)"
+)
+
 # Headers that say *who* answered. Asked only when the answer is one the application could not
 # have written: an edge or a proxy names itself and carries an id worth quoting, where FastAPI
 # would have sent `application/json` and a `detail`.
@@ -134,7 +151,7 @@ def ducks(token: str, base: str = DEFAULT_CENTRAL_URL) -> tuple[list[Robot], lis
     try:
         answer = requests.get(
             f"{base}/api/robot-status",
-            headers={"Authorization": f"Bearer {token}"},
+            headers={"Authorization": f"Bearer {token}", "User-Agent": USER_AGENT},
             timeout=TIMEOUT,
         )
     except requests.RequestException as e:
