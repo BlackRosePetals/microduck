@@ -455,7 +455,23 @@ LINK = Link()
 # ── what the robot already has ───────────────────────────────────────────────
 
 
-def robot_state() -> tuple[str, list[str]]:
+def _skill_choices(names: list[str]) -> Any:
+    """What a `gr.Dropdown` output has to be given to change what is *in* it.
+
+    **A bare list sets the value, not the choices**, and that is the whole of why the skills box
+    stayed empty while the robot was answering perfectly: `robot.skills` came back with five, they
+    were returned as a list, and Gradio read them as the selection — then refused it, because none
+    of them was among the choices, which were still the empty list the box was built with. It says
+    so on the way past, once per press: `The value passed into gr.Dropdown() is not in the list of
+    choices. Please update the list of choices to include: []`.
+
+    `find_robots` had it right for the ducks box next to it, which is what made the difference
+    visible: the same page, two dropdowns, one filled and one not.
+    """
+    return gr.update(choices=names, value=names[0] if names else None)
+
+
+def robot_state() -> tuple[str, Any]:
     """What is loaded and what it can be asked to do, as one read.
 
     `robot.policies` carries the skills as well as the slots — deliberately, because a client
@@ -466,7 +482,7 @@ def robot_state() -> tuple[str, list[str]]:
         policies = LINK.call("robot.policies") or {}
         skills = LINK.call("robot.skills") or {}
     except RpcError as e:
-        return f"could not read this robot: {e.message}", []
+        return f"could not read this robot: {e.message}", _skill_choices([])
 
     lines = [f"**mode** `{policies.get('mode') or '?'}`"]
     if not policies.get("enabled"):
@@ -510,7 +526,7 @@ def robot_state() -> tuple[str, list[str]]:
             "The daemon drives these itself, so they are not editable here: "
             + ", ".join(f"`{name}`" for name in built_in)
         )
-    return "\n".join(lines), names + [n for n in built_in if n not in names]
+    return "\n".join(lines), _skill_choices(names + [n for n in built_in if n not in names])
 
 
 def not_accepted(result: Any) -> str | None:
@@ -710,16 +726,37 @@ def load_catalogue(force: bool = False) -> list[Any]:
     *reload the catalogue* is the force, and a restart is the other one.
     """
     global CATALOGUE, CATALOGUE_ERROR, CATALOGUE_READ_AT
+    # **What a press changed, which is usually nothing, and has to say so.** Re-reading a Hub that
+    # has not moved repaints 40 identical rows and a clock: from the outside the button is
+    # indistinguishable from a button that is not wired up, which is what it was reported as.
+    # A reload that found nothing new is a successful reload, and the only one that can prove it
+    # ran is the one that says it ran.
+    before = {policy.key for policy in CATALOGUE}
     if force or not CATALOGUE:
         CATALOGUE, CATALOGUE_ERROR = catalogue.read_hub()
         CATALOGUE_READ_AT = time.time()
+    after = {policy.key for policy in CATALOGUE}
+    news = ""
+    if force and not CATALOGUE_ERROR:
+        gained, lost = len(after - before), len(before - after)
+        if gained or lost:
+            news = " " + ", ".join(
+                bit
+                for bit in (
+                    f"{gained} new" if gained else "",
+                    f"{lost} gone" if lost else "",
+                )
+                if bit
+            ) + " since the last read."
+        else:
+            news = " Nothing has changed on the Hub since the last read."
 
     heading = (
         CATALOGUE_ERROR
         if CATALOGUE_ERROR
         else (
             f"{len(CATALOGUE)} policies on the Hub, official first — read "
-            f"{time.strftime('%H:%M UTC', time.gmtime(CATALOGUE_READ_AT))}."
+            f"{time.strftime('%H:%M:%S UTC', time.gmtime(CATALOGUE_READ_AT))}.{news}"
             # Gradio wants its components at build time, so the ceiling is real. Saying so is
             # the difference between a short list and a list that quietly lost its tail.
             + (
