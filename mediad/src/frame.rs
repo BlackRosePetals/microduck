@@ -450,11 +450,24 @@ mod tests {
     async fn a_request_without_a_newline_is_still_bounded() {
         let (mut client, server) = UnixStream::pair().unwrap();
         let task = tokio::spawn(handle(server, Frames::default(), 90));
-        client
+        // **A broken pipe here is the bound working, not a failure.** The server reads its limit,
+        // answers and hangs up while this is still writing — and whether that lands mid-write
+        // depends on the socketpair buffer, which is about 8 KB on macOS against Linux's 208 KB.
+        // Insisting on a complete write asserted the platform rather than the behaviour: it passed
+        // on the robot's OS and failed everywhere else, which nothing noticed while this file was
+        // compiled on Linux alone.
+        let written = client
             .write_all("y".repeat(MAX_REQUEST_BYTES * 4).as_bytes())
-            .await
-            .unwrap();
-        client.shutdown().await.unwrap();
+            .await;
+        if let Err(e) = &written {
+            assert_eq!(
+                e.kind(),
+                std::io::ErrorKind::BrokenPipe,
+                "the only write failure this test allows is the server having already answered"
+            );
+        }
+        // Nor can the shutdown be insisted on, for the same reason: the other end may be gone.
+        let _ = client.shutdown().await;
         let mut text = String::new();
         BufReader::new(client).read_line(&mut text).await.unwrap();
         task.await.unwrap().unwrap();
