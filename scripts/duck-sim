@@ -627,10 +627,12 @@ start_body() {
         > "$STATE/body.log" 2>&1 &
     echo $! > "$STATE/body.pid"
     if ! wait_for_port; then
-        # The one failure here that is not about this repo. `--cameras`/`--frame-port` are newer
-        # than the body server, and argparse refuses the whole invocation over an argument it does
-        # not know — so a checkout from before the rendering landed fails with the reason in a log
-        # file and nothing on screen but "did not come up".
+        # **The one failure here that belongs to the other repo.** The camera arrived in
+        # `microduck_rl` long after `duck-body` did, so a checkout that predates it runs a body
+        # server with no `--cameras`/`--frame-port` — and argparse exits on an unknown argument
+        # rather than ignoring it. The process is started in the background with its output
+        # redirected, so what that looks like from here is a port that never opens: the real reason
+        # is one line in `body.log` that nobody has opened yet.
         if grep -q 'unrecognized arguments: --cameras' "$STATE/body.log" 2>/dev/null; then
             die "$(cat <<WHY
 this microduck_rl has no camera: its body server does not know --cameras.
