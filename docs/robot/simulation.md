@@ -33,8 +33,10 @@ encoder are absent, not modelled; a bug in one of those is only visible on a rob
 - A checkout of `microduck_rl` with its venv — beside this repo, or wherever `DUCK_SIM_RL` points.
   It provides `duck-body`, the scenes, and the `libonnxruntime` a laptop otherwise lacks. The
   camera lives on its `develop` branch.
-- For a duck with a camera off Linux: `brew install gstreamer`. One formula, and it carries
-  `webrtcsink`, libnice, srtp and x264 — everything `mediad`'s pipeline needs off a robot.
+- For a duck with a camera off Linux: `brew install gstreamer libnice-gstreamer`. The first is one
+  merged formula carrying `webrtcsink`, srtp and x264. The second is the ICE agent `webrtcbin`
+  needs, and the first does not depend on it — without it the duck comes up and streams to nothing,
+  failing only when a browser asks for the video. `scripts/duck-sim` checks for both.
 - For the container form only: `sudo`, `systemd-nspawn` (package `systemd-container`) and
   `mmdebstrap`. The script says which one is missing and prints the line to install it.
 

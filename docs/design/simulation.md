@@ -287,8 +287,15 @@ wherever GStreamer does.
 
 So the gate is `any(target_os = "linux", feature = "gstreamer")`: assumed on the robot's OS, opt-in
 elsewhere. A developer's machine gets the real daemon, the real console and real WebRTC against a
-simulated camera for one Homebrew formula, and `Source::Camera` off Linux is a clear error rather
-than a missing arm. `exposure.rs` stays Linux-only and that is not packaging — it writes V4L2
+simulated camera for two Homebrew formulae, and `Source::Camera` off Linux is a clear error rather
+than a missing arm.
+
+Two, not one, and the second is a trap worth writing down: Homebrew's `gstreamer` links
+`libgstnice.dylib` into a separate `libnice-gstreamer` formula that it does not depend on. Without
+that formula the link dangles, `webrtcbin` has no ICE agent, and everything works — the pipeline,
+the camera, the rendezvous registration — until the first consumer asks for a pad and the session
+dies inside a GStreamer thread with "libnice elements are not available". A build check cannot see
+it, so `scripts/duck-sim` checks the elements rather than the pkg-config file. `exposure.rs` stays Linux-only and that is not packaging — it writes V4L2
 controls through `ioctl`, and there is no sensor behind a simulated source to meter.
 
 Off by default there, deliberately: Homebrew's `gstreamer` is one merged formula that pulls gtk4 and

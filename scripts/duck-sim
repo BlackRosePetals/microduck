@@ -398,19 +398,47 @@ TOML
     # container has no packaged one — so the console is served from the host, pointed at the
     # simulator's frame port. `360p30` is exactly the 640x360 the renderer produces.
     #
-    # **Off Linux the pipeline is a cargo feature and a package.** `mediad/Cargo.toml` says why;
-    # what it means here is `brew install gstreamer` once, and checking for it before cargo does —
-    # without it the build dies inside `gstreamer-sys` with a pkg-config error naming neither the
-    # feature nor the formula.
+    # **Off Linux the pipeline is a cargo feature and two packages.** `mediad/Cargo.toml` says why
+    # the feature exists; what it means here is a `brew install` once, and checking for it before
+    # cargo does — without it the build dies inside `gstreamer-sys` with a pkg-config error naming
+    # neither the feature nor the formula.
+    #
+    # **Two checks, because they fail at different moments.** pkg-config answers whether `mediad`
+    # will *build*. Whether it will *stream* is a different question, and on macOS the answer can
+    # be no while the build is perfect: Homebrew's `gstreamer` symlinks `libgstnice.dylib` into a
+    # separate `libnice-gstreamer` formula that is not one of its dependencies, so the link dangles
+    # and `webrtcbin` has no ICE agent. Everything comes up — the pipeline, the camera, the
+    # registration — and then the first consumer to ask for video dies with "libnice elements are
+    # not available" from inside a GStreamer thread. So the elements the pipeline actually needs
+    # are checked here, where the answer can still name the formula.
     mediad_features=""
     if any_camera && [ "$(uname -s)" != Linux ]; then
         pkg-config --exists gstreamer-1.0 2>/dev/null || die "$(cat <<'WHY'
 a duck was asked for a camera, and this machine has no GStreamer.
 
-    brew install gstreamer
+    brew install gstreamer libnice-gstreamer
 
-One formula: it carries gst-plugins-rs (which is where webrtcsink comes from), libnice, srtp and
-x264. Then run this again — or drop DUCK_SIM_CAMERAS for ducks with no eyes.
+`gstreamer` is one merged formula carrying gst-plugins-rs (which is where webrtcsink comes from),
+srtp and x264; `libnice-gstreamer` is the ICE agent webrtcbin needs, and is not pulled in by it.
+Then run this again — or drop DUCK_SIM_CAMERAS for ducks with no eyes.
+WHY
+)"
+        missing=""
+        for element in nice webrtcsink x264enc; do
+            gst-inspect-1.0 "$element" >/dev/null 2>&1 || missing="$missing $element"
+        done
+        # The message needs $missing, so this heredoc is unquoted — and then an apostrophe in it
+        # would break the `$( )` around it in dash, several hundred lines further down. No
+        # apostrophes, and no backticks either, for the reason the params heredoc above gives.
+        [ -z "$missing" ] || die "$(cat <<WHY
+GStreamer is installed, but these elements are missing:$missing
+
+    brew install libnice-gstreamer
+
+"nice" is the usual one, and the usual cause: the Homebrew gstreamer formula links
+libgstnice.dylib into a formula it does not itself depend on, so the link dangles until that
+formula is installed. A duck without it comes up and streams to nothing, and fails the moment a
+browser asks for the video.
 WHY
 )"
         mediad_features="--features gstreamer"
