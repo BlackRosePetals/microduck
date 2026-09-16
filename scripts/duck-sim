@@ -81,6 +81,14 @@ ctl() {
 # which is a good way to kill your own terminal — three times in one afternoon, in this case.
 # Stop one thing this script started, identified by name and by what it must still be running.
 #
+# **`$expect` names *this* state directory's daemon, not the daemon's kind.** It used to be
+# `robotd`, and matching on that is a name check dressed as an identity check: a stale pidfile
+# whose pid has since been recycled onto *another* `duck-sim`'s robotd passes it, and this then
+# TERMs somebody else's duck. Two simulators on one machine — different `DUCK_SIM_STATE`,
+# different ports, which is exactly how you run one while another is up — is not an exotic case.
+# So every caller below passes a path under `$STATE`, or for the body the port it was given, and
+# every one of those appears in the argv of the process this script started and in nothing else.
+#
 # **A pid is not an identity.** This function used to kill the process *group* named by a pidfile,
 # with a `sudo` fallback — and pidfiles go stale, pids are recycled, and a `boot` leaves behind the
 # pidfiles an `up` wrote. The result was `kill -TERM -<recycled pid>` as root, which took out an
@@ -133,14 +141,14 @@ stop_one() {
 }
 
 down() {
-    stop_one robotd robotd
-    stop_one ether duck-ether
-    stop_one body body_server
+    stop_one robotd "$STATE/"
+    stop_one ether "$STATE/"
+    stop_one body "body_server --port $PORT"
     i=0
     while [ "$i" -lt 16 ]; do
-        stop_one "$(duck_name "$i")" robotd
-        stop_one "$(duck_name "$i")-tof" tofd
-        stop_one "$(duck_name "$i")-media" mediad
+        stop_one "$(duck_name "$i")" "$STATE/$(duck_name "$i").sock"
+        stop_one "$(duck_name "$i")-tof" "$STATE/$(duck_name "$i")-tof.sock"
+        stop_one "$(duck_name "$i")-media" "$STATE/mediad-$(duck_name "$i").toml"
         i=$((i + 1))
     done
     # The container-mode radio is a unit, not a pidfile — see `boot`.
@@ -449,7 +457,7 @@ start_body() {
     [ -d "$RL" ] || die "no simulator at $RL. It is the microduck_rl repo — set DUCK_SIM_RL."
     [ -x "$RL/.venv/bin/python" ] || die "$RL has no .venv. Run \`uv sync\` there first."
     mkdir -p "$STATE"
-    say "starting the body — a MuJoCo window should open"
+    say "starting the body from $RL — a MuJoCo window should open"
     # `DUCK_SIM_VIEWER=0` for a window-less run: watching costs frames, and the daemon's loop is
     # wall-clock, so a simulator that cannot keep up is a robot that cannot balance.
     [ "${DUCK_SIM_VIEWER:-1}" = 0 ] && HEADLESS=--headless || HEADLESS=
@@ -486,7 +494,26 @@ start_body() {
         $cam_args \
         > "$STATE/body.log" 2>&1 &
     echo $! > "$STATE/body.pid"
-    wait_for_port || die "the simulator did not come up. $STATE/body.log has why."
+    if ! wait_for_port; then
+        # **The one failure here that belongs to the other repo.** The camera arrived in
+        # `microduck_rl` long after `duck-body` did, so a checkout that predates it runs a body
+        # server with no `--cameras`/`--frame-port` — and argparse exits on an unknown argument
+        # rather than ignoring it. The process is started in the background with its output
+        # redirected, so what that looks like from here is a port that never opens: the real reason
+        # is one line in `body.log` that nobody has opened yet.
+        if grep -q 'unrecognized arguments: --cameras' "$STATE/body.log" 2>/dev/null; then
+            die "$(cat <<WHY
+this microduck_rl has no camera: its body server does not know --cameras.
+
+    git -C $RL checkout develop && git -C $RL pull
+
+The rendering is on develop; a checkout on an older branch has the body and not the eye.
+Or unset DUCK_SIM_CAMERAS, and the duck runs blind.
+WHY
+)"
+        fi
+        die "the simulator did not come up. $STATE/body.log has why."
+    fi
 }
 
 wait_for_port() {
