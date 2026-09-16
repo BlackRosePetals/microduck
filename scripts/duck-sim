@@ -352,6 +352,11 @@ hw_rev = 1
 state_dir = "$STATE/$name/updater"
 robot_socket = "$STATE/$name.sock"
 
+# Where `policy.fetch` puts what it downloads. The default is /var/lib/robot/policies, which is
+# the board's and is unwritable here — every fetch against a twin refused with `Permission denied
+# (os error 13)` naming a path no simulator should have been given.
+policy_library = "$STATE/$name/policies"
+
 # Nothing in a simulator applies a release behind your back. The default is "mandatory", which is
 # right for a fleet and wrong for a laptop somebody is working on.
 auto_apply = "off"
