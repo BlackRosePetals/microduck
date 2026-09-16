@@ -337,7 +337,19 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// A new variant on a tagged enum is what a robotctl built before it cannot decode, which is the
 /// one reason this is a bump rather than a note: the tap is still `padd`'s own socket, and every
 /// other client is untouched.
-pub const API_VERSION: u32 = 29;
+/// # v30 — `homed`, so a client can wait instead of guessing
+///
+/// One `Option<bool>` on [`PoliciesResult`]. `robot.do` refuses a skill while the robot is on its
+/// way to its home pose, and that refusal is a second old and resolves by itself — but from the
+/// wire it is `accepted: false` and a sentence, indistinguishable from "press Start on the pad",
+/// which stays true until somebody acts. A client that installs a policy triggers a reload,
+/// the reload sends the robot home, and the `robot.do` that follows is refused by the client's own
+/// previous call. Without this the only ways out are matching on the reason string or retrying
+/// blindly through refusals that will never clear.
+///
+/// `None` is "this robot does not say", which is what an older `robotd` sends and what a client
+/// must fall back from rather than read as `false`.
+pub const API_VERSION: u32 = 30;
 
 /// The observation width every policy this robot family runs is built against.
 ///
@@ -2324,6 +2336,21 @@ pub struct PoliciesResult {
     /// show what is loaded.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub skills: Vec<String>,
+    /// Whether the robot has reached its home pose, or `None` from a robot too old to say.
+    ///
+    /// **A skill is refused while this is false, and the refusal expires on its own.** That makes
+    /// it unlike every other reason `robot.do` says no: "press Start on the pad" is true until a
+    /// human acts, "no skill named …" is true until the config changes, and this one is true for
+    /// about a second. A client cannot tell them apart from `accepted: false` and a sentence, and
+    /// a client that just installed a policy is the one most likely to meet it — `robot.setSkill`
+    /// triggers a reload, a reload sends the robot home, and the `robot.do` that follows is
+    /// refused because of the call before it.
+    ///
+    /// Published here rather than on the 50 Hz stream for the reason `skills` is: it answers a
+    /// question asked once, on the read a client already makes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub homed: Option<bool>,
+
     /// Why the last policy change failed, when it was not a change to one slot.
     ///
     /// **A slot's failure is reported on the slot**; this is for the two that name none — a

@@ -4313,6 +4313,9 @@ fn dispatch(
                 enabled: state.policy_enabled,
                 slots: state.policy_slots.load().as_ref().clone(),
                 skills: state.policies.load().skills.clone(),
+                // The same flag `robot.do` refuses on, so a client can wait for it rather than
+                // be told no and guess whether asking again would help.
+                homed: Some(state.homed.load(Ordering::Relaxed)),
                 change_error: state
                     .policy_change_error
                     .load_full()
@@ -7604,6 +7607,43 @@ mod tests {
         assert!(result.accepted);
         assert!(result.reason.is_none(), "{:?}", result.reason);
         assert!(intents.take_policy_change().is_some());
+    }
+
+    /// `homed` rides the read a client already makes, and it has to *move* — a field that is
+    /// always false is as useless as no field, because the thing a caller wants to know is when it
+    /// stopped being false. A client that installs a policy triggers a reload, the reload sends
+    /// the robot home, and the `robot.do` that follows is refused by its own previous call; this
+    /// is what it waits on instead.
+    #[test]
+    fn robot_policies_publishes_the_flag_robot_do_refuses_on() {
+        let s = RobotState::new(
+            &Params::default(),
+            std::path::Path::new("/test/robotd.toml"),
+            false,
+            false,
+        );
+        let intents = Arc::new(Intents::new());
+
+        let read = |s: &RobotState| -> proto::PoliciesResult {
+            dispatch(
+                s,
+                &intents,
+                proto::Id::Number(1),
+                &proto::Call::RobotPolicies,
+            )
+            .result_as()
+            .unwrap()
+        };
+
+        s.homed.store(false, Ordering::Relaxed);
+        assert_eq!(
+            read(&s).homed,
+            Some(false),
+            "a robot on its way home says so, rather than saying nothing"
+        );
+
+        s.homed.store(true, Ordering::Relaxed);
+        assert_eq!(read(&s).homed, Some(true), "and says when it has arrived");
     }
 
     /// `robot.policies` answers for every slot, including the empty ones, and says where each
