@@ -161,3 +161,11 @@ h2 { font-size: 20px; margin: 30px 0 12px; }
   border-radius: 10px;
   background: #11141a;
 }
+
+/* The duck's own buttons: not tricks, so not yellow. Stop is the one a child should be able to
+   find without reading, so it is the only red thing on the page. */
+.controls { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-top: 18px; }
+.control { font-size: 17px; font-weight: 600; padding: 12px 18px; border-radius: 12px; }
+.control-start { background: var(--live); border-color: var(--live); color: #fff; }
+.control-stand { background: var(--card); }
+.control-stop { background: #fff1f1; border-color: #e7b6b6; color: var(--bad); }

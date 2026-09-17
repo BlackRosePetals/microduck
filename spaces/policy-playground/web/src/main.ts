@@ -43,6 +43,14 @@ interface State {
   session: Session | null;
   duckName: string | null;
   /**
+   * Whether the policy is driving, from `robot.policies`.
+   *
+   * Not a belief this page keeps: the robot owns it, and anything else can change it — the pad,
+   * a relax, either side restarting. A client that remembered its own answer would show a Start
+   * button that does nothing every other press, which is the reason `robot.enable` has a `toggle`.
+   */
+  enabled: boolean | null;
+  /**
    * What the duck has, and which of those this page may take off again.
    *
    * `overridden` on `robot.skills` is the difference: a skill that came from the robot's config
@@ -73,6 +81,7 @@ const state: State = {
   chosen: null,
   session: null,
   duckName: null,
+  enabled: null,
   onTheDuck: [],
   policies: [],
   trouble: null,
@@ -127,6 +136,7 @@ async function disconnect(): Promise<void> {
   await state.session?.stop();
   state.session = null;
   state.duckName = null;
+  state.enabled = null;
   state.onTheDuck = [];
   state.said = "Let go of your duck.";
   state.saidFor = null;
@@ -138,6 +148,8 @@ async function readTheDuck(): Promise<void> {
   const session = state.session;
   if (!session) return;
   try {
+    const policies = (await session.call("robot.policies")) as Record<string, unknown>;
+    state.enabled = typeof policies.enabled === "boolean" ? policies.enabled : null;
     const table = (await session.call("robot.skills")) as Record<string, unknown>;
     const skills = Array.isArray(table.skills) ? (table.skills as Record<string, unknown>[]) : [];
     const builtIn = Array.isArray(table.built_in) ? (table.built_in as string[]) : [];
@@ -304,6 +316,92 @@ async function takeOff(name: string): Promise<void> {
     state.stage = null;
     render();
   }
+}
+
+/**
+ * The three things a duck needs doing to it that are not tricks.
+ *
+ * `robot.init` stands it up and is never refused, whatever it is lying on. `robot.enable` is the
+ * pad's Start, and the page only offers it when the duck says the policy is *not* driving —
+ * because that is the one state where pressing it means something, and a button that is usually a
+ * no-op is a button nobody trusts.
+ *
+ * `robot.relax` is deliberately absent. It cuts torque and the duck drops where it stands, which
+ * `robotctl` guards with `--yes` and BLE refuses to carry at all. On a page built for a child it
+ * would be a button that looks like "have a rest" and is in fact "fall over".
+ */
+async function duckCommand(method: string, saying: string): Promise<void> {
+  const session = state.session;
+  if (!session) return;
+  state.busy = `cmd:${method}`;
+  state.stage = saying;
+  render();
+  try {
+    const answer = await session.call(method);
+    const refused = refusal(answer);
+    state.said = refused ?? null;
+    await readTheDuck();
+  } catch (e) {
+    state.said = `${saying} did not work: ${e instanceof Error ? e.message : String(e)}`;
+  } finally {
+    state.saidFor = state.said ? "duck" : null;
+    state.busy = null;
+    state.stage = null;
+    render();
+  }
+}
+
+async function startPolicy(): Promise<void> {
+  const session = state.session;
+  if (!session) return;
+  state.busy = "cmd:enable";
+  state.stage = "Starting…";
+  render();
+  try {
+    // `on: true` rather than the toggle: the page has just read the state and knows it is off, so
+    // asking for the state it wants beats asking for "the other one" and racing the pad.
+    const answer = await session.call("robot.enable", { on: true, toggle: false });
+    const refused = refusal(answer);
+    state.said = refused ?? null;
+    await readTheDuck();
+  } catch (e) {
+    state.said = `Could not start it: ${e instanceof Error ? e.message : String(e)}`;
+  } finally {
+    state.saidFor = state.said ? "duck" : null;
+    state.busy = null;
+    state.stage = null;
+    render();
+  }
+}
+
+function duckControls(): HTMLElement | null {
+  if (!state.session) return null;
+  const row = el("div", "controls");
+  const busy = state.busy !== null;
+
+  if (state.enabled === false) {
+    const start = el("button", "control control-start",
+      state.busy === "cmd:enable" ? (state.stage ?? "…") : "Start it");
+    start.disabled = busy;
+    start.addEventListener("click", () => void startPolicy());
+    row.append(start);
+    row.append(el("span", "hint", "Your duck is switched off — start it, then stand it up."));
+  }
+
+  const stand = el("button", "control control-stand",
+    state.busy === "cmd:robot.init" ? (state.stage ?? "…") : "Stand up");
+  stand.disabled = busy;
+  stand.addEventListener("click", () => void duckCommand("robot.init", "Standing up…"));
+  row.append(stand);
+
+  const stop = el("button", "control control-stop",
+    state.busy === "cmd:robot.stop" ? (state.stage ?? "…") : "Stop");
+  stop.disabled = busy;
+  stop.addEventListener("click", () => void duckCommand("robot.stop", "Stopping…"));
+  row.append(stop);
+
+  if (state.saidFor === "duck" && state.said) row.append(el("p", "card-said", state.said));
+  return row;
 }
 
 // ── the page ─────────────────────────────────────────────────────────────────
@@ -521,6 +619,9 @@ function render(): void {
       ),
     );
   }
+
+  const controls = duckControls();
+  if (controls) root.append(controls);
 
   const known = shelf();
   if (known) root.append(known);
