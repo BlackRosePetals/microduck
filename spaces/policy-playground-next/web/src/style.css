@@ -148,3 +148,6 @@ h2 { font-size: 20px; margin: 30px 0 12px; }
 
 /* Already on the duck: still pressable, no longer shouting. */
 .go-again { background: #f1f3f7; border-color: var(--line); color: var(--dim); font-weight: 500; }
+
+.chip-link { background: #eef3ff; color: #2a5db0; text-decoration: none; }
+.chip-link:hover { text-decoration: underline; }

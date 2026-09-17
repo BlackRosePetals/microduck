@@ -360,6 +360,16 @@ function card(policy: Policy): HTMLElement {
   facts.append(el("span", "chip", howLong(policy)));
   if (policy.official) facts.append(el("span", "chip chip-official", "made by Pollen"));
   if (alreadyOn(policy)) facts.append(el("span", "chip chip-live", "✓ on your duck"));
+
+  // Who made it, and a way to go and look. A trick is somebody's work — often somebody a child
+  // could plausibly meet — and the repo page is where the training, the manifest and the person
+  // are. `target="_blank"` because leaving the page would drop the session with the duck.
+  const who = el("a", "chip chip-link", `by ${policy.repo.split("/")[0]}`);
+  who.href = `https://huggingface.co/${policy.repo}`;
+  who.target = "_blank";
+  who.rel = "noopener noreferrer";
+  who.title = policy.repo;
+  facts.append(who);
   if (policy.forRobot) facts.append(el("span", "chip chip-bad", `for a ${policy.forRobot}`));
   if (needsALength(policy) && !blocked) facts.append(el("span", "chip", `held for ${HOLD_SECONDS}s`));
   node.append(facts);
