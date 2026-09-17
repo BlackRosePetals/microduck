@@ -353,6 +353,20 @@ function card(policy: Policy): HTMLElement {
     notATrick(policy) ??
     (isATrick(policy) ? null : "This one keeps going rather than finishing, so it is not a trick.");
   const node = el("article", `card${blocked ? " card-blocked" : ""}`);
+  // **The clip first, because it is the answer to the question the card exists to ask.** A name
+  // and a sentence are a guess at what a trick looks like; five seconds of a duck doing it is not.
+  // `preload="metadata"` and no autoplay: thirteen videos playing at once is a page that fights
+  // the wifi somebody is also using to reach their robot.
+  if (policy.video) {
+    const clip = el("video", "card-clip");
+    clip.src = policy.video;
+    clip.controls = true;
+    clip.muted = true;
+    clip.loop = true;
+    clip.playsInline = true;
+    clip.preload = "metadata";
+    node.append(clip);
+  }
   node.append(el("h3", "card-name", policy.name));
   node.append(el("p", "card-what", policy.description ?? "Nobody wrote down what this one does."));
 

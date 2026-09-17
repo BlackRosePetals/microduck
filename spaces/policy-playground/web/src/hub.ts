@@ -36,6 +36,8 @@ export interface Policy {
   official: boolean;
   /** The robot the manifest says it is for, when that is not a plain duck. */
   forRobot: string | null;
+  /** A short clip of it being done, when the repo ships one. */
+  video: string | null;
   likes: number;
   key: string;
 }
@@ -102,7 +104,13 @@ function number(value: unknown): number | null {
   return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
 
-function policyFrom(fields: Record<string, unknown>, repo: string, file: string | null, likes = 0): Policy {
+function policyFrom(
+  fields: Record<string, unknown>,
+  repo: string,
+  file: string | null,
+  likes = 0,
+  video: string | null = null,
+): Policy {
   const command = (fields.command ?? {}) as Record<string, unknown>;
   const robot = (fields.robot ?? {}) as Record<string, unknown>;
   // `||` and not `??`, which cost a nameless card: `stem(null)` is `""`, and `""` is not nullish,
@@ -134,6 +142,7 @@ function policyFrom(fields: Record<string, unknown>, repo: string, file: string 
     idle: Array.isArray(command.idle) ? (command.idle as number[]) : null,
     official: repo.split("/")[0] === OFFICIAL_ORG,
     forRobot,
+    video,
     likes,
     key: file ? `${repo}#${file}` : repo,
   };
@@ -143,6 +152,32 @@ function merge(manifest: Record<string, unknown>, entry: Record<string, unknown>
   const inherited: Record<string, unknown> = {};
   for (const field of INHERITED) if (field in manifest) inherited[field] = manifest[field];
   return { ...inherited, ...entry };
+}
+
+/**
+ * A clip of the trick being done, out of whatever the repo happens to ship.
+ *
+ * **A convention, not a field.** Nobody specified this, and most publishers landed on the same
+ * two paths anyway — `media/preview.mp4` and `preview.mp4` — so those are taken first and
+ * everything else is ranked rather than guessed at. The ranking matters: one repo carries
+ * `experiments/2026-09-13/examples/rejected_phrase_609_25_ducks_front_split_v2.mp4`, which is a
+ * training artefact and a rejected one, and picking the first `.mp4` in the list would have put it
+ * on the card as though it were the trick.
+ *
+ * A `.gif` is taken only when there is no video at all: it is somebody's fallback for a viewer
+ * that cannot play one, and this page can.
+ */
+function previewIn(files: string[]): string | null {
+  const clips = files.filter((f) => /\.(mp4|webm|mov)$/i.test(f));
+  const pick =
+    clips.find((f) => f === "media/preview.mp4") ??
+    clips.find((f) => f === "preview.mp4") ??
+    clips.find((f) => /(^|\/)preview[^/]*$/i.test(f)) ??
+    // Shallowest, then shortest: a file at the top of a repo is the one somebody meant to be
+    // found, and a deep path is nearly always a run, an experiment or an evaluation.
+    clips.sort((a, b) => a.split("/").length - b.split("/").length || a.length - b.length)[0] ??
+    files.find((f) => /\.gif$/i.test(f));
+  return pick ?? null;
 }
 
 async function manifestOf(repo: string): Promise<Record<string, unknown> | null> {
@@ -165,7 +200,9 @@ async function manifestOf(repo: string): Promise<Record<string, unknown> | null>
 export async function readHub(): Promise<{ policies: Policy[]; trouble: string | null }> {
   let hits: Array<Record<string, unknown>>;
   try {
-    const answer = await fetch(`${HUB_API}?search=${SEARCH}&limit=50`);
+    // `full=true` carries each repo's file list in the request we were making anyway, which is
+    // what makes the preview videos free. Without it they would be one extra request per repo.
+    const answer = await fetch(`${HUB_API}?search=${SEARCH}&limit=50&full=true`);
     if (!answer.ok) throw new Error(`HTTP ${answer.status}`);
     hits = (await answer.json()) as Array<Record<string, unknown>>;
   } catch (e) {
@@ -176,9 +213,18 @@ export async function readHub(): Promise<{ policies: Policy[]; trouble: string |
   }
 
   const likes = new Map<string, number>();
+  const previews = new Map<string, string | null>();
   for (const hit of hits) {
     const id = String(hit.modelId ?? hit.id ?? "");
-    if (id) likes.set(id, typeof hit.likes === "number" ? hit.likes : 0);
+    if (!id) continue;
+    likes.set(id, typeof hit.likes === "number" ? hit.likes : 0);
+    const files = Array.isArray(hit.siblings)
+      ? (hit.siblings as Array<{ rfilename?: unknown }>)
+          .map((s) => String(s.rfilename ?? ""))
+          .filter(Boolean)
+      : [];
+    const clip = previewIn(files);
+    previews.set(id, clip ? `https://huggingface.co/${id}/resolve/main/${clip.split("/").map(encodeURIComponent).join("/")}` : null);
   }
   const repos = [...likes.keys()].filter((repo) => repo !== SET_REPO);
 
@@ -212,7 +258,7 @@ export async function readHub(): Promise<{ policies: Policy[]; trouble: string |
       }
       continue;
     }
-    policies.push(policyFrom(manifest, repo, null, likes.get(repo) ?? 0));
+    policies.push(policyFrom(manifest, repo, null, likes.get(repo) ?? 0, previews.get(repo) ?? null));
   }
 
   // Official first, then most-liked: a page whose first card is a stranger's untested policy is

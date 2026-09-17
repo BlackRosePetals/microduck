@@ -3,221 +3,106 @@ title: microduck policy playground
 emoji: 🦆
 colorFrom: yellow
 colorTo: pink
-sdk: gradio
-app_file: app.py
+sdk: docker
+app_port: 7860
 pinned: false
 hf_oauth: true
-short_description: Pick a policy off the Hub, put it on your duck, run it.
+hf_oauth_expiration_minutes: 1440
+short_description: Pick a trick, watch your duck do it.
+tags:
+ - microduck
 ---
 
 # microduck policy playground
 
-Everything published to the Hub as `microduck-…`, read the way the robot reads it, with a button
-that downloads one onto your duck and runs it — and a box to name one the search did not reach.
+Sign in, wake your duck up, press a trick. The trick is downloaded from the Hub onto the duck and
+run, and the card you pressed says which of those it is doing.
 
-**Do not edit this Space directly.** The source is `spaces/policy-playground/` in
-`pollen-robotics/microduck`, and `scripts/publish-space.sh policy-playground` is what puts it here.
+**Do not edit this Space directly.** The source is `spaces/policy-playground-next/` in
+`pollen-robotics/microduck`, and `scripts/publish-space.sh` is what puts it here.
 
-## The one click
-
-Four calls over the session's `control` channel, in the order `robotctl policy add` makes them:
-
-| | |
-| --- | --- |
-| `policy.fetch {repo, file}` | `updaterd` downloads it and reads the `manifest.json` beside it |
-| `robot.setSkill {name, path, duration, …}` | `robotd` writes the entry and re-reads its skills |
-| `robot.policies` | did the reload take? `change_error` is where it says no |
-| `robot.do {skill}` | run it |
-
-Nothing is invented on either side: those are `duck-ipc-proto` method names, already in
-`mediad/src/route.rs`'s permitted set, and `mediad` knows none of them — the control channel is a
-pipe to the API the robot already serves.
-
-**The robot's reading of a manifest wins over this page's.** The catalogue is read here so a row
-can say what a policy claims to be before anybody clicks it, but the skill that gets written comes
-from `policy.fetch`'s answer, which is about the bytes that were actually downloaded.
-
-## Naming one yourself
-
-The gallery is `?search=microduck`, which is a convention rather than a rule. A policy on a branch,
-in a repo named something else, or published into a search index that has not caught up is
-invisible in the list and perfectly fetchable — so there is a box above the rows, and what it takes
-is `robotctl policy add`'s own spelling: `org/name`, optionally `@branch-tag-or-commit`, optionally
-`:file.onnx` for a repo carrying several. A pasted Hub address is the same three fields and is
-accepted as it comes, `blob/` and `resolve/` URLs included, because what is in somebody's clipboard
-is the page they were just reading.
-
-`catalogue.parse_spec` is the whole of that, and it repeats `updater/src/policy.rs`'s rule about
-what an `org/name` is for one reason: the daemon's refusal is correct and arrives after a round
-trip to a robot, and a typo deserves an answer while the cursor is still in the box. A Space URL
-gets named as one rather than 404ing, since it is the same shape as a model's and it is the
-mistake to expect.
-
-**Nothing is read here first, and that is the difference from a row.** A row has had its manifest
-read, so the page can refuse a ground pick before anything is downloaded; a typed repo has not, and
-fetching one to pre-judge it would be this page second-guessing `policy.fetch` — which reads the
-same file on the robot, refuses on shape before downloading, and is the reading that the skill gets
-written from either way. The encoding refusal still lands, one step later, off the fetch answer.
-
-The line a run finishes on is the spec rather than the row's key — `org/name@v2:walk.onnx`, what
-was actually fetched, revision and all. It pastes back into the box, and into `robotctl policy add`
-on the robot.
-
-## The picture
-
-The session carries the camera as well as the channel, so the newest frame is shown beside the
-buttons — decoded from H.264 by `aiortc`, on whichever transport is connected, and repainted ten
-times a second. Watching the thing you installed do something is most of the point of installing
-it from here rather than from a terminal.
-
-It is put the right way up by asking. The camera is mounted a quarter turn off and nothing on the
-robot rotates the pixels; `media.video` carries `rotate` and the control channel sends it once
-when it opens, so there is no angle written down anywhere in this Space. `vision-demo` has to
-compile one in, because it has no control channel to ask on.
-
-## What it refuses, and why it is this side's job
-
-A policy whose command the daemon generates — a phase for a ground pick, a flag for a sit↔stand —
-cannot be a one-shot skill. `robot.setSkill` would accept the entry, and the robot would then feed
-a constant to a network trained on a phase: it moves plausibly and wrongly, which is worse than a
-refusal. `robotctl`'s `skill_encoding_refusal` is the rule, `robotctl` is not in the path of a
-click, so `catalogue.refusal` is the same rule again.
-
-The shape claims — `obs_len`, `action_len`, `model_api`, `robot.model` — are deliberately *not*
-repeated here. `policy.fetch` checks them itself, before the download, so "this policy is 51-D and
-this robot is 61-D" comes back in a second and comes back from the robot.
-
-A `perpetual` policy has no length of its own, so a one-shot made out of one is a hold and an
-unwind. `robotctl policy add` refuses without `--hold` rather than picking a number; this page asks
-instead, and that is the seconds box above the rows.
-
-## Two ways in
-
-**From anywhere** is the rendezvous: the robot registers as a producer holding its account token,
-this signs in as the visitor, and the service pairs them. It is the path that reaches a duck behind
-its owner's router, and it needs a candidate pair that works. The robot offers a `relay` candidate
-(`remote-access-design.md` §6), so a session between a home router and a data centre has a
-fallback for when host and srflx do not punch a hole — which they often do not. That fallback is
-somebody's bandwidth and it is metered, and because the control channel is SCTP over the same
-candidate pair, a relay that stops being available takes every button on this page with it. The
-status line names the stage it reached instead of saying "connecting…", so that failure is
-legible rather than mysterious.
-
-**On this network** needs none of that. `mediad` is already serving `webrtcsink`'s signalling
-server on `ws://<robot>:8443` — it is what the robot's own console talks to — and it carries the
-same gst envelopes the rendezvous carries over SSE and `POST /send`. So `lan.py` is one hop
-swapped and nothing above it changed: same `control` channel, same JSON-RPC, same buttons. No
-account, no lease, no rendezvous, no relay, and on one network both sides offer host candidates.
-
-That makes it the useful thing to reach for when a click does not work and nobody knows which
-layer to blame. **If it works on the LAN and not through the rendezvous, the transport is the
-problem** and nothing about the policy, the manifest or the robot is.
-
-A Space in a data centre cannot reach a LAN, so that tab is for running this yourself. Once:
+## Working on it
 
 ```bash
-uv venv && uv pip install -r requirements.txt
-```
-
-Then, and every time after:
-
-```bash
-uv run app.py
-```
-
-`uv run` picks up the `.venv` beside it, so nothing has to be activated and no flags are needed.
-There is deliberately no `pyproject.toml`: `requirements.txt` is what Hugging Face installs, and a
-second copy of one dependency list is a second copy to get wrong — which is the whole reason the
-install step is a separate line rather than something inferred from a manifest.
-
-`DUCK_HOST` pre-fills the address box. `HF_TOKEN` stands in for the sign-in, and so does whatever
-`hf auth login` stored — see **Identity** for why a local run needs one of those rather than the
-login button.
-
-**One consumer at a time.** The rendezvous's rule, not a simplification: while this holds a
-session, the robot's own console cannot open one, and neither can the vision demo. The LAN
-transport is subject to the same thing for a different reason — one `webrtcsink` session per
-consumer slot — so *disconnect* before opening the console.
-
-## Identity
-
-**A visitor's token by preference, and never the robot's.** The rendezvous maps a token to one
-peer, so a consumer authenticating as the robot would take the robot off its owner's listing.
-`hf_oauth: true` plus Gradio's login button gives each visitor their own, which reaches their own
-robots and nobody else's — and is what makes a public Space defensible.
-
-**Outside a Space, that button is a mock, and its token is a placeholder.** Gradio mocks its own
-login when `SPACE_ID` is unset: the buttons behave and the profile is real, but `access_token` is
-the literal string `mock-oauth-token-for-local-dev`. Sent to a service that resolves tokens
-through `whoami-v2`, it is a `401` — which is what "the rendezvous refused this token" meant the
-first time this page was run locally, while `microduck-console` listed the same duck perfectly.
-So a mocked token is dropped rather than preferred, and a local run uses `HF_TOKEN` or whatever
-`hf auth login` stored. The log line says which, on every press.
-
-Ducks are told from minis on `meta.kind`, and the chosen robot is pinned by `peerId` rather than by
-name: their consumer's auto-pick falls back to the only visible producer whatever it is called, so
-an account with one duck and one mini could otherwise hand this page a mini to drive with method
-names it does not serve. §5.1 has the other half, which is theirs.
-
-## When it does not work
-
-**The log says which of four things failed**, because they present identically as "the button did
-nothing" and have nothing in common. It is at the bottom of the page and on the terminal at once —
-a Space has logs nobody has open and a browser has no stderr — and it carries every HTTP status,
-every signalling frame, every JSON-RPC line and every refusal, with the token's *source* named and
-the token itself never written down.
-
-```bash
-DUCK_LOG=DEBUG uv run app.py
-```
-
-adds the streaming notifications and each ICE candidate — which is what to reach for when
-signalling crossed and media did not, and nothing else.
-
-Each layer is also checkable on its own, in the order the failures happen:
-
-```bash
-uv run rendezvous.py
-```
-
-lists the account's robots with their `kind` and their `busy` state. A `401` here is the token and
-nothing else. This needs no Gradio and no robot.
-
-```bash
-uv run catalogue.py
-```
-
-prints the whole Hub catalogue with what each policy claims and which are refused. Needs no token.
-Given arguments, it answers for the box instead — what each one parses to, and what the Hub has
-there:
-
-```bash
-uv run catalogue.py https://huggingface.co/RemiFabre/microduck-flamingo-cycle
+cd spaces/policy-playground-next/web && npm install
 ```
 
 ```bash
-uv run lan.py
+npm run dev
 ```
 
-drives a real session against a producer on loopback. If this passes and a duck does not, the
-problem is between here and the duck rather than in this code.
+That serves the real page against the real Hub and the real rendezvous. Signing in needs an OAuth
+app whose redirect URI is exactly the dev URL, so pass one:
 
-## What the checks above actually cover
+```bash
+open "http://localhost:5173/?client_id=<an app registered for localhost:5173>"
+```
 
-`catalogue.py` reads the Hub the way `updater/src/policy.rs` reads it — `?search=microduck` and a
+Building writes one self-contained `index.html` beside the `Dockerfile`:
+
+```bash
+npm run build
+```
+
+That file is committed, because `publish-space.sh` publishes the *top level* of a space directory —
+files, not trees — and a bundler emits `assets/`. Inlining everything keeps the published Space the
+same four files the console has: a page, a Dockerfile, an entrypoint and this card. Nothing is
+built on Hugging Face's side, so nothing there can fail for a reason nobody can see.
+
+## Why it is a browser and not a Python container
+
+The Gradio version of this page is still published and works, and every hard problem it had came
+from being a client that runs in a data centre:
+
+- **The rendezvous refused it.** `requests` signs its calls `python-requests/2.x`, which Hugging
+  Face's edge reads as a bot: from a Space container the very first `GET /api/robot-status` came
+  back `429` with an HTML page and `server=awselb/2.0`, and the service never saw the request. From
+  a browser the call carries the visitor's own address and their own browser's signature.
+- **Every visitor shared one robot.** The session lived in a module-level object, because module
+  globals are per-process and a Space is one process. Here each visitor is their own browser, and
+  per-visitor sessions cost nothing to arrange.
+- **`aiortc`, `av`, a DTLS cipher patch and `PyGObject`** existed to give Python a WebRTC stack.
+  A browser has one.
+- **Server-side rendering**, which put a Node proxy in front of the page and stopped ten seconds
+  after it started, with no traceback.
+
+None of those exist here. `microduck-console` is the same shape and has never had any of them.
+
+## Who it is for
+
+A ten-year-old with a duck. That is a constraint on the whole page and not a coat of paint:
+nothing on it names a method, a transport, a socket or a schema. A trick has a name, a sentence
+about what it does, and one button.
+
+What the four calls are — `policy.fetch`, `robot.setSkill`, `robot.policies`, `robot.do` — which
+lane they take, and why a refusal happened, all live in **What just happened?** at the bottom. That
+is where somebody goes when it breaks, not when they want to see a duck bow.
+
+## The parts
+
+`src/rendezvous.ts` is a port of `spaces/shared/wire.py`: `GET /events` for the stream, `POST /send`
+for everything else, and a `peer` envelope carrying `rpc` is a control call. Four things that
+protocol punishes a reader for not knowing are in its header, all of them learned in the Python
+version and all still true.
+
+`src/hub.ts` makes the same two requests `updater/src/policy.rs` makes — `?search=microduck` and a
 `manifest.json` per hit — so the gallery and `policy.search` cannot disagree about what exists.
+Every field below the repo is the publisher's claim, displayed and never acted on: what gets
+installed comes from the robot's own reading of the manifest it downloaded.
 
-`rendezvous.py` is one `GET /api/robot-status`, read off `reachy_mini_central`'s own `app.py`:
-`Depends(_resolve_hf_token)` then one `whoami-v2` call, with no scope check and no requirement
-that the caller hold an event stream. Its docstring says it is for exactly this — "a passive
-status indicator without consuming a session slot" — which also makes it safe to press
-mid-session, where the console's `list` route would open a second stream on the same token and
-evict the peer the session is riding on (§3.7).
+`src/auth.ts` is PKCE, with the client id substituted into the page by `entrypoint.sh` rather than
+injected by the platform — the console's Dockerfile says what the documented injection did instead,
+which was nothing, for a day.
 
-`lan.py` stands up a producer on loopback that speaks what `webrtcsink`'s signaller speaks
-and drives a real session against it: welcome, list, startSession, an offer answered, DTLS, SCTP,
-the `control` channel, a call matched to its reply, and a video track decoded to check that frames
-arrive at all and arrive as RGB. Two aiortc peers on `127.0.0.1` are not a duck — they are the
-same protocol, and a dozen hand-written envelope shapes are exactly the thing that fails silently
-rather than loudly. The producer there sends VP8 where a duck sends H.264, because the codec is
-aiortc's to pick and the plumbing under test is the same one either way.
+## What a press does
+
+    getting it → putting it on your duck → waiting for your duck → doing it
+
+**"Waiting for your duck" is not padding.** Putting a trick on a duck makes it reload, a reloading
+duck goes back to its standing pose, and it refuses to do anything until it gets there — so without
+the wait, the press that installs is the press that gets refused, and the trick silently never
+runs. `homed` on `robot.policies` (`API_VERSION` 30) is the flag to wait on. A duck too old to
+publish it sends nothing, and then there is nothing to wait for.
+
+The rest of the page is inert while a press is in flight. A duck does one thing at a time, so a
+page that accepted a second press would be promising something it cannot keep.

@@ -151,3 +151,13 @@ h2 { font-size: 20px; margin: 30px 0 12px; }
 
 .chip-link { background: #eef3ff; color: #2a5db0; text-decoration: none; }
 .chip-link:hover { text-decoration: underline; }
+
+/* A clip of the trick, where a guess used to be. Fixed aspect so a grid of cards does not jump
+   around as each one's metadata arrives. */
+.card-clip {
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  object-fit: cover;
+  border-radius: 10px;
+  background: #11141a;
+}
