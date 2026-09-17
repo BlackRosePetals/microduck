@@ -15,7 +15,7 @@
  * and the rest of the page is inert while one is in flight. A robot can only do one thing at a
  * time, so a page that accepted a second press would be promising something it cannot keep.
  */
-import { beginSignIn, canSignIn, completeSignIn, forgetSignIn, type SignedIn } from "./auth";
+import { beginSignIn, canSignIn, completeSignIn, forgetSignIn, localHint, type SignedIn } from "./auth";
 import { howLong, isATrick, needsALength, notATrick, readHub, skillFor, type Policy } from "./hub";
 import { listDucks, RpcError, Session, type Robot } from "./rendezvous";
 import "./style.css";
@@ -290,7 +290,9 @@ function header(): HTMLElement {
     button.disabled = !canSignIn();
     button.addEventListener("click", () => void beginSignIn());
     right.append(button);
-    if (!canSignIn()) right.append(el("span", "chip chip-bad", "no app id on this page"));
+    const hint = localHint();
+    if (hint) right.append(el("span", "chip chip-bad", "no app id — see below"));
+    else if (!canSignIn()) right.append(el("span", "chip chip-bad", "no app id on this page"));
   } else if (!state.session) {
     const picker = el("select", "picker");
     if (state.ducks.length === 0) {
@@ -358,7 +360,8 @@ function render(): void {
         "hint",
         state.signedIn
           ? "Pick your duck and wake it up, then choose a trick."
-          : "Sign in to find your duck. You will only see robots your own account owns.",
+          : (localHint() ??
+              "Sign in to find your duck. You will only see robots your own account owns."),
       ),
     );
   }

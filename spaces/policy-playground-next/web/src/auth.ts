@@ -50,12 +50,34 @@ function nameOf(result: Stored): string {
 }
 
 /**
+ * Whether this page is running on somebody's own machine.
+ *
+ * The gate for the `?token=` shortcut below, and the reason it is a gate: a token in a query
+ * string ends up in browser history, in a referrer, and in whatever proxy sits between. On
+ * localhost there is none of that and the alternative is registering an OAuth app to look at a
+ * page. On a published Space it would be a live credential pasted into an address bar, so there
+ * it does not exist at all.
+ */
+function onThisMachine(): boolean {
+  return ["localhost", "127.0.0.1", "[::1]"].includes(location.hostname);
+}
+
+/**
  * Consume a redirect if this page load is one, before anything else runs.
  *
  * Called first thing: a page holding a fresh `?code=` has one chance to exchange it, and anything
  * that re-renders or re-navigates first throws it away.
  */
 export async function completeSignIn(): Promise<SignedIn | null> {
+  // **`?token=` is for a local run and nowhere else.** `hf auth login` already stored one —
+  // `cat ~/.cache/huggingface/token` — and pasting it is a great deal less ceremony than
+  // registering an OAuth app whose redirect URI is a dev server. Off localhost this branch is
+  // not reachable, whatever the URL says.
+  const pasted = new URLSearchParams(location.search).get("token");
+  if (pasted && onThisMachine()) {
+    return { token: pasted, username: "you (a token from the address bar)" };
+  }
+
   let result: Stored | null = null;
   try {
     result = (await oauthHandleRedirectIfPresent()) as Stored | null;
@@ -102,4 +124,11 @@ export function forgetSignIn(): void {
 /** Whether signing in is possible at all here, so the page can say so rather than fail on a press. */
 export function canSignIn(): boolean {
   return Boolean(clientId());
+}
+
+/** What to tell somebody running this locally with no OAuth app, which is the usual case. */
+export function localHint(): string | null {
+  if (!onThisMachine() || canSignIn()) return null;
+  return "Running locally: add ?token=<your Hugging Face token> to the address bar. " +
+    "`cat ~/.cache/huggingface/token` is the one `hf auth login` stored.";
 }
