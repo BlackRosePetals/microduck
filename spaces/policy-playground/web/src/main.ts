@@ -50,6 +50,8 @@ interface State {
    * button that does nothing every other press, which is the reason `robot.enable` has a `toggle`.
    */
   enabled: boolean | null;
+  /** Parked in its seat, from `robot.policies`. `null` is a duck too old to say. */
+  sitting: boolean | null;
   /**
    * What the duck has, and which of those this page may take off again.
    *
@@ -82,6 +84,7 @@ const state: State = {
   session: null,
   duckName: null,
   enabled: null,
+  sitting: null,
   onTheDuck: [],
   policies: [],
   trouble: null,
@@ -137,6 +140,7 @@ async function disconnect(): Promise<void> {
   state.session = null;
   state.duckName = null;
   state.enabled = null;
+  state.sitting = null;
   state.onTheDuck = [];
   state.said = "Let go of your duck.";
   state.saidFor = null;
@@ -150,6 +154,7 @@ async function readTheDuck(): Promise<void> {
   try {
     const policies = (await session.call("robot.policies")) as Record<string, unknown>;
     state.enabled = typeof policies.enabled === "boolean" ? policies.enabled : null;
+    state.sitting = typeof policies.sitting === "boolean" ? policies.sitting : null;
     const table = (await session.call("robot.skills")) as Record<string, unknown>;
     const skills = Array.isArray(table.skills) ? (table.skills as Record<string, unknown>[]) : [];
     const builtIn = Array.isArray(table.built_in) ? (table.built_in as string[]) : [];
@@ -330,14 +335,18 @@ async function takeOff(name: string): Promise<void> {
  * `robotctl` guards with `--yes` and BLE refuses to carry at all. On a page built for a child it
  * would be a button that looks like "have a rest" and is in fact "fall over".
  */
-async function duckCommand(method: string, saying: string): Promise<void> {
+async function duckCommand(
+  method: string,
+  saying: string,
+  params: Record<string, unknown> = {},
+): Promise<void> {
   const session = state.session;
   if (!session) return;
   state.busy = `cmd:${method}`;
   state.stage = saying;
   render();
   try {
-    const answer = await session.call(method);
+    const answer = await session.call(method, params);
     const refused = refusal(answer);
     state.said = refused ?? null;
     await readTheDuck();
@@ -388,10 +397,20 @@ function duckControls(): HTMLElement | null {
     row.append(el("span", "hint", "Your duck is switched off — start it, then stand it up."));
   }
 
+  // **Two calls behind one button, and the duck says which.** A duck on its feet stands with
+  // `robot.init`. A duck in its seat is held there by the `sit_toggle` latch the daemon drives —
+  // `init` argues with that rather than winning, which is a robot visibly fighting itself. A duck
+  // too old to report `sitting` sends `init`, which is what every client did before this existed.
+  const seated = state.sitting === true;
   const stand = el("button", "control control-stand",
-    state.busy === "cmd:robot.init" ? (state.stage ?? "…") : "Stand up");
+    state.busy?.startsWith("cmd:") && state.busy !== "cmd:enable" && state.busy !== "cmd:robot.stop"
+      ? (state.stage ?? "…")
+      : seated ? "Get up" : "Stand up");
   stand.disabled = busy;
-  stand.addEventListener("click", () => void duckCommand("robot.init", "Standing up…"));
+  stand.addEventListener("click", () =>
+    void (seated
+      ? duckCommand("robot.do", "Getting up…", { skill: "sit_toggle" })
+      : duckCommand("robot.init", "Standing up…")));
   row.append(stand);
 
   const stop = el("button", "control control-stop",
