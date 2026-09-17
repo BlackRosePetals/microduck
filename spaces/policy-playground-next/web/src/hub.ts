@@ -34,6 +34,8 @@ export interface Policy {
   unwindS: number | null;
   idle: number[] | null;
   official: boolean;
+  /** The robot the manifest says it is for, when that is not a plain duck. */
+  forRobot: string | null;
   likes: number;
   key: string;
 }
@@ -112,8 +114,13 @@ function policyFrom(fields: Record<string, unknown>, repo: string, file: string 
   // A manifest naming another robot is kept and labelled rather than dropped: `policy.fetch`
   // refuses on `robot.model` itself, and a row that says why beats a policy that is silently
   // missing from the list somebody was told to look in.
+  // **Labelled, not hidden, and still pressable.** `policy.fetch` compares this against the robot's
+  // own model and refuses — but the comparison is the *robot's* to make, and this page does not
+  // know which kind of duck is on the other end until it asks. Excluding a `full_shell` policy
+  // would be exactly wrong for somebody holding a full shell, so the card says what it is for and
+  // lets the duck answer.
   const model = robot.model == null ? null : String(robot.model);
-  if (model && model !== "microduck") description = `This was made for a ${model}, not for a duck.`;
+  const forRobot = model && model !== "microduck" ? model : null;
 
   return {
     repo,
@@ -126,6 +133,7 @@ function policyFrom(fields: Record<string, unknown>, repo: string, file: string 
     unwindS: number(fields.unwind_s),
     idle: Array.isArray(command.idle) ? (command.idle as number[]) : null,
     official: repo.split("/")[0] === OFFICIAL_ORG,
+    forRobot,
     likes,
     key: file ? `${repo}#${file}` : repo,
   };

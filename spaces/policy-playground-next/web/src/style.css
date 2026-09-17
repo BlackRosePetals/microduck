@@ -117,3 +117,31 @@ h2 { font-size: 20px; margin: 30px 0 12px; }
   border: 1px solid #f0dfa0;
   font-size: 15px;
 }
+
+/* The shelf is the page's headline, not a list above the real content: one press here is a duck
+   doing something in front of a friend. */
+.shelf { margin-top: 22px; }
+.shelf-title { font-size: 24px; margin: 0 0 12px; }
+.shelf-row { display: flex; flex-wrap: wrap; gap: 12px; }
+.tile { display: flex; align-items: stretch; }
+.tile-go {
+  background: linear-gradient(#fff7d6, #ffe89a);
+  border: 2px solid #e6c34d;
+  border-radius: 16px 6px 6px 16px;
+  font-size: 20px;
+  font-weight: 700;
+  padding: 16px 20px;
+  text-transform: capitalize;
+}
+.tile-go:not(:disabled):active { transform: translateY(1px); }
+.tile:has(.tile-off) .tile-go { border-right: none; }
+.tile:not(:has(.tile-off)) .tile-go { border-radius: 16px; }
+.tile-off {
+  border: 2px solid #e6c34d;
+  border-left: 1px solid #edd88f;
+  border-radius: 6px 16px 16px 6px;
+  background: #fffdf5;
+  color: #9a8a4a;
+  padding: 0 12px;
+  font-size: 15px;
+}

@@ -17,7 +17,7 @@
  */
 import { beginSignIn, canSignIn, completeSignIn, forgetSignIn, localHint, type SignedIn } from "./auth";
 import { howLong, isATrick, needsALength, notATrick, readHub, skillFor, type Policy } from "./hub";
-import { listDucks, RpcError, Session, type Robot } from "./rendezvous";
+import { listDucks, Session, type Robot } from "./rendezvous";
 import "./style.css";
 
 /** How long to hold a trick that has no length of its own. Perpetual means "until told otherwise". */
@@ -42,7 +42,14 @@ interface State {
   chosen: string | null;
   session: Session | null;
   duckName: string | null;
-  onTheDuck: string[];
+  /**
+   * What the duck has, and which of those this page may take off again.
+   *
+   * `overridden` on `robot.skills` is the difference: a skill that came from the robot's config
+   * is one somebody added and can remove, and a shipped one is part of the release. Offering to
+   * delete a shipped skill would be offering something the daemon will refuse.
+   */
+  onTheDuck: Array<{ name: string; removable: boolean }>;
   policies: Policy[];
   trouble: string | null;
   busy: string | null;
@@ -131,11 +138,18 @@ async function readTheDuck(): Promise<void> {
   const session = state.session;
   if (!session) return;
   try {
-    const policies = (await session.call("robot.policies")) as Record<string, unknown>;
-    const skills = Array.isArray(policies.skills) ? (policies.skills as string[]) : [];
-    const built = (await session.call("robot.skills")) as Record<string, unknown>;
-    const builtIn = Array.isArray(built.built_in) ? (built.built_in as string[]) : [];
-    state.onTheDuck = [...skills, ...builtIn.filter((n) => !skills.includes(n))];
+    const table = (await session.call("robot.skills")) as Record<string, unknown>;
+    const skills = Array.isArray(table.skills) ? (table.skills as Record<string, unknown>[]) : [];
+    const builtIn = Array.isArray(table.built_in) ? (table.built_in as string[]) : [];
+    state.onTheDuck = [
+      ...skills.map((skill) => ({
+        name: String(skill.name),
+        removable: Boolean(skill.overridden),
+      })),
+      // The daemon drives these itself — `ground_pick` writes a scripted phase, `sit_toggle` is
+      // latched — so they can be asked for and never taken away.
+      ...builtIn.map((name) => ({ name, removable: false })),
+    ];
   } catch (e) {
     note(`could not read the duck: ${e}`);
   }
@@ -177,13 +191,30 @@ function refusal(result: unknown): string | null {
   return String(answer.reason ?? "your duck said no, without saying why");
 }
 
-async function teachAndDo(policy: Policy): Promise<void> {
+/**
+ * A refusal, said to somebody who is ten.
+ *
+ * The daemon writes for whoever is reading a journal: `network error: Teethyfish/microduck-… will
+ * not run on this robot: it is for a microduck full_shell, and this is a microduck`. Three
+ * true things — a repo id, an error class that is not what happened, and one sentence a child
+ * could act on. This keeps the sentence.
+ *
+ * Nothing is invented and nothing is swallowed: the whole message is in the log, every time.
+ */
+function inWords(e: unknown, policy: Policy): string {
+  const raw = e instanceof Error ? e.message : String(e);
+  const mismatch = /it is for an? (.+?), and this is an? (.+?)$/.exec(raw);
+  if (mismatch) return `${policy.name} is made for a ${mismatch[1]}, and yours is a ${mismatch[2]}.`;
+  // The daemon calls every refusal it raises a "network error", including the ones that are
+  // nothing of the kind. Dropping the prefix is the honest half of that; the other half is a
+  // change to the daemon.
+  return raw.replace(/^network error: /, "").replace(`${policy.repo} `, "");
+}
+
+async function putOnDuck(policy: Policy): Promise<void> {
   const session = state.session;
-  // Not silent. The button is disabled without a duck, so this should be unreachable — and
-  // "should be unreachable" is exactly the branch that returns quietly and leaves somebody
-  // pressing a button that does nothing.
   if (!session) {
-    state.said = "Wake your duck up first, then press a trick.";
+    state.said = "Wake your duck up first.";
     state.saidFor = policy.key;
     render();
     return;
@@ -218,23 +249,11 @@ async function teachAndDo(policy: Policy): Promise<void> {
     const after = (await session.call("robot.policies")) as Record<string, unknown>;
     if (after.change_error) throw new Error(String(after.change_error));
 
-    state.stage = "Waiting for your duck…";
-    render();
-    await waitForHome();
-
-    state.stage = "Doing it!";
-    render();
-    const name = String(skill.name);
-    const ran = await session.call("robot.do", { skill: name });
-    const notRun = refusal(ran);
-    state.said = notRun
-      ? `It is on your duck, but it would not do it: ${notRun}`
-      : `${state.duckName ?? "Your duck"} is doing it!`;
-    state.saidFor = policy.key;
     await readTheDuck();
+    state.said = `It is on your duck. Press it up in “On your duck”.`;
+    state.saidFor = policy.key;
   } catch (e) {
-    const why = e instanceof RpcError ? e.message : e instanceof Error ? e.message : String(e);
-    state.said = `That did not work: ${why}`;
+    state.said = `That did not work: ${inWords(e, policy)}`;
     state.saidFor = policy.key;
   } finally {
     state.busy = null;
@@ -259,6 +278,28 @@ async function doAgain(name: string): Promise<void> {
     state.said = `It would not do it: ${e instanceof Error ? e.message : String(e)}`;
     state.saidFor = `again:${name}`;
   } finally {
+    state.busy = null;
+    state.stage = null;
+    render();
+  }
+}
+
+async function takeOff(name: string): Promise<void> {
+  const session = state.session;
+  if (!session) return;
+  note(`taking ${name} off the duck`);
+  state.busy = `off:${name}`;
+  state.stage = "Taking it off…";
+  render();
+  try {
+    const gone = await session.call("robot.removeSkill", { name });
+    const refused = refusal(gone);
+    state.said = refused ? `Could not take ${name} off: ${refused}` : `${name} is off your duck.`;
+    await readTheDuck();
+  } catch (e) {
+    state.said = `Could not take ${name} off: ${e instanceof Error ? e.message : String(e)}`;
+  } finally {
+    state.saidFor = "shelf";
     state.busy = null;
     state.stage = null;
     render();
@@ -291,6 +332,7 @@ function card(policy: Policy): HTMLElement {
   const facts = el("p", "card-facts");
   facts.append(el("span", "chip", howLong(policy)));
   if (policy.official) facts.append(el("span", "chip chip-official", "made by Pollen"));
+  if (policy.forRobot) facts.append(el("span", "chip chip-bad", `for a ${policy.forRobot}`));
   if (needsALength(policy) && !blocked) facts.append(el("span", "chip", `held for ${HOLD_SECONDS}s`));
   node.append(facts);
 
@@ -300,10 +342,10 @@ function card(policy: Policy): HTMLElement {
   }
 
   const mine = state.busy === policy.key;
-  const button = el("button", "go", mine ? (state.stage ?? "…") : "Teach my duck");
+  const button = el("button", "go", mine ? (state.stage ?? "…") : "Put it on my duck");
   button.disabled = !state.session || state.busy !== null;
   if (mine) button.classList.add("go-busy");
-  button.addEventListener("click", () => void teachAndDo(policy));
+  button.addEventListener("click", () => void putOnDuck(policy));
   node.append(button);
   if (state.saidFor === policy.key && state.said) node.append(el("p", "card-said", state.said));
   return node;
@@ -356,21 +398,46 @@ function header(): HTMLElement {
   return bar;
 }
 
+/**
+ * What the duck can do right now — the top of the page, in big buttons.
+ *
+ * **This is what the page is for.** A ten-year-old with a duck and a friend standing next to them
+ * wants one press and a duck doing something, and everything else — the Hub, the manifests, the
+ * downloading — is what you do once so that this row exists. So it is first, it is large, and the
+ * catalogue below is called "get more tricks" rather than being the page itself.
+ */
 function shelf(): HTMLElement | null {
-  if (!state.session || state.onTheDuck.length === 0) return null;
+  if (!state.session) return null;
   const box = el("section", "shelf");
-  box.append(el("h2", "", "Already on your duck"));
+  box.append(el("h2", "shelf-title", "On your duck"));
+  if (state.onTheDuck.length === 0) {
+    box.append(el("p", "hint", "Nothing yet. Pick a trick below and put it on."));
+    return box;
+  }
+
   const row = el("div", "shelf-row");
-  for (const name of state.onTheDuck) {
-    const button = el("button", "known", state.busy === `again:${name}` ? (state.stage ?? "…") : name);
-    button.disabled = state.busy !== null;
-    button.addEventListener("click", () => void doAgain(name));
-    row.append(button);
+  for (const { name, removable } of state.onTheDuck) {
+    const tile = el("div", "tile");
+    const doing = state.busy === `again:${name}`;
+    const go = el("button", "tile-go", doing ? (state.stage ?? "…") : name);
+    go.disabled = state.busy !== null;
+    go.addEventListener("click", () => void doAgain(name));
+    tile.append(go);
+    // Only what somebody added can be taken off. A shipped skill is part of the release, and a
+    // cross beside it would be offering something the daemon refuses.
+    if (removable) {
+      const off = el("button", "tile-off", "✕");
+      off.title = `Take ${name} off your duck`;
+      off.disabled = state.busy !== null;
+      off.addEventListener("click", () => void takeOff(name));
+      tile.append(off);
+    }
+    row.append(tile);
   }
   box.append(row);
-  // The shelf's answers land here for the same reason a card's land on the card: `doAgain` sets
-  // `saidFor` too, and a message nothing renders is a message that does not exist.
-  if (state.saidFor?.startsWith("again:") && state.said) box.append(el("p", "card-said", state.said));
+  if ((state.saidFor === "shelf" || state.saidFor?.startsWith("again:")) && state.said) {
+    box.append(el("p", "card-said", state.said));
+  }
   return box;
 }
 
@@ -399,7 +466,7 @@ function render(): void {
   if (known) root.append(known);
 
   const tricks = el("section", "tricks");
-  tricks.append(el("h2", "", "Tricks you can add"));
+  tricks.append(el("h2", "", "Get more tricks"));
   if (state.trouble) tricks.append(el("p", "hint", state.trouble));
   const grid = el("div", "grid");
   for (const policy of state.policies.filter(isATrick)) grid.append(card(policy));
