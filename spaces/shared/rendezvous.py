@@ -15,6 +15,11 @@ that is about to start a session needs the stream anyway. Peers are keyed by tok
 listed that way could not refresh its list without dropping the session it was holding. This one
 opens nothing.
 
+**A `429` here is not theirs.** `robot_status` is `validate_hf_token` and then a loop over the
+producers — it never calls `check_rate_limit`, whose bucket is 1200 requests a minute keyed on a
+hash of the token, and the only status it raises is `401`. So a 429 on this route was written by
+something in front of the application, and `_who_answered` exists to say which something.
+
 **A `401` here means the token, and nothing else.** Worth stating plainly because the first thing
 that produced one was not a robot problem at all: run outside a Space, Gradio mocks its login and
 hands the app the literal string `mock-oauth-token-for-local-dev`, which `whoami-v2` refuses
@@ -45,6 +50,39 @@ DEFAULT_CENTRAL_URL = os.environ.get(
 DUCK = "microduck"
 
 TIMEOUT = 20
+
+# **What we call ourselves, and it is not cosmetic.** `requests` signs every call
+# `python-requests/2.x`, which Hugging Face's edge treats as a bot: from a Space's container the
+# very first `GET /api/robot-status` came back `429` with an HTML page and `server=awselb/2.0`,
+# so the rendezvous never saw it. The reference client — `reachy_mini.media.central_consumer`,
+# which `rf-detr-realtime-webcam` runs server-side from its own Space against this same host and
+# route — sends no `User-Agent` of its own either, but it is built on `aiohttp` and inherits that
+# library's signature instead. The difference between the two calls was the client, and nothing
+# else: same URL, same `Authorization`, same everything.
+#
+# So this names the page honestly rather than imitating a browser. A caller that says who it is
+# and carries a link is what a rate limiter is meant to let through, and it is the half of this
+# that stays true if the rule ever changes.
+USER_AGENT = (
+    "microduck-policy-playground/1.0 "
+    "(+https://huggingface.co/spaces/pollen-robotics/microduck-policy-playground)"
+)
+
+# Headers that say *who* answered. Asked only when the answer is one the application could not
+# have written: an edge or a proxy names itself and carries an id worth quoting, where FastAPI
+# would have sent `application/json` and a `detail`.
+TELLTALE = (
+    "retry-after",
+    "server",
+    "via",
+    "x-request-id",
+    "x-amzn-requestid",
+    "cf-ray",
+    "x-ratelimit-limit",
+    "x-ratelimit-remaining",
+    "x-ratelimit-reset",
+    "content-type",
+)
 
 
 logger = logging.getLogger(__name__)
@@ -84,6 +122,23 @@ class Robot:
         return " — ".join(bits)
 
 
+def _who_answered(answer: requests.Response) -> str:
+    """Which hop produced this status, in the terms the answer itself offers.
+
+    **A status the application cannot produce came from something in front of it**, and the only
+    evidence of which something is what came back: a `server` that names itself, a request id to
+    quote at whoever runs it, a `retry-after` that says whether this is a burst or a wall, and a
+    body that is HTML where FastAPI would have written `{"detail": ...}`.
+
+    The token is never part of this. What is quoted is the answer, which the caller already has.
+    """
+    bits = [f"{name}={answer.headers[name]}" for name in TELLTALE if name in answer.headers]
+    body = " ".join((answer.text or "").split())[:200]
+    if body:
+        bits.append(f"body={body!r}")
+    return ", ".join(bits) or "nothing — no telltale headers and an empty body"
+
+
 def ducks(token: str, base: str = DEFAULT_CENTRAL_URL) -> tuple[list[Robot], list[str]]:
     """This account's ducks, and the names of whatever else was listed.
 
@@ -96,13 +151,18 @@ def ducks(token: str, base: str = DEFAULT_CENTRAL_URL) -> tuple[list[Robot], lis
     try:
         answer = requests.get(
             f"{base}/api/robot-status",
-            headers={"Authorization": f"Bearer {token}"},
+            headers={"Authorization": f"Bearer {token}", "User-Agent": USER_AGENT},
             timeout=TIMEOUT,
         )
     except requests.RequestException as e:
         raise RendezvousError(f"the rendezvous could not be reached: {e}") from None
 
     logger.info("GET %s/api/robot-status -> HTTP %s", base, answer.status_code)
+    # Logged for every refusal rather than only for the one that raises here, because which hop
+    # answered is the question in all of them and the branches below each throw a different half
+    # of it away.
+    if answer.status_code != 200:
+        logger.info("  answered by: %s", _who_answered(answer))
     if answer.status_code == 401:
         raise RendezvousError(
             "the rendezvous refused this token — `whoami-v2` did not recognise it. On a Space, "
@@ -111,7 +171,11 @@ def ducks(token: str, base: str = DEFAULT_CENTRAL_URL) -> tuple[list[Robot], lis
             "instead — the log line above says which one was used."
         )
     if answer.status_code == 429:
-        raise RendezvousError("the rendezvous is rate-limiting this token; wait a minute.")
+        raise RendezvousError(
+            "something answered 429 before the rendezvous did — `/api/robot-status` raises 401 "
+            "and nothing else, and its rate limiter is not on that route. So this is an edge in "
+            f"front of the Space, and here is what it said: {_who_answered(answer)}"
+        )
     if answer.status_code != 200:
         raise RendezvousError(
             f"the rendezvous answered HTTP {answer.status_code}: {answer.text[:200]}"
