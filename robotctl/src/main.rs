@@ -4858,13 +4858,18 @@ mod tests {
         }
     }
 
+    /// The three fields these tests are about, and `..Default::default()` for the rest.
+    ///
+    /// **Spelling every field is what broke the build.** This helper cares about the slots and
+    /// whether the policy is driving; it listed the others because they existed, so adding
+    /// `homed` and `sitting` to the wire — a change no part of `robotctl` reads — failed to
+    /// compile a `robotctl` test. A helper that names only what it asserts on does not.
     fn policies_of(slots: Vec<proto::PolicySlot>) -> proto::PoliciesResult {
         proto::PoliciesResult {
             mode: "walk".into(),
             enabled: true,
             slots,
-            skills: Vec::new(),
-            change_error: None,
+            ..Default::default()
         }
     }
 
