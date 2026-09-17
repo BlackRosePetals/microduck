@@ -24,7 +24,8 @@
 //! reply was more than a few kilobytes. `notify` hands a D-Bus signal to the connection and
 //! returns; nothing here can ask BlueZ whether the radio has caught up, and nothing reports the
 //! notification MTU either. Both gaps are worked around rather than solved: the payload is taken
-//! from what BlueZ reports on inbound writes (one ATT MTU serves both directions), and the pump
+//! from what BlueZ reports on inbound writes (one ATT MTU serves both directions, capped at the
+//! 512-byte limit on a characteristic value — see `framing::notification_payload`), and the pump
 //! pauses every [`NOTIFY_BURST`] chunks. The IO model has the readiness signal this wants and
 //! still cannot be used, for the reason above — it serves only the `Acquire*` paths.
 
@@ -49,21 +50,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use tokio::sync::mpsc;
 
-use crate::gatt::{RPC_UUID, SERVICE_UUID};
 use crate::link::Link;
 use crate::session;
 use crate::upstream::{NameChoice, Sockets};
-
-/// Notification payload a session starts with, before any write has reported the negotiated one.
-///
-/// 20 bytes is what every BLE link is required to support, so it is the only safe *first* guess.
-/// It used to be the guess for the whole session — the notify side has no way to ask BlueZ, which
-/// remains true — and that was wrong in two ways. Tenfold more notifications than the link needed
-/// was the visible half; the other half is that a reply above roughly 5 KiB tore the session down
-/// (see [`NOTIFY_BURST`]). The write side does learn the real MTU, BlueZ reports it on every
-/// inbound write, and both directions share one ATT MTU — so the floor now lasts until the
-/// client's first write, which is always `system.authenticate`.
-const FLOOR_MTU: usize = 20;
+use duck_ble::framing::{FLOOR_MTU, notification_payload};
+use duck_ble::gatt::{RPC_UUID, SERVICE_UUID};
 
 /// How many notifications to queue before pausing to let the radio drain.
 ///
@@ -280,7 +271,7 @@ async fn serve_on_an_adapter(
     // `bd_addr` rather than `address`, because the advertisement now carries an IPv4 one too and a
     // journal with both spelled `address` reads as one field contradicting itself.
     //
-    // `max_adv_len` is logged because it is the budget `crate::adv` is written against: the payload
+    // `max_adv_len` is logged because it is the budget `duck_ble::adv` is written against: the payload
     // fits 31 bytes, and a controller that reports less is the one place that assumption fails. It
     // is the first thing to read if a robot ever advertises its name but no address.
     tracing::warn!(
@@ -416,7 +407,7 @@ async fn serve_on_an_adapter(
                         // free to do so and a central may renegotiate; logged only when it moves,
                         // because the value that matters is the one a reply gets chunked for and
                         // that number had never appeared in the journal at all.
-                        let payload = usize::from(req.mtu).saturating_sub(3).max(FLOOR_MTU);
+                        let payload = notification_payload(req.mtu);
                         let previous = write_mtu.swap(payload, Ordering::Relaxed);
                         let learned = (previous != payload).then_some(payload);
 
@@ -666,11 +657,11 @@ async fn notify_chunk(notifier: &mut CharacteristicNotifier, chunk: Vec<u8>) -> 
 ///
 /// One struct rather than two arguments threaded through the reconcile loop, so that "has anything
 /// moved" is one comparison. Adding a third field would otherwise mean finding every place that
-/// compares the pair — and `crate::adv` explains why there is no room for a third field anyway.
+/// compares the pair — and `duck_ble::adv` explains why there is no room for a third field anyway.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Advertised {
     name: String,
-    /// `None` is a robot with no IPv4 address, which goes out as `0.0.0.0` — see [`crate::adv`] for
+    /// `None` is a robot with no IPv4 address, which goes out as `0.0.0.0` — see [`duck_ble::adv`] for
     /// why the field is broadcast either way.
     address: Option<Ipv4Addr>,
 }
@@ -712,7 +703,7 @@ impl std::fmt::Display for Advertised {
 /// all, and returning an error here would take the advertisement down with it.
 ///
 /// **The address field is dropped rather than allowed to fail the registration.** The arithmetic in
-/// [`crate::adv`] says the payload fits, but the byte that overflows a legacy advertisement is the
+/// [`duck_ble::adv`] says the payload fits, but the byte that overflows a legacy advertisement is the
 /// controller's to count, not ours — and BlueZ refuses the whole registration when it does not fit.
 /// On a robot whose only front door may be BLE, that trade is not close: an advertisement with no
 /// address is a robot someone can still reach, and a refused one is a robot that has gone dark. Same
@@ -731,7 +722,7 @@ async fn advertise(
     let advertisement = |address: Option<Vec<u8>>| Advertisement {
         service_uuids: [SERVICE_UUID].into_iter().collect(),
         manufacturer_data: address
-            .map(|data| [(crate::adv::COMPANY_ID, data)].into_iter().collect())
+            .map(|data| [(duck_ble::adv::COMPANY_ID, data)].into_iter().collect())
             .unwrap_or_default(),
         discoverable: Some(true),
         local_name: Some(name.to_owned()),
@@ -740,7 +731,7 @@ async fn advertise(
         ..Default::default()
     };
 
-    let with_address = advertisement(Some(crate::adv::address_data(advertised.address)));
+    let with_address = advertisement(Some(duck_ble::adv::address_data(advertised.address)));
     match adapter.advertise(with_address).await {
         Ok(handle) => Ok(handle),
         Err(e) => {
@@ -846,7 +837,7 @@ async fn ask_name(sockets: &Sockets, fallback: &str) -> String {
 /// watching the address blink. So an outage keeps the last known address, exactly as [`ask_name`]
 /// keeps the last known name.
 ///
-/// Only IPv4, because only IPv4 fits — see [`crate::adv`].
+/// Only IPv4, because only IPv4 fits — see [`duck_ble::adv`].
 ///
 /// `debug` rather than `warn` for the same reason as [`ask_name`]: this runs every few seconds.
 async fn ask_address(sockets: &Sockets, last: Option<Ipv4Addr>) -> Option<Ipv4Addr> {

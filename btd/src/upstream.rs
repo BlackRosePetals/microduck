@@ -304,6 +304,7 @@ mod tests {
                     name: "duck-7f3a".into(),
                     serial: Some("bb7b734a7717ac41".into()),
                     uptime_seconds: 12,
+                    simulated: false,
                 },
             ),
         );

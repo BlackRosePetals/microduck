@@ -40,8 +40,11 @@ use clap::{Args, CommandFactory, Parser, Subcommand};
 use duck_ipc_proto as proto;
 use robotd_params::Slot;
 
+mod camera;
+mod cells;
 mod configure;
 mod duck;
+mod frame;
 mod imu_view;
 mod monitor;
 mod path_map;
@@ -107,6 +110,10 @@ struct Cli {
     #[arg(long, global = true, default_value = proto::socket::TOF)]
     tof_socket: PathBuf,
 
+    /// Local camera snapshot socket.
+    #[arg(long, global = true, default_value = proto::socket::MEDIA)]
+    media_socket: PathBuf,
+
     #[command(subcommand)]
     namespace: Namespace,
 }
@@ -115,6 +122,11 @@ struct Cli {
 /// `robotctl motors` later is additive rather than a restructure.
 #[derive(Subcommand, Debug)]
 enum Namespace {
+    /// Save one fresh raw UYVY frame; geometry is printed to stderr.
+    Frame {
+        #[arg(long, default_value = "frame.uyvy")]
+        output: PathBuf,
+    },
     /// Wifi. Served by `configd`, which drives NetworkManager.
     #[command(subcommand_required = true, arg_required_else_help = true)]
     Net {
@@ -2621,6 +2633,12 @@ fn run_system(socket: &Path, command: SystemCommand) -> Result<(), Failure> {
         SystemCommand::Info { .. } => {
             let info: proto::SystemInfoResult = decode(&result)?;
             println!("name    {}", info.name);
+            // First, and only when true. Everything below this line reads the same for a duck in
+            // MuJoCo as for one on the desk — which is the point of the simulator, and is also how
+            // somebody ends up debugging the wrong robot.
+            if info.simulated {
+                println!("body    MuJoCo (this is a simulated duck)");
+            }
             println!(
                 "serial  {}",
                 // A board with no readable SoC serial, not a board nobody provisioned: the
@@ -4513,6 +4531,7 @@ fn resolve_from_dir(dir: &std::path::Path) -> Result<String, Failure> {
 
 fn run(cli: Cli) -> Result<(), Failure> {
     let command = match cli.namespace {
+        Namespace::Frame { output } => return frame::run(&cli.media_socket, &output),
         Namespace::Health { json } => {
             return run_health(&cli.socket, &cli.robot_socket, &cli.config_socket, json);
         }
@@ -4524,6 +4543,7 @@ fn run(cli: Cli) -> Result<(), Failure> {
                 &cli.robot_socket,
                 &cli.pad_socket,
                 &cli.tof_socket,
+                &cli.media_socket,
                 hz,
                 json,
             );
@@ -4838,13 +4858,18 @@ mod tests {
         }
     }
 
+    /// The three fields these tests are about, and `..Default::default()` for the rest.
+    ///
+    /// **Spelling every field is what broke the build.** This helper cares about the slots and
+    /// whether the policy is driving; it listed the others because they existed, so adding
+    /// `homed` and `sitting` to the wire — a change no part of `robotctl` reads — failed to
+    /// compile a `robotctl` test. A helper that names only what it asserts on does not.
     fn policies_of(slots: Vec<proto::PolicySlot>) -> proto::PoliciesResult {
         proto::PoliciesResult {
             mode: "walk".into(),
             enabled: true,
             slots,
-            skills: Vec::new(),
-            change_error: None,
+            ..Default::default()
         }
     }
 

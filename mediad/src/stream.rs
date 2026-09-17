@@ -50,7 +50,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use futures_util::{SinkExt as _, StreamExt as _};
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", feature = "gstreamer"))]
 use image::ImageEncoder as _;
 
 /// What the frames are, on the wire.
@@ -592,7 +592,7 @@ pub fn hello(config: &Config, producer: &crate::producer::Producer, rotate: u32)
 /// Opening the valve is [`Encoders::gate`]'s job rather than this closure's, so that a stream
 /// which stops shuts it again: a second encoder running for nobody is what the valve exists to
 /// prevent.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", feature = "gstreamer"))]
 pub fn h264_encoder(branch: crate::pipeline::StreamBranch) -> Encode {
     Arc::new(move |_config: &Config| {
         let (bytes, keyframe) = branch.encoded.next_unit()?;
@@ -611,8 +611,8 @@ pub fn h264_encoder(branch: crate::pipeline::StreamBranch) -> Encode {
 /// [`Streamer::start`] gives it one, the same way the detector and the exposure loop have theirs.
 /// A frame is asked for rather than published, which is the whole design of `Frames`: at 5 fps
 /// this copies five of thirty rather than all thirty.
-#[cfg(target_os = "linux")]
-pub fn jpeg_encoder(frames: crate::pipeline::Frames, turn: duck_detect::Turn) -> Encode {
+#[cfg(any(target_os = "linux", feature = "gstreamer"))]
+pub fn jpeg_encoder(frames: crate::pipeline::Frames, turn: uyvy::Turn) -> Encode {
     // Reused across frames: at 640×480 the RGB buffer is 920 KB, and allocating that five times a
     // second forever is a page fault storm for no reason. A `Mutex` because `Encode` is `Fn` — one
     // thread ever takes it, so it is uncontended by construction.
@@ -633,7 +633,7 @@ pub fn jpeg_encoder(frames: crate::pipeline::Frames, turn: duck_detect::Turn) ->
 
         let mut held = scratch.lock().expect("not poisoned");
         let (rgb, jpeg) = &mut *held;
-        let (width, height) = duck_detect::rgb_from_uyvy(
+        let (width, height) = uyvy::rgb_from_uyvy(
             &frame.data,
             frame.width as usize,
             frame.height as usize,
@@ -771,6 +771,7 @@ mod tests {
             serial: Some("3fa1c51b".to_owned()),
             release: "0.10.0".to_owned(),
             api_version: 23,
+            simulated: false,
         };
         let line = hello(&config("wss://x/frames"), &producer, 90);
         let parsed: serde_json::Value = serde_json::from_str(&line).unwrap();
@@ -899,6 +900,7 @@ mod tests {
                 serial: None,
                 release: "0.10.0".to_owned(),
                 api_version: 23,
+                simulated: false,
             },
             90,
             dir.path().join("hf-token"),

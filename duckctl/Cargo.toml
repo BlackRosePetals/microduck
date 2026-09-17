@@ -26,7 +26,12 @@ description = "The robot from a laptop — over BLE today, over whatever reaches
 # the *client* side of the module the robot chunks with, so an asymmetry between them would show
 # up as this tool not working — which makes it a test of the protocol rather than a second
 # implementation free to agree with itself.
-btd = { path = "../btd" }
+#
+# `duck-ble` rather than `btd`, since a second consumer arrived and the split
+# became worth making: this tool wanted three platform-independent modules and
+# was pulling a Linux daemon — and on Linux, `bluer` and a vendored libdbus with
+# it — to reach them.
+duck-ble = { path = "../duck-ble" }
 
 # `API_VERSION`, and the `semver` re-export it is compared with. The version handshake is a
 # contract between this client and every daemon, so it is read from the crate that defines it
@@ -36,7 +41,23 @@ duck-ipc-proto = { path = "../duck-ipc-proto" }
 # `btleplug` rather than `bluer`, because this runs on a developer's machine: CoreBluetooth on
 # macOS, BlueZ on Linux, WinRT on Windows. `bluer` would make the client Linux-only, which defeats
 # the point of having one.
-btleplug = "0.11"
+#
+# **0.13 or newer, and the floor is deliberate.** Every 0.11 has three `.expect()`s in the
+# CoreBluetooth backend that abort the BLE event loop rather than fail a call:
+# `set_characteristics` panics on a service it does not know, and `update_descriptors` panics twice
+# more on an unknown service or characteristic. The second pair fires on a discovery-callback
+# ordering that CoreBluetooth produces in practice — deviceplug/btleplug#397 — and it takes down
+# the whole client, not the connection.
+#
+# 0.13 fixed all three: characteristics are merged rather than replaced, so descriptor state from an
+# earlier callback survives, and the descriptor handlers warn and return. The phone app would
+# otherwise have had to carry a vendored, patched copy of this crate the way
+# `reachy_mini_mobile_app` does, and it does not.
+#
+# We have not seen the panic here, and that is not evidence of much: `duckctl` connects briefly and
+# a developer re-runs it without filing anything. The reason to move is that the failure is a
+# process abort in a tool people reach for when a board is already misbehaving.
+btleplug = "0.13"
 clap = { workspace = true, features = ["derive"] }
 futures = "0.3"
 # `open` launches a browser, and which command does that is per-platform: `open` on macOS,

@@ -165,11 +165,14 @@ struct Args {
     pad_socket: Option<std::path::PathBuf>,
     #[arg(long)]
     updater_socket: Option<std::path::PathBuf>,
+    /// Local raw camera snapshot endpoint (not the control datachannel).
+    #[arg(long, default_value = duck_ipc_proto::socket::MEDIA)]
+    frame_socket: std::path::PathBuf,
 }
 
-// Gated with the `main` that calls it: off Linux there is no pipeline, so there is nothing to
-// point at a socket and `-D warnings` would call this dead.
-#[cfg(target_os = "linux")]
+// Gated with the `main` that calls it: without a pipeline there is nothing to point at a socket and
+// `-D warnings` would call this dead.
+#[cfg(any(target_os = "linux", feature = "gstreamer"))]
 impl Args {
     fn sockets(&self) -> mediad::upstream::Sockets {
         let mut s = mediad::upstream::Sockets::default();
@@ -192,7 +195,7 @@ impl Args {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", feature = "gstreamer"))]
 fn main() -> ExitCode {
     let args = Args::parse();
     tracing_subscriber::fmt()
@@ -270,7 +273,7 @@ fn main() -> ExitCode {
     );
     // The same angle the detector needs, in its own vocabulary: it folds the turn into the
     // resampling it already does, which is why nothing in the pipeline has to.
-    let turn = match duck_detect::Turn::from_degrees(rotate) {
+    let turn = match uyvy::Turn::from_degrees(rotate) {
         Some(turn) => turn,
         None => {
             tracing::error!(degrees = rotate, "mediad cannot start");
@@ -298,8 +301,9 @@ fn main() -> ExitCode {
         // neither. So this is logged at error and the daemon carries on.
         let page = mediad::web::page(args.port);
         let (web_host, web_port) = (args.host.clone(), args.web_port);
+        let web_frame_socket = args.frame_socket.clone();
         tokio::spawn(async move {
-            if let Err(e) = mediad::web::serve(&web_host, web_port, page).await {
+            if let Err(e) = mediad::web::serve(&web_host, web_port, page, web_frame_socket).await {
                 tracing::error!(
                     error = %format!("{e:#}"),
                     "the console is not being served; video and control are unaffected"
@@ -312,12 +316,19 @@ fn main() -> ExitCode {
         // unix-socket round trip on a boot where `configd` may not be up yet, which is why it is
         // bounded and why a failure is a warning rather than an exit.
         let sockets = args.sockets();
-        let producer =
+        let mut producer =
             mediad::producer::Producer::learn(sockets.clone(), duck_ipc_proto::build_info!()).await;
+        // **A camera that is MuJoCo is a simulated robot, whatever `configd` said.** `configd` owns
+        // the fact and this is the backstop for the one case that would be wrong: it is asked once,
+        // with a timeout, on a machine where every daemon starts at the same instant, so a late
+        // answer would register a simulated duck as hardware. The two cannot disagree — there is no
+        // arrangement in which the frames come from a simulator and the robot is real.
+        producer.simulated |= args.sim_camera.is_some();
         tracing::info!(
             name = producer.name.as_deref().unwrap_or("unknown"),
             release = %producer.release,
             api_version = producer.api_version,
+            simulated = producer.simulated,
             "producing as"
         );
 
@@ -359,7 +370,12 @@ fn main() -> ExitCode {
                 ),
                 Some(meta) => {
                     if let Some(relay) =
-                        mediad::relay::Relay::new(&args.rendezvous_url, &args.token, meta)
+                        mediad::relay::Relay::new(
+                            &args.rendezvous_url,
+                            &args.token,
+                            meta,
+                            sockets.clone(),
+                        )
                     {
                         // The bridge is a *consumer* of the signalling server this same process
                         // runs, so it has to be told the port `--port` chose rather than assuming
@@ -428,12 +444,38 @@ fn main() -> ExitCode {
             }
         };
 
+        // A recorder or perception process asks the local Unix socket for one raw frame. It is
+        // deliberately not the datachannel: a snapshot is camera-sized, and control has to stay
+        // prompt even while a slow local reader is being served. `npu-bringup.md` names this.
+        let (frame_lock, frame_listener) = match mediad::frame::bind(&args.frame_socket).await {
+            Ok(bound) => bound,
+            Err(error) => {
+                tracing::error!(error = %error, "cannot bind media.frame; refusing a partial start");
+                return ExitCode::FAILURE;
+            }
+        };
+        let frame_source = frames.clone();
+        // The mount angle every frame header carries — and zero when the pipeline was asked to
+        // flip, for the detector's sampler and the JPEG streamer's reason: those pixels arrive
+        // upright already, and turning them twice is a picture on its side with nothing to say why.
+        let frame_rotate = if args.flip_in_pipeline { 0 } else { rotate };
+        tokio::spawn(async move {
+            let _lock = frame_lock;
+            if let Err(error) = mediad::frame::serve(frame_listener, frame_source, frame_rotate).await
+            {
+                tracing::error!(error = %format!("{error:#}"), "media.frame endpoint stopped");
+            }
+        });
+
         // After the pipeline, because it meters the pipeline's own frames — and only with a real
         // camera, since a test pattern has no sensor to write and the loop would spend the daemon's
         // life reporting that it cannot.
         //
         // `_exposure` is the handle that stops the thread; it lives as long as this scope, which is
         // as long as the daemon.
+        // V4L2 controls through `ioctl`, so it exists only where a real camera can. Nothing else
+        // in this function cares: the other two sources have no sensor to meter.
+        #[cfg(target_os = "linux")]
         let _exposure = match (&source, args.no_auto_exposure) {
             (mediad::pipeline::Source::Camera(camera), false) => Some(mediad::exposure::spawn(
                 camera.device.clone(),
@@ -470,7 +512,7 @@ fn main() -> ExitCode {
             // to flip, in which case they are upright already and the sampler must not turn them
             // again.
             let sampler_turn = if args.flip_in_pipeline {
-                duck_detect::Turn::None
+                uyvy::Turn::None
             } else {
                 turn
             };
@@ -544,7 +586,7 @@ fn main() -> ExitCode {
                 jpeg: mediad::stream::jpeg_encoder(
                     frames.clone(),
                     if args.flip_in_pipeline {
-                        duck_detect::Turn::None
+                        uyvy::Turn::None
                     } else {
                         turn
                     },
@@ -648,12 +690,18 @@ fn main() -> ExitCode {
     })
 }
 
-/// `mediad` is a Linux daemon: it drives GStreamer against a Rockchip VPU and a V4L2 capture path.
-/// The rest of the crate is portable and its tests run anywhere, which is why this is a stub rather
-/// than a `cfg` on the whole crate.
-#[cfg(not(target_os = "linux"))]
+/// Built without a pipeline: the rest of the crate is portable and its tests run anywhere, which is
+/// why this is a stub rather than a `cfg` on the whole crate.
+///
+/// The message names the way out, because the shape of this failure is somebody following the
+/// simulator's instructions and getting a daemon that exits with no picture and no reason.
+#[cfg(not(any(target_os = "linux", feature = "gstreamer")))]
 fn main() -> ExitCode {
     let _ = Args::parse();
-    eprintln!("mediad runs on the robot; this host is not Linux");
+    eprintln!(
+        "this mediad was built without a pipeline, so it has no camera, no console and no \
+         WebRTC.\nOn a robot that cannot happen. Here, build it with GStreamer:\n\n    brew \
+         install gstreamer\n    cargo build -p mediad --features gstreamer\n"
+    );
     ExitCode::FAILURE
 }

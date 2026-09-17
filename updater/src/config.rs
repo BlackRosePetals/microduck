@@ -47,6 +47,18 @@ pub struct Config {
     /// rollback (`docs/design/updater-design.md` §5.7).
     pub state_dir: PathBuf,
 
+    /// Where fetched policies are kept: one directory per `org/name/revision`, outside every
+    /// release directory so a policy somebody chose survives an update and a rollback
+    /// (`docs/design/updater-design.md` §5.7).
+    ///
+    /// **Configurable because it was a constant, and a constant is right exactly once.**
+    /// `/var/lib/robot/policies` is correct on a board and unwritable on the laptop the twin runs
+    /// on, so every `policy.fetch` against a simulated duck refused with `Permission denied (os
+    /// error 13)` naming a path no simulator should ever have been given. The default is still
+    /// the board's, so nothing in a release changes; `scripts/duck-sim` sets it per duck.
+    #[serde(default = "default_policy_library")]
+    pub policy_library: PathBuf,
+
     /// Where `robotd` listens. Used by every `health = { probe = "socket" }` component
     /// and by the pre-restart `safeToRestart` query.
     ///
@@ -333,6 +345,10 @@ fn default_robot_socket() -> PathBuf {
     PathBuf::from("/run/robotd.sock")
 }
 
+fn default_policy_library() -> PathBuf {
+    PathBuf::from(crate::policy::LIBRARY_ROOT)
+}
+
 impl Config {
     /// Parse from TOML text. Always validated — an invalid config must not be
     /// constructible.
@@ -428,6 +444,16 @@ impl Config {
             return bad(format!(
                 "state_dir must be absolute, got {}",
                 self.state_dir.display()
+            ));
+        }
+
+        // Same rule as `state_dir`, for the same reason: this is resolved by a daemon whose
+        // working directory is not anybody's, and a relative path there is a directory nobody
+        // meant to write to.
+        if !self.policy_library.is_absolute() {
+            return bad(format!(
+                "policy_library must be absolute, got {}",
+                self.policy_library.display()
             ));
         }
 
@@ -748,6 +774,42 @@ mod tests {
 
         assert!(AutoApply::All.permits(true), "all must include mandatory");
         assert!(AutoApply::All.permits(false));
+    }
+
+    /// A board's config says nothing about the policy library and must keep getting the board's
+    /// path; a twin's says where it can actually write, and must be believed. Both halves matter:
+    /// the default is what every release depends on, and the override is the whole reason this
+    /// stopped being a constant — `/var/lib/robot/policies` is unwritable on the laptop the
+    /// simulator runs on, and a `policy.fetch` there refused with `Permission denied`.
+    #[test]
+    fn policy_library_defaults_to_the_board_and_can_be_moved() {
+        let base = r#"
+            trusted_keys_dir = "/etc/robot/keys"
+            hw_rev = 1
+            state_dir = "/var/lib/robot/updater"
+            [component.daemon]
+            install_dir = "/opt/robot/daemon"
+            source = { type = "local_dir", path = "/var/tmp/rel" }
+            on_apply = { action = "none" }
+        "#;
+        assert_eq!(
+            Config::from_toml(base).unwrap().policy_library,
+            PathBuf::from(crate::policy::LIBRARY_ROOT),
+            "a config that does not mention it must still get the board's library"
+        );
+
+        let moved = format!("policy_library = \"/tmp/ducks/duck-a/policies\"\n{base}");
+        assert_eq!(
+            Config::from_toml(&moved).unwrap().policy_library,
+            PathBuf::from("/tmp/ducks/duck-a/policies")
+        );
+
+        let relative = format!("policy_library = \"policies\"\n{base}");
+        let why = Config::from_toml(&relative).unwrap_err().to_string();
+        assert!(
+            why.contains("policy_library must be absolute"),
+            "a relative library is a directory nobody meant to write to: {why}"
+        );
     }
 
     /// The default has to be `mandatory`: a config that omits the field still needs to

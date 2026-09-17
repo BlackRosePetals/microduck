@@ -1351,7 +1351,7 @@ impl Engine {
         // out from under it. `None` — a robot that did not answer — prunes nothing at all.
         let in_use = self.robot.policy_paths(ROBOT_QUERY_TIMEOUT).await;
         crate::policy::fetch(
-            std::path::Path::new(crate::policy::LIBRARY_ROOT),
+            &self.config.policy_library,
             repo,
             revision,
             file,

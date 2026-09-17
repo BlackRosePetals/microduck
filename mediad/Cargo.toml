@@ -5,10 +5,22 @@ edition.workspace = true
 license.workspace = true
 description = "Camera, mic, WebRTC — and the remote gateway"
 
-# GStreamer is Linux-only here, the way `padd`'s evdev tap is. The daemon runs on the robot; the
-# route table, the session pipe and the upstream pool are portable and their tests run on a laptop.
-# Gating by target rather than by feature keeps `cargo test` honest on both — a feature that is off
-# by default is a module nobody compiles.
+# GStreamer is assumed on Linux, the way `padd`'s evdev tap is. The daemon runs on the robot; the
+# route table, the session pipe, the upstream pool and the relay are portable and their tests run on
+# a laptop. Gating by target rather than by feature keeps `cargo test` honest — a feature that is
+# off by default is a module nobody compiles.
+#
+# **And off Linux the same pipeline is one `brew install gstreamer` away, behind `--features
+# gstreamer`.** GStreamer is not the Linux part; the *capture* half is — `v4l2src`, the driver's
+# buffer pool, the sensor mode — and that is about 230 lines of `pipeline.rs`. The rest is an
+# appsrc, a tee, an appsink and `webrtcsink`, which run wherever they are installed. Since
+# `Source::Sim` exists there is something real to point them at: a duck in MuJoCo on a developer's
+# machine is otherwise a robot with no video, no console and nothing in its owner's robot list.
+#
+# Off by default there, deliberately. Homebrew's `gstreamer` is one merged formula that pulls gtk4
+# and ffmpeg with it, and somebody working on `robotd` should not install it to run `cargo check`.
+# The cost is the one the note above warns about: no CI job compiles this combination, so it is a
+# developer running it that keeps it working.
 #
 # This is the second C dependency to reach the board, after libudev for `gilrs` in `padd`, and it is
 # much larger: `scripts/cross-sysroot.sh` exists for it. `ci-cross-deps.sh` says of the first that
@@ -26,11 +38,16 @@ duck-ipc-proto = { path = "../duck-ipc-proto" }
 # through, so the schema, the defaults and the editor cannot drift from what is read here.
 robotd-params = { path = "../robotd-params" }
 anyhow = "1"
+# `getgrnam` and `chown`, to hand the frame socket to the `robot` group after binding — the same
+# thing `tof` and `padd` do with theirs. Mode 0660 alone would leave it `mediad:mediad`, and the
+# operator is only ever added to `robot`.
+libc = "0.2"
 # The detector itself: the letterbox+turn, the NPU binding, the ONNX fallback and the decoder.
 duck-detect = { path = "../duck-detect" }
-# JPEG for the frame stream. Same crate and same feature `duck-detect` already uses, so
-# this adds a feature to a build rather than a dependency to the tree.
-image = { version = "0.25", default-features = false, features = ["jpeg"] }
+# The sampler both the detector and the snapshot routes take a frame through.
+uyvy = { path = "../uyvy" }
+# JPEG for the frame stream and PNG for lossless console snapshots.
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 # The console's one route. Already in `Cargo.lock` — `updater` uses it for its test mirror — so it
 # is known-good against this toolchain and the cross build. The alternative was a hand-rolled
 # HTTP/1.1 responder: about sixty lines of hand-written request parsing bound to 0.0.0.0, written to
@@ -97,6 +114,29 @@ gstreamer-webrtc = { version = "0.24", features = ["v1_22"] }
 # bindings rather than a hand-written GType lookup.
 gstreamer-video = { version = "0.24", features = ["v1_22"] }
 glib = "0.21"
+
+# The pipeline on a machine that is not the robot. See the note at the top of this file.
+#
+# Named for what it needs rather than for what it is for: the answer to "why will this not build" is
+# `brew install gstreamer`, which a feature called `sim-media` would not say.
+[features]
+gstreamer = [
+    "dep:gstreamer",
+    "dep:gstreamer-app",
+    "dep:gstreamer-video",
+    "dep:gstreamer-webrtc",
+    "dep:glib",
+]
+
+# The same four crates, optional, everywhere that is not the robot's OS. A second target table
+# rather than making the Linux ones optional, so Linux is exactly as it was: no feature to remember,
+# and no way to build a `mediad` for a board that cannot stream.
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+gstreamer = { version = "0.24", features = ["v1_22"], optional = true }
+gstreamer-app = { version = "0.24", features = ["v1_22"], optional = true }
+gstreamer-webrtc = { version = "0.24", features = ["v1_22"], optional = true }
+gstreamer-video = { version = "0.24", features = ["v1_22"], optional = true }
+glib = { version = "0.21", optional = true }
 
 [dev-dependencies]
 # `[media]` from a real file on disk, which is how `config::load`'s fall-back-to-defaults rule is

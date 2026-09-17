@@ -17,7 +17,6 @@
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::style::Color;
 
 /// The baked model, produced by `scripts/bake-duck-mesh.py`. Committed rather than
 /// built, because building it needs the app repository and numpy, and CI has neither.
@@ -663,42 +662,18 @@ impl DuckView {
         }
     }
 
-    /// Pixels → cells. `▀` is two vertically stacked pixels: foreground paints the top
-    /// one, background the bottom. Where only one of the pair is lit the other stays
-    /// the terminal's own background, so the robot sits on whatever theme is running.
+    /// Pixels → cells, through the shared half-block blitter. The mask is this view's own:
+    /// where nothing was rasterized the terminal's background shows through, so the robot sits
+    /// on whatever theme is running rather than in a black rectangle.
     fn blit(&self, area: Rect, buf: &mut Buffer) {
         let w = area.width as usize;
-        for row in 0..area.height {
-            for col in 0..w {
-                let top = self.pixel(col, row as usize * 2, w);
-                let bottom = self.pixel(col, row as usize * 2 + 1, w);
-                let Some(cell) = buf.cell_mut((area.x + col as u16, area.y + row)) else {
-                    continue;
-                };
-                match (top, bottom) {
-                    (Some(t), Some(b)) => {
-                        cell.set_symbol("▀").set_fg(rgb(t)).set_bg(rgb(b));
-                    }
-                    (Some(t), None) => {
-                        cell.set_symbol("▀").set_fg(rgb(t));
-                    }
-                    (None, Some(b)) => {
-                        cell.set_symbol("▄").set_fg(rgb(b));
-                    }
-                    (None, None) => {}
-                }
-            }
-        }
+        crate::cells::blit(area, buf, |x, y| self.pixel(x, y, w));
     }
 
     fn pixel(&self, x: usize, y: usize, w: usize) -> Option<[u8; 3]> {
         let i = y * w + x;
         (*self.lit.get(i)?).then(|| self.pixels[i])
     }
-}
-
-fn rgb(c: [u8; 3]) -> Color {
-    Color::Rgb(c[0], c[1], c[2])
 }
 
 /// The pose, reduced to one comparable number. Angles are quantized to ~0.3° first:
