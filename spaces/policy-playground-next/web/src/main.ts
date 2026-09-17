@@ -319,6 +319,33 @@ function el<K extends keyof HTMLElementTagNameMap>(
   return node;
 }
 
+/**
+ * The name this policy takes once it is on the duck.
+ *
+ * `skillFor` builds it from the *fetched* manifest, which this page has not read yet — so this is
+ * the same transformation applied to the name the catalogue already has. It agrees for every
+ * policy published so far, because both start from the manifest's `name`; where it does not, the
+ * card simply does not say "on your duck", which is a missing tick rather than a wrong one.
+ */
+function skillName(policy: Policy): string {
+  return policy.name.replaceAll(" ", "-");
+}
+
+/**
+ * Two names for the same trick, compared the way a person would.
+ *
+ * The duck's shipped skills are `kick_left` and `roulade`; a community one installed from here is
+ * `polite-bow`; and the catalogue has already turned both separators into spaces to make a card
+ * heading. Comparing any two of those literally says they are different tricks, and the tick that
+ * says "you already have this" never appears on the three every duck ships with.
+ */
+const sameTrick = (name: string): string => name.toLowerCase().replace(/[-_\s]+/g, "-");
+
+function alreadyOn(policy: Policy): boolean {
+  const wanted = sameTrick(skillName(policy));
+  return state.onTheDuck.some((skill) => sameTrick(skill.name) === wanted);
+}
+
 function card(policy: Policy): HTMLElement {
   // Either reason not to offer a button: the daemon drives it, or it has no ending. The card says
   // which, in the same place, because to a reader they are the same answer — "not this one".
@@ -332,6 +359,7 @@ function card(policy: Policy): HTMLElement {
   const facts = el("p", "card-facts");
   facts.append(el("span", "chip", howLong(policy)));
   if (policy.official) facts.append(el("span", "chip chip-official", "made by Pollen"));
+  if (alreadyOn(policy)) facts.append(el("span", "chip chip-live", "✓ on your duck"));
   if (policy.forRobot) facts.append(el("span", "chip chip-bad", `for a ${policy.forRobot}`));
   if (needsALength(policy) && !blocked) facts.append(el("span", "chip", `held for ${HOLD_SECONDS}s`));
   node.append(facts);
@@ -342,7 +370,15 @@ function card(policy: Policy): HTMLElement {
   }
 
   const mine = state.busy === policy.key;
-  const button = el("button", "go", mine ? (state.stage ?? "…") : "Put it on my duck");
+  // A trick already on the duck keeps its button — pressing it again fetches the current file and
+  // replaces what is there, which is how somebody picks up a policy that has been retrained. But
+  // it stops shouting: the loud yellow one is for tricks the duck does not have yet.
+  const on = alreadyOn(policy);
+  const button = el(
+    "button",
+    on ? "go go-again" : "go",
+    mine ? (state.stage ?? "…") : on ? "Get it again" : "Put it on my duck",
+  );
   button.disabled = !state.session || state.busy !== null;
   if (mine) button.classList.add("go-busy");
   button.addEventListener("click", () => void putOnDuck(policy));

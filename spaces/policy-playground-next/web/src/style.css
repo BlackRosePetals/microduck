@@ -145,3 +145,6 @@ h2 { font-size: 20px; margin: 30px 0 12px; }
   padding: 0 12px;
   font-size: 15px;
 }
+
+/* Already on the duck: still pressable, no longer shouting. */
+.go-again { background: #f1f3f7; border-color: var(--line); color: var(--dim); font-weight: 500; }
