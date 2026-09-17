@@ -108,3 +108,12 @@ h2 { font-size: 20px; margin: 30px 0 12px; }
 
 .rest { margin-top: 34px; }
 .rest summary { cursor: pointer; font-size: 20px; font-weight: 600; margin-bottom: 10px; }
+
+.card-said {
+  margin: 0;
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: #fff6d8;
+  border: 1px solid #f0dfa0;
+  font-size: 15px;
+}

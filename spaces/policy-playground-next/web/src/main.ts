@@ -48,6 +48,15 @@ interface State {
   busy: string | null;
   stage: string | null;
   said: string | null;
+  /**
+   * Which card the message belongs to, or `null` for the page.
+   *
+   * **The Gradio page printed every answer in one line at the top, two thousand pixels from the
+   * button, and that is why a refusal read as a button that did nothing.** Rebuilding that here
+   * took one afternoon: "Getting it…" flipped back to "Teach my duck" and the reason was on
+   * screen, above the fold, unread. An answer belongs where the question was asked.
+   */
+  saidFor: string | null;
   log: string[];
 }
 
@@ -63,6 +72,7 @@ const state: State = {
   busy: null,
   stage: null,
   said: null,
+  saidFor: null,
   log: [],
 };
 
@@ -94,9 +104,11 @@ async function connect(): Promise<void> {
     state.session = session;
     state.duckName = duck?.name ?? "your duck";
     state.said = `${state.duckName} is ready.`;
+    state.saidFor = null;
     await readTheDuck();
   } catch (e) {
     state.said = `Could not reach your duck. ${e instanceof Error ? e.message : String(e)}`;
+    state.saidFor = null;
     note(String(e));
   } finally {
     state.busy = null;
@@ -110,6 +122,7 @@ async function disconnect(): Promise<void> {
   state.duckName = null;
   state.onTheDuck = [];
   state.said = "Let go of your duck.";
+  state.saidFor = null;
   render();
 }
 
@@ -171,17 +184,20 @@ async function teachAndDo(policy: Policy): Promise<void> {
   // pressing a button that does nothing.
   if (!session) {
     state.said = "Wake your duck up first, then press a trick.";
+    state.saidFor = policy.key;
     render();
     return;
   }
   const blocked = notATrick(policy);
   if (blocked) {
     state.said = blocked;
+    state.saidFor = policy.key;
     render();
     return;
   }
 
   note(`pressed: ${policy.name} (${policy.key})`);
+  if (state.saidFor === policy.key) state.said = null;
   state.busy = policy.key;
   try {
     state.stage = "Getting it…";
@@ -212,12 +228,14 @@ async function teachAndDo(policy: Policy): Promise<void> {
     const ran = await session.call("robot.do", { skill: name });
     const notRun = refusal(ran);
     state.said = notRun
-      ? `${policy.name} is on your duck, but it would not do it: ${notRun}`
-      : `${policy.name}! ${state.duckName ?? "Your duck"} is doing it.`;
+      ? `It is on your duck, but it would not do it: ${notRun}`
+      : `${state.duckName ?? "Your duck"} is doing it!`;
+    state.saidFor = policy.key;
     await readTheDuck();
   } catch (e) {
     const why = e instanceof RpcError ? e.message : e instanceof Error ? e.message : String(e);
-    state.said = `${policy.name} did not work: ${why}`;
+    state.said = `That did not work: ${why}`;
+    state.saidFor = policy.key;
   } finally {
     state.busy = null;
     state.stage = null;
@@ -235,9 +253,11 @@ async function doAgain(name: string): Promise<void> {
     await waitForHome();
     const ran = await session.call("robot.do", { skill: name });
     const notRun = refusal(ran);
-    state.said = notRun ? `It would not do ${name}: ${notRun}` : `${name}!`;
+    state.said = notRun ? `It would not do it: ${notRun}` : `${name}!`;
+    state.saidFor = `again:${name}`;
   } catch (e) {
-    state.said = `It would not do ${name}: ${e instanceof Error ? e.message : String(e)}`;
+    state.said = `It would not do it: ${e instanceof Error ? e.message : String(e)}`;
+    state.saidFor = `again:${name}`;
   } finally {
     state.busy = null;
     state.stage = null;
@@ -285,6 +305,7 @@ function card(policy: Policy): HTMLElement {
   if (mine) button.classList.add("go-busy");
   button.addEventListener("click", () => void teachAndDo(policy));
   node.append(button);
+  if (state.saidFor === policy.key && state.said) node.append(el("p", "card-said", state.said));
   return node;
 }
 
@@ -347,6 +368,9 @@ function shelf(): HTMLElement | null {
     row.append(button);
   }
   box.append(row);
+  // The shelf's answers land here for the same reason a card's land on the card: `doAgain` sets
+  // `saidFor` too, and a message nothing renders is a message that does not exist.
+  if (state.saidFor?.startsWith("again:") && state.said) box.append(el("p", "card-said", state.said));
   return box;
 }
 
@@ -356,10 +380,7 @@ function render(): void {
   root.replaceChildren();
   root.append(header());
 
-  if (state.said) {
-    const said = el("p", "said", state.said);
-    root.append(said);
-  }
+  if (state.said && state.saidFor === null) root.append(el("p", "said", state.said));
 
   if (!state.session) {
     root.append(
