@@ -388,11 +388,36 @@ fn permits(call: &proto::Call) -> bool {
         // non-event rather than a lost login.
         AccountLogin(_) | AccountStatus | AccountLogout => true,
 
-        // Power to the joints. A phone button that drops the robot on the floor is not one to
-        // offer, and `robot.init` is its counterpart: standing a robot up moves every joint at once,
-        // which wants the person doing it to be looking at the robot rather than at a screen. Both
-        // are `robotctl` on the robot, deliberately.
-        RobotInit | RobotRelax | RobotRebootMotors(_) => false,
+        // **Standing the robot up, which is how anything else here starts.**
+        //
+        // Refused until the phone app was used, on the grounds that standing a robot up moves
+        // every joint at once and wants the person doing it to be looking at the robot rather
+        // than at a screen. The second half of that is the argument this file makes *for*
+        // routing things — ten metres of radio range means whoever tapped it is looking at the
+        // robot — and it is what lets `robot.do`, `robot.loadPolicy` and `policy.install`
+        // through. It was never a reason to refuse this one.
+        //
+        // What made it worth changing is what the refusal cost: a robot that has not been
+        // started ignores every other call this transport carries, so the app could show a
+        // robot's health, its wifi and its gaits and not make it move — and the way out was to
+        // go and find the gamepad. That is the opposite of what the app is for.
+        //
+        // `robotd` already publishes what a client needs to choose correctly: `homed` and
+        // `sitting` on `robot.policies`, added in API v30 and v31 for exactly this — a duck on
+        // its feet stands with `init`, a duck in its seat is held there by the `sit_toggle`
+        // latch and `init` argues with it rather than winning. A client that has those does not
+        // have to guess.
+        RobotInit => true,
+
+        // **`relax` stays refused, and the asymmetry is the point.** Standing up is controlled:
+        // the joints go where they are told. Relaxing is a robot that was holding itself up and
+        // now is not, which on a phone is a button whose failure mode is the floor. `init` has
+        // no such mode, and a refusal that covered both was treating "moves the joints" as the
+        // hazard when the hazard is "stops holding them".
+        //
+        // `robot.rebootMotors` keeps it company: a servo bus cycled while the robot is standing
+        // is the same fall by another route.
+        RobotRelax | RobotRebootMotors(_) => false,
 
         // `robot.stop` deserves its own line, because refusing it looks wrong. An emergency stop
         // in the app is exactly what someone reaches for, and §6 does say local should preempt
