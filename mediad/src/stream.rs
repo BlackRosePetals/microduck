@@ -771,6 +771,7 @@ mod tests {
             serial: Some("3fa1c51b".to_owned()),
             release: "0.10.0".to_owned(),
             api_version: 23,
+            simulated: false,
         };
         let line = hello(&config("wss://x/frames"), &producer, 90);
         let parsed: serde_json::Value = serde_json::from_str(&line).unwrap();
@@ -899,6 +900,7 @@ mod tests {
                 serial: None,
                 release: "0.10.0".to_owned(),
                 api_version: 23,
+                simulated: false,
             },
             90,
             dir.path().join("hf-token"),

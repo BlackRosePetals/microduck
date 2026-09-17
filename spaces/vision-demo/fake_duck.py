@@ -257,6 +257,15 @@ class FakeDuck:
                     "name": NAME,
                     "kind": "microduck",
                     "release": "fake",
+                    # The same key a duck in MuJoCo sets, and for the same reason: this is not a
+                    # robot, and the listing should say so rather than leaving it to `release`
+                    # being the word "fake". `docs/design/simulation.md` §8.
+                    #
+                    # This process and `scripts/duck-sim` are not the same thing and both are worth
+                    # having: the simulator is a real duck and needs MuJoCo, a cargo build and a
+                    # GStreamer; this needs a token and `uv run`, and exercises the Space rather
+                    # than the robot.
+                    "simulated": True,
                     "api_version": 23,
                 },
             }

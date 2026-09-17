@@ -101,6 +101,12 @@ class Robot:
         self.name: str = meta.get("name") or entry.get("robotName") or "a robot with no name"
         self.kind: str | None = meta.get("kind")
         self.release: str = meta.get("release") or "release unknown"
+        # **A duck in MuJoCo, not one on a desk.** `mediad` sets this from `configd --simulated`;
+        # `docs/design/simulation.md` §8 is why it is one declared fact rather than something each
+        # client works out. Accepted as a bool or as the string a `GstStructure` turns it into,
+        # because those are the two ways it reaches a listing and neither is this Space's choice.
+        flag = meta.get("simulated")
+        self.simulated: bool = flag is True or str(flag).lower() == "true"
         self.busy: bool = bool(entry.get("busy"))
         # Who has it, when it is busy. The rendezvous reports the *consumer's* name here, which
         # is why this Space sends a `consumer_label` worth reading.
@@ -113,8 +119,17 @@ class Robot:
         `busy` matters more than it looks. One consumer at a time is the rendezvous's rule, so a
         robot somebody's console is already watching will refuse a session — and a dropdown that
         did not say so would make that look like a fault here.
+
+        `simulated` matters for the opposite reason: nothing here goes wrong, and somebody drives a
+        duck in MuJoCo believing it is the one on the shelf.
         """
-        bits = [self.name, self.release]
+        bits = [self.name]
+        # Second, before anything about availability: which robot this is matters more than whether
+        # it happens to be busy, and somebody scanning a dropdown of real ducks should not have to
+        # read to the end of the line to find the one that is not real.
+        if self.simulated:
+            bits.append("simulated")
+        bits.append(self.release)
         if self.busy:
             bits.append(f"busy with {self.active_app or 'something'}")
         if self.age is not None and self.age > 60:

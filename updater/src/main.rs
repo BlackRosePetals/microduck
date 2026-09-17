@@ -46,6 +46,15 @@ struct Args {
     #[arg(long, global = true)]
     robot_socket: Option<PathBuf>,
 
+    /// The account credential this robot signs in to, and the file `mediad` reads back.
+    ///
+    /// On a robot the default is right and nobody types it. It exists for the simulator, where the
+    /// daemons run as a person rather than as root and `/etc/robot` is not writable — see
+    /// `docs/robot/simulation.md`. `mediad --token` is the same flag on the reading side, and the
+    /// two must name one file or the duck signs in and never registers.
+    #[arg(long, global = true, default_value = updater::account::DEFAULT_PATH)]
+    token: PathBuf,
+
     /// Run boot recovery, then exit without serving.
     ///
     /// Note this **performs** recovery rather than reporting it: `record_boot` advances every armed
@@ -606,8 +615,11 @@ async fn serve(args: Args) -> ExitCode {
     let check_interval = config_check_interval;
     let auto_apply = config_auto_apply;
 
-    let server = std::sync::Arc::new(updater::ipc::Server::with_policy(
-        engine, allow_uids, allow_gids,
+    let server = std::sync::Arc::new(updater::ipc::Server::with_policy_at(
+        engine,
+        allow_uids,
+        allow_gids,
+        args.token.clone(),
     ));
     let socket = args.socket.clone();
 

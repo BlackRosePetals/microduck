@@ -2633,6 +2633,12 @@ fn run_system(socket: &Path, command: SystemCommand) -> Result<(), Failure> {
         SystemCommand::Info { .. } => {
             let info: proto::SystemInfoResult = decode(&result)?;
             println!("name    {}", info.name);
+            // First, and only when true. Everything below this line reads the same for a duck in
+            // MuJoCo as for one on the desk — which is the point of the simulator, and is also how
+            // somebody ends up debugging the wrong robot.
+            if info.simulated {
+                println!("body    MuJoCo (this is a simulated duck)");
+            }
             println!(
                 "serial  {}",
                 // A board with no readable SoC serial, not a board nobody provisioned: the
@@ -4852,13 +4858,18 @@ mod tests {
         }
     }
 
+    /// The three fields these tests are about, and `..Default::default()` for the rest.
+    ///
+    /// **Spelling every field is what broke the build.** This helper cares about the slots and
+    /// whether the policy is driving; it listed the others because they existed, so adding
+    /// `homed` and `sitting` to the wire — a change no part of `robotctl` reads — failed to
+    /// compile a `robotctl` test. A helper that names only what it asserts on does not.
     fn policies_of(slots: Vec<proto::PolicySlot>) -> proto::PoliciesResult {
         proto::PoliciesResult {
             mode: "walk".into(),
             enabled: true,
             slots,
-            skills: Vec::new(),
-            change_error: None,
+            ..Default::default()
         }
     }
 
