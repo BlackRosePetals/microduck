@@ -349,7 +349,15 @@ pub const JSONRPC_VERSION: &str = "2.0";
 ///
 /// `None` is "this robot does not say", which is what an older `robotd` sends and what a client
 /// must fall back from rather than read as `false`.
-pub const API_VERSION: u32 = 30;
+/// # v31 — `sitting`, because "stand up" is two calls
+///
+/// One more `Option<bool>` on [`PoliciesResult`], beside `homed` and for the same reason: a client
+/// choosing what to send needs the robot's answer rather than its own guess. A duck on its feet
+/// stands with `robot.init`; a duck in its seat is held there by the `sit_toggle` latch, and
+/// `init` argues with that rather than winning. Without it a client either guesses — sitting a
+/// standing duck down every other press — or asks somebody to reach for the pad, which is what the
+/// playground did.
+pub const API_VERSION: u32 = 31;
 
 /// The observation width every policy this robot family runs is built against.
 ///
@@ -2350,6 +2358,16 @@ pub struct PoliciesResult {
     /// question asked once, on the read a client already makes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub homed: Option<bool>,
+
+    /// Whether the duck is parked in its seat, or `None` from a robot too old to say.
+    ///
+    /// **"Stand up" is two different calls, and this is how a client tells which.** A duck on its
+    /// feet comes up with `robot.init`. A duck in its seat is held there by the `sit_toggle` latch,
+    /// which the daemon drives itself — `init` argues with that rather than winning, and what ends
+    /// a sit is `robot.do sit_toggle`. A client that guessed would sit a standing duck down every
+    /// other press.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sitting: Option<bool>,
 
     /// Why the last policy change failed, when it was not a change to one slot.
     ///
