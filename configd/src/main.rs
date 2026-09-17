@@ -72,6 +72,25 @@ struct Args {
     /// between them.
     #[arg(long)]
     fake_pads: bool,
+
+    /// This robot is a duck in MuJoCo. The value is the serial it answers with.
+    ///
+    /// **A simulated robot needs an identity for the same reasons a real one does**, and it has
+    /// nowhere to read one from: there is no SoC and no devicetree, `/etc/machine-id` is one value
+    /// per machine so four ducks in one scene would share it, and macOS has none at all. So the
+    /// simulator names them, one per duck and stable across restarts: `sim-duck-a`.
+    ///
+    /// That identity is load-bearing twice. The robot's default name derives from it, so a duck in
+    /// the twin is called `duck-3f9c` as a robot is rather than falling back to the laptop's
+    /// hostname. And it is what `mediad` registers with the rendezvous as `hardware_id`, the key
+    /// the service evicts an older producer of the same robot on — so a restarted sim duck replaces
+    /// itself in the listing instead of appearing twice (`remote-access-design.md` §3.7).
+    ///
+    /// One flag rather than a `--simulated` beside a `--serial`, because those two can disagree: a
+    /// real robot handed a serial override is a robot lying about which one it is, and there is no
+    /// reason to build the switch that allows it.
+    #[arg(long, value_name = "SERIAL")]
+    simulated: Option<String>,
 }
 
 /// Who may change this robot's configuration.
@@ -159,6 +178,8 @@ struct Service {
     /// Read once at startup rather than per call: it comes from the SoC's fuses by way of the
     /// bootloader, so it cannot change while this process is running.
     serial: Option<String>,
+    /// Whether that serial names a duck in MuJoCo. See [`Args::simulated`].
+    simulated: bool,
 }
 
 fn hostname() -> String {
@@ -210,7 +231,11 @@ async fn main() -> ExitCode {
 
     // The identity, and the name that hangs off it. A board with no readable serial keeps the old
     // behaviour — the hostname — rather than losing its name over a missing devicetree property.
-    let serial = configd::identity::serial();
+    // A simulated duck's serial comes from the flag rather than the devicetree, and everything
+    // downstream — the derived name, `system.info`, what `mediad` registers with — cannot tell the
+    // difference. Which is the point of putting it here rather than teaching each of them.
+    let simulated = args.simulated.is_some();
+    let serial = args.simulated.clone().or_else(configd::identity::serial);
     let default_name = match &serial {
         Some(serial) => configd::identity::default_name(serial),
         None => {
@@ -223,13 +248,14 @@ async fn main() -> ExitCode {
             name
         }
     };
-    tracing::info!(serial = ?serial, %default_name, "identity");
+    tracing::info!(serial = ?serial, %default_name, simulated, "identity");
 
     let service = Arc::new(Service {
         net,
         pads,
         store: Store::new(args.state_dir.join("config.json"), default_name),
         serial,
+        simulated,
         policy: PeerPolicy {
             owner_uid: unsafe { libc::getuid() },
             allow_uids: args
@@ -471,6 +497,7 @@ async fn dispatch(
             &proto::SystemInfoResult {
                 name: service.store.name(),
                 serial: service.serial.clone(),
+                simulated: service.simulated,
                 uptime_seconds: uptime_seconds(),
             },
         ),

@@ -654,6 +654,18 @@ struct RobotState {
     /// distinguishes them.
     homed: AtomicBool,
 
+    /// The duck is parked in its seat, latched there by `sit_toggle`.
+    ///
+    /// **Published because "stand up" means two different calls.** A duck on its feet stands with
+    /// `robot.init`; a duck in the seat is *held* there by a latch this daemon drives, and `init`
+    /// argues with it rather than winning. What ends a sit is `robot.do sit_toggle`, and a client
+    /// cannot know which of the two to send without this — the playground sent `init` at a seated
+    /// duck and watched the two fight.
+    ///
+    /// Not `busy`: a seated duck is parked, not travelling, which is the distinction
+    /// [`control::Controller::busy`] already draws.
+    sitting: AtomicBool,
+
     period_us: u64,
     min_achieved_hz: f64,
     stall_periods: u32,
@@ -706,6 +718,7 @@ impl RobotState {
             fallen: AtomicBool::new(false),
             moving: AtomicBool::new(false),
             homed: AtomicBool::new(false),
+            sitting: AtomicBool::new(false),
             period_us: params.period().as_micros() as u64,
             min_achieved_hz: params.update_gate.min_achieved_hz,
             stall_periods: params.update_gate.stall_periods,
@@ -2722,6 +2735,12 @@ async fn control_loop<T: RobotIo>(
         state
             .homed
             .store(bringup == Bringup::Ready, Ordering::Relaxed);
+        // Beside `homed` and for the same reason: a client deciding what to press needs the
+        // robot's answer, not its own guess. No controller means no seat to be in.
+        state.sitting.store(
+            controller.as_ref().is_some_and(|c| c.is_sitting()),
+            Ordering::Relaxed,
+        );
 
         // The policy must not start on an unconverged orientation filter — the first
         // seconds of projected gravity are whatever the filter is mid-way through deciding,
@@ -4313,6 +4332,10 @@ fn dispatch(
                 enabled: state.policy_enabled,
                 slots: state.policy_slots.load().as_ref().clone(),
                 skills: state.policies.load().skills.clone(),
+                // The same flag `robot.do` refuses on, so a client can wait for it rather than
+                // be told no and guess whether asking again would help.
+                homed: Some(state.homed.load(Ordering::Relaxed)),
+                sitting: Some(state.sitting.load(Ordering::Relaxed)),
                 change_error: state
                     .policy_change_error
                     .load_full()
@@ -7604,6 +7627,54 @@ mod tests {
         assert!(result.accepted);
         assert!(result.reason.is_none(), "{:?}", result.reason);
         assert!(intents.take_policy_change().is_some());
+    }
+
+    /// `homed` rides the read a client already makes, and it has to *move* — a field that is
+    /// always false is as useless as no field, because the thing a caller wants to know is when it
+    /// stopped being false. A client that installs a policy triggers a reload, the reload sends
+    /// the robot home, and the `robot.do` that follows is refused by its own previous call; this
+    /// is what it waits on instead.
+    #[test]
+    fn robot_policies_publishes_the_flag_robot_do_refuses_on() {
+        let s = RobotState::new(
+            &Params::default(),
+            std::path::Path::new("/test/robotd.toml"),
+            false,
+            false,
+        );
+        let intents = Arc::new(Intents::new());
+
+        let read = |s: &RobotState| -> proto::PoliciesResult {
+            dispatch(
+                s,
+                &intents,
+                proto::Id::Number(1),
+                &proto::Call::RobotPolicies,
+            )
+            .result_as()
+            .unwrap()
+        };
+
+        s.homed.store(false, Ordering::Relaxed);
+        assert_eq!(
+            read(&s).homed,
+            Some(false),
+            "a robot on its way home says so, rather than saying nothing"
+        );
+
+        s.homed.store(true, Ordering::Relaxed);
+        assert_eq!(read(&s).homed, Some(true), "and says when it has arrived");
+
+        // The seat, for the same reason and with the same shape: a client choosing between
+        // `robot.init` and `robot.do sit_toggle` has no other way to know which one stands a duck
+        // up, and guessing sits a standing one down every other press.
+        assert_eq!(read(&s).sitting, Some(false), "a duck on its feet says so");
+        s.sitting.store(true, Ordering::Relaxed);
+        assert_eq!(
+            read(&s).sitting,
+            Some(true),
+            "and a duck in its seat says so"
+        );
     }
 
     /// `robot.policies` answers for every slot, including the empty ones, and says where each

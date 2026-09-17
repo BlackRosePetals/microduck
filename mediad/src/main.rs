@@ -316,12 +316,19 @@ fn main() -> ExitCode {
         // unix-socket round trip on a boot where `configd` may not be up yet, which is why it is
         // bounded and why a failure is a warning rather than an exit.
         let sockets = args.sockets();
-        let producer =
+        let mut producer =
             mediad::producer::Producer::learn(sockets.clone(), duck_ipc_proto::build_info!()).await;
+        // **A camera that is MuJoCo is a simulated robot, whatever `configd` said.** `configd` owns
+        // the fact and this is the backstop for the one case that would be wrong: it is asked once,
+        // with a timeout, on a machine where every daemon starts at the same instant, so a late
+        // answer would register a simulated duck as hardware. The two cannot disagree — there is no
+        // arrangement in which the frames come from a simulator and the robot is real.
+        producer.simulated |= args.sim_camera.is_some();
         tracing::info!(
             name = producer.name.as_deref().unwrap_or("unknown"),
             release = %producer.release,
             api_version = producer.api_version,
+            simulated = producer.simulated,
             "producing as"
         );
 
@@ -363,7 +370,12 @@ fn main() -> ExitCode {
                 ),
                 Some(meta) => {
                     if let Some(relay) =
-                        mediad::relay::Relay::new(&args.rendezvous_url, &args.token, meta)
+                        mediad::relay::Relay::new(
+                            &args.rendezvous_url,
+                            &args.token,
+                            meta,
+                            sockets.clone(),
+                        )
                     {
                         // The bridge is a *consumer* of the signalling server this same process
                         // runs, so it has to be told the port `--port` chose rather than assuming

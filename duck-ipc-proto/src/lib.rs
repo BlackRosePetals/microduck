@@ -337,7 +337,27 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// A new variant on a tagged enum is what a robotctl built before it cannot decode, which is the
 /// one reason this is a bump rather than a note: the tap is still `padd`'s own socket, and every
 /// other client is untouched.
-pub const API_VERSION: u32 = 28;
+/// # v30 — `homed`, so a client can wait instead of guessing
+///
+/// One `Option<bool>` on [`PoliciesResult`]. `robot.do` refuses a skill while the robot is on its
+/// way to its home pose, and that refusal is a second old and resolves by itself — but from the
+/// wire it is `accepted: false` and a sentence, indistinguishable from "press Start on the pad",
+/// which stays true until somebody acts. A client that installs a policy triggers a reload,
+/// the reload sends the robot home, and the `robot.do` that follows is refused by the client's own
+/// previous call. Without this the only ways out are matching on the reason string or retrying
+/// blindly through refusals that will never clear.
+///
+/// `None` is "this robot does not say", which is what an older `robotd` sends and what a client
+/// must fall back from rather than read as `false`.
+/// # v31 — `sitting`, because "stand up" is two calls
+///
+/// One more `Option<bool>` on [`PoliciesResult`], beside `homed` and for the same reason: a client
+/// choosing what to send needs the robot's answer rather than its own guess. A duck on its feet
+/// stands with `robot.init`; a duck in its seat is held there by the `sit_toggle` latch, and
+/// `init` argues with that rather than winning. Without it a client either guesses — sitting a
+/// standing duck down every other press — or asks somebody to reach for the pad, which is what the
+/// playground did.
+pub const API_VERSION: u32 = 31;
 
 /// The observation width every policy this robot family runs is built against.
 ///
@@ -2324,6 +2344,31 @@ pub struct PoliciesResult {
     /// show what is loaded.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub skills: Vec<String>,
+    /// Whether the robot has reached its home pose, or `None` from a robot too old to say.
+    ///
+    /// **A skill is refused while this is false, and the refusal expires on its own.** That makes
+    /// it unlike every other reason `robot.do` says no: "press Start on the pad" is true until a
+    /// human acts, "no skill named …" is true until the config changes, and this one is true for
+    /// about a second. A client cannot tell them apart from `accepted: false` and a sentence, and
+    /// a client that just installed a policy is the one most likely to meet it — `robot.setSkill`
+    /// triggers a reload, a reload sends the robot home, and the `robot.do` that follows is
+    /// refused because of the call before it.
+    ///
+    /// Published here rather than on the 50 Hz stream for the reason `skills` is: it answers a
+    /// question asked once, on the read a client already makes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub homed: Option<bool>,
+
+    /// Whether the duck is parked in its seat, or `None` from a robot too old to say.
+    ///
+    /// **"Stand up" is two different calls, and this is how a client tells which.** A duck on its
+    /// feet comes up with `robot.init`. A duck in its seat is held there by the `sit_toggle` latch,
+    /// which the daemon drives itself — `init` argues with that rather than winning, and what ends
+    /// a sit is `robot.do sit_toggle`. A client that guessed would sit a standing duck down every
+    /// other press.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sitting: Option<bool>,
+
     /// Why the last policy change failed, when it was not a change to one slot.
     ///
     /// **A slot's failure is reported on the slot**; this is for the two that name none — a
@@ -3785,6 +3830,19 @@ pub struct SystemInfoResult {
     /// to its hostname for a name.
     pub serial: Option<String>,
     pub uptime_seconds: u64,
+    /// This robot is a duck in MuJoCo, not a duck on a desk.
+    ///
+    /// **One fact, declared once, so nothing downstream has to infer it.** `mediad` puts it in the
+    /// `meta` it registers with, so a simulated duck is marked as such in its owner's robot list
+    /// rather than sitting there looking like hardware somebody could walk over to; `robotctl`
+    /// says it too. The alternative was every client deciding for itself from a serial that starts
+    /// with `sim-`, which is a convention three places would have to agree on and one of them
+    /// would get wrong.
+    ///
+    /// `serde(default)` for the reason every field here has it: an older daemon does not send it,
+    /// and absent means a real robot — which is right for every robot built so far.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub simulated: bool,
 }
 
 /// Answer to [`Call::SystemSetName`].
