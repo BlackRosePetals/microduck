@@ -166,7 +166,14 @@ function refusal(result: unknown): string | null {
 
 async function teachAndDo(policy: Policy): Promise<void> {
   const session = state.session;
-  if (!session) return;
+  // Not silent. The button is disabled without a duck, so this should be unreachable — and
+  // "should be unreachable" is exactly the branch that returns quietly and leaves somebody
+  // pressing a button that does nothing.
+  if (!session) {
+    state.said = "Wake your duck up first, then press a trick.";
+    render();
+    return;
+  }
   const blocked = notATrick(policy);
   if (blocked) {
     state.said = blocked;
@@ -174,6 +181,7 @@ async function teachAndDo(policy: Policy): Promise<void> {
     return;
   }
 
+  note(`pressed: ${policy.name} (${policy.key})`);
   state.busy = policy.key;
   try {
     state.stage = "Getting it…";
@@ -439,6 +447,26 @@ async function main(): Promise<void> {
 
   if (state.signedIn) await findDucks();
 }
+
+/**
+ * Nothing fails quietly on this page.
+ *
+ * A thrown error in a click handler goes to the browser console, which nobody has open — and the
+ * card just sits there. "I pressed it and nothing happened" is the least debuggable sentence in
+ * software, and it is the one this page has already produced once. Every escape becomes a line
+ * somebody can read and a line in the log.
+ */
+window.addEventListener("error", (event) => {
+  state.said = `Something went wrong: ${event.message}`;
+  note(`uncaught: ${event.message} (${event.filename}:${event.lineno})`);
+  render();
+});
+window.addEventListener("unhandledrejection", (event) => {
+  const why = event.reason instanceof Error ? event.reason.message : String(event.reason);
+  state.said = `Something went wrong: ${why}`;
+  note(`uncaught (in a promise): ${why}`);
+  render();
+});
 
 void main();
 
