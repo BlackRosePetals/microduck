@@ -234,8 +234,25 @@ fn permits(call: &proto::Call) -> bool {
         // not exist for the first ~73s of a boot is not a control transport. The body pose and
         // the mouth ride with it: all of these are a stream of small updates, and the argument is
         // about the stream, not about any one of them.
-        RobotMove(_) | RobotHead(_) | RobotLook(_) | RobotEnable(_) | RobotPose(_)
-        | RobotMouth(_) => false,
+        RobotMove(_) | RobotHead(_) | RobotLook(_) | RobotPose(_) | RobotMouth(_) => false,
+
+        // **Not teleop either, and it sat in that group for the same reason a skill did**: it was
+        // next to them in a match arm rather than because anybody argued it belonged. It is one
+        // request — start driving, or stop — not fifty a second, so the notification budget and
+        // the latency argument above do not reach it.
+        //
+        // What makes it necessary is what `robot.init` alone turned out not to do. Standing a
+        // robot up is the *first* of the two things the gamepad's Start button does; the second
+        // is this, and without it the app could stand a robot up and then be told by every skill
+        // it asked for that the policy is not driving — press Start on the pad. Half a path is
+        // worse than none, because it looks like the whole one until it stops.
+        //
+        // `toggle` rather than a state this side chose: `padd` keeps no belief about whether the
+        // policy is driving, for the reason its own comment gives — a local on/off drifts from
+        // the robot's the moment anything else moves it, and a stale belief turns the button into
+        // one that does nothing every other press. The robot owns the state and names the one it
+        // ended in, so a client shows the answer instead of predicting it.
+        RobotEnable(_) => true,
 
         // **A skill is not teleop**, and it sat in that group for longer than it deserved. It is
         // one request — "do the bow" — not fifty a second, so the notification budget and the
@@ -762,13 +779,22 @@ mod tests {
                 head_yaw: 0.0,
                 head_roll: 0.0,
             }),
-            proto::Call::RobotEnable(proto::EnableParams {
-                on: true,
-                toggle: false,
-            }),
         ] {
             assert_eq!(upstream_for(&call), None, "{}", call.method());
         }
+    }
+
+    /// **Starting the policy is not teleop either**, and it left that arm for the same reason
+    /// `robot.do` did: one request, not a stream. It was pinned as refused here until the phone
+    /// app stood a robot up and found every skill answering "the policy is not driving — press
+    /// Start on the pad", which is the half-path `robot.init` alone leaves behind.
+    #[test]
+    fn starting_the_policy_is_reachable() {
+        let call = proto::Call::RobotEnable(proto::EnableParams {
+            on: false,
+            toggle: true,
+        });
+        assert!(upstream_for(&call).is_some(), "{}", call.method());
     }
 
     /// A refusal must be distinguishable from "no such method", because the two ask the user
