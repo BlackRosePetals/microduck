@@ -148,19 +148,19 @@ targets and none of them can send one. That is the borrow checker, not a convent
 transactions per tick, plus a third once a second:
 
 ```text
-read()          one sync_read  · IMU board + 15 servos · registers 124–136   (§2.1)
+read()          one fast sync_read · IMU board + 15 servos · regs 124–136   (§2.1)
 decide          observation → policy → targets → clamp                 (§2.2–§2.4)
-write()         one sync_write · goal positions
+write()         one sync_write     · goal positions
 publish         atomics always; a state frame only if someone subscribed     (§4.1)
 
-every 1 s       slow_sensors() · registers 144–146 · voltage + temperature   (§2.1)
+every 1 s       slow_sensors()     · registers 144–146 · voltage + temperature (§2.1)
 ```
 
 Where the data goes, once per period:
 
 ```text
   Dynamixel bus
-       │  one sync_read: IMU board + 15 servos, one transaction
+       │  one fast sync_read: IMU board + 15 servos, one transaction
        ▼
    Sensors ──────────┬──────────────────────► safety.observe ──► fallen? (debounced)
    joints, IMU       │
@@ -260,7 +260,7 @@ intended:
 
 ### 2.1 The bus layer and `RobotIo`
 
-A thin layer over `rustypot`: open, one combined `sync_read`, `sync_write` goal positions,
+A thin layer over `rustypot`: open, one combined fast `sync_read`, `sync_write` goal positions,
 torque enable, gains, the slow sensor read, and the startup register check. Written fresh
 rather than lifted, but **the numbers are borrowed from the runtime**, each with a comment
 saying so:
@@ -305,6 +305,35 @@ shutdown.
 A silent servo does not produce a short answer: `rustypot`'s `sync_read` waits for every id and
 fails the whole transaction if one does not reply. So both reads are all-or-nothing, and the
 caller keeps its previous sample rather than treating one miss as news.
+
+**Every sync read is a fast sync read** (protocol 2.0 instruction 0x8A), enabled once on the
+controller so the tick's combined read, the slow read and the startup position read all use it
+without naming it. The instruction packet is a plain sync read's; what changes is the answer.
+Instead of sixteen status packets, each with its ten-byte protocol 2.0 header and each preceded
+by that device's turnaround, the devices append their blocks to **one** status packet from the
+broadcast id. The bus turns around once per tick rather than sixteen times, which is the same
+cost `return_delay_time = 0` above exists to hold down — the register check still matters,
+because every other transaction on this bus is an ordinary one that pays it per device.
+
+It is the same all-or-nothing shape, for a new reason: the blocks arrive in one packet, so a
+device whose firmware does not implement 0x8A simply does not answer and the read times out
+rather than coming back short. **XL330 firmware must be v46 or newer**, and the `imu_to_dxl`
+board — `id 200`, the first block in the tick's read — has to implement it too.
+
+That is firmware, not software, and it is the one thing on this bus the daemon cannot talk its
+way out of — so it is `bus.fast_sync_read`, **on by default**, rather than a constant. Off, every
+sync read is a plain one and the robot behaves exactly as it did before the instruction was used
+at all; `open_bus` says so once in the journal, because otherwise a robot running the slow path
+is indistinguishable from a slow robot.
+
+The default is the brave one because getting it wrong is unambiguous rather than subtle. A device
+that does not implement 0x8A does not answer at all, so *every* read times out — not some of them
+returning something plausible. The loop reports bus drops from its first tick, `min_achieved_hz`
+(§3.4) sees an unhealthy robot, and a release that turned this on against firmware that cannot do
+it rolls itself back. A robot that predates the firmware needs one key set, once, by whoever
+notices; there is no version negotiation here and no probe at startup, because a device that does
+not answer looks exactly like one that is unpowered and a probe would have to tell those apart
+before it could say anything useful.
 
 **Board temperature is a third source, and not on the bus at all.** The hottest of the SoC's
 thermal zones, read from `sysfs` in the same once-a-second sample (`robotd/src/soc.rs`). It
