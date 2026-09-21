@@ -1676,8 +1676,30 @@ fn render_health(report: &HealthReport) -> String {
             // Its own line, next to the motors rather than merged with them: hot servos and a
             // hot board are different faults with different fixes, and a reader scanning for
             // "what is too hot here" needs to see which.
-            if let Some(cpu) = health.cpu_temp_c {
-                let _ = writeln!(out, "  {:<9} {cpu:.0} °C", "cpu");
+            //
+            // The clock joins the temperature on that line rather than taking one of its own,
+            // because it is the *consequence* of it: 95 °C on its own reads as a warm robot,
+            // and "95 °C, held at 408 of 1800 MHz" is why the duck is walking badly. Silent
+            // while nothing is holding the clock down — an unthrottled board is every healthy
+            // robot, and a clause it always wore is a clause nobody would read on the one that
+            // is not.
+            let temp = health.cpu_temp_c.map(|c| format!("{c:.0} °C"));
+            let clock = health
+                .cpu_throttle
+                .filter(proto::CpuThrottle::throttled)
+                .map(|t| {
+                    format!(
+                        "throttled to {} of {} MHz (level {} of {})",
+                        t.khz / 1000,
+                        t.max_khz / 1000,
+                        t.level,
+                        t.max_level
+                    )
+                });
+            // Either half on its own, because either can be the one the kernel does not offer.
+            let cpu: Vec<String> = [temp, clock].into_iter().flatten().collect();
+            if !cpu.is_empty() {
+                let _ = writeln!(out, "  {:<9} {}", "cpu", cpu.join(" · "));
             }
         }
         (None, Some(why)) => {
@@ -5831,12 +5853,84 @@ mod tests {
         assert!(out.contains("48 °C max (left_knee)"), "{out}");
         // Board and servos on separate lines: they fail differently.
         assert!(out.contains("cpu       52 °C"), "{out}");
+        // Nothing holding the clock down, so the line says nothing about the clock.
+        assert!(!out.contains("throttled"), "{out}");
         assert!(out.contains("bus       ok"), "{out}");
         assert!(out.contains("imu       ready"), "{out}");
         // And the software half, in the same answer — the whole point of one command.
         assert!(out.contains("software"), "{out}");
         assert!(out.contains("robotd    0.2.0"), "{out}");
         assert!(out.contains("daemon    0.2.0 installed"), "{out}");
+    }
+
+    /// The case the clock reading exists for: the temperature alone reads as a warm robot,
+    /// and the board is in fact running at under a quarter of its clock. Taken from a real
+    /// Radxa Zero 3 — 95.5 °C, `cpufreq-cpu0` at the bottom of its table.
+    #[test]
+    fn health_says_what_a_hot_board_is_costing() {
+        let out = render_health(&health_report(
+            Some(proto::HealthResult {
+                healthy: true,
+                cpu_temp_c: Some(95.5),
+                cpu_throttle: Some(proto::CpuThrottle {
+                    level: 6,
+                    max_level: 6,
+                    khz: 408_000,
+                    max_khz: 1_800_000,
+                }),
+                ..Default::default()
+            }),
+            None,
+        ));
+
+        assert!(
+            out.contains("cpu       96 °C · throttled to 408 of 1800 MHz (level 6 of 6)"),
+            "{out}"
+        );
+        // Reported, never judged: the verdict is `robotd`'s and a hot board does not change it.
+        assert!(out.contains("robot     healthy"), "{out}");
+    }
+
+    /// A ceiling lowered with the governor still at zero is somebody's `cpufreq` policy, not
+    /// heat. Worth printing — a robot mysteriously short of CPU is the same symptom — and the
+    /// level is what says the thermal governor had nothing to do with it.
+    #[test]
+    fn health_reports_a_ceiling_nothing_thermal_lowered() {
+        let out = render_health(&health_report(
+            Some(proto::HealthResult {
+                healthy: true,
+                cpu_temp_c: Some(41.0),
+                cpu_throttle: Some(proto::CpuThrottle {
+                    level: 0,
+                    max_level: 6,
+                    khz: 1_104_000,
+                    max_khz: 1_800_000,
+                }),
+                ..Default::default()
+            }),
+            None,
+        ));
+
+        assert!(
+            out.contains("cpu       41 °C · throttled to 1104 of 1800 MHz (level 0 of 6)"),
+            "{out}"
+        );
+    }
+
+    /// An older `robotd` sends no clock reading at all. The line must be exactly what it was
+    /// before the field existed, rather than gaining an empty clause or a zeroed one.
+    #[test]
+    fn health_from_a_robotd_without_the_clock_reading_is_unchanged() {
+        let out = render_health(&health_report(
+            Some(proto::HealthResult {
+                healthy: true,
+                cpu_temp_c: Some(52.0),
+                ..Default::default()
+            }),
+            None,
+        ));
+
+        assert!(out.contains("cpu       52 °C\n"), "{out}");
     }
 
     /// A stopped `robotd` must still produce the software half.

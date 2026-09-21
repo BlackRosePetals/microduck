@@ -344,6 +344,20 @@ servos are the same symptom until you can see both numbers. The maximum across z
 than one zone by name, so a board that wires its sensors differently cannot silently omit the
 one that was climbing.
 
+**And what the heat is costing, which the temperature does not say.** The same sample reads the
+clock ceiling — `scaling_max_freq` against `cpuinfo_max_freq` — and the cpufreq cooling device's
+state. A Radxa Zero 3 at 95 °C is not merely warm: the thermal governor has already pinned it to
+408 MHz of 1800, under a quarter of the CPU the gaits were tuned on, and a duck walking badly on
+a hot board is walking badly *because of that*. The temperature alone reads as a robot somebody
+should keep an eye on; the pair says the robot is already impaired.
+
+Both readings, because either alone is half an answer. The cooling state names heat as the cause
+but is an index into a frequency table, so "6 of 6" says nothing about what was lost; the ceiling
+is what was lost but can also be a userspace policy. The worst cluster and the deepest cpufreq
+cooler win, for the same reason the hottest zone does — a big.LITTLE board throttles its big
+cores first, and reporting `policy0` there would show a board running freely while the cores the
+loop is on are halved.
+
 **IMU staleness is tracked, permanently.** "The read succeeded but the board handed back the
 same sample" feeds dead orientation to the policy, is invisible unless someone counts it, and
 is known to happen. The bus layer remembers the last block, counts identical successors, and
@@ -726,7 +740,7 @@ robot.
 
 | method | answer |
 |---|---|
-| `robot.health` | **the loop is meeting its deadline** — from achieved rate and missed-deadline count — plus a description of the robot the verdict never consults: loop, bus, IMU, battery, servo and board temperature |
+| `robot.health` | **the loop is meeting its deadline** — from achieved rate and missed-deadline count — plus a description of the robot the verdict never consults: loop, bus, IMU, battery, servo and board temperature, and the board's clock ceiling |
 | `robot.safeToRestart` | false while the policy is enabled and the robot is moving |
 | `robot.modelApi` | constant |
 | `robot.remoteSessionActive` | `false` — `mediad` owns the real answer |
@@ -741,10 +755,13 @@ distinction real is why the control loop was built before anything that walks (�
 **What may and may not reach the verdict.** `healthy` and `degraded` are the update system's
 inputs, so only conditions a *release* can be blamed for may set them — that is what `degraded`
 already exists to enforce for an unpowered bench board. Everything else on the answer is a
-**description**, and no automatic decision may read it: battery, motor temperature, and the
-loop/bus/IMU counters. Gating on the battery would mean a robot updated on a low pack rolls the
-release back, then judges its replacement on the same low pack, and cannot be updated at all until
-someone works out why. Motor temperature would do the same on a hot afternoon.
+**description**, and no automatic decision may read it: battery, motor and board temperature, the
+clock ceiling, and the loop/bus/IMU counters. Gating on the battery would mean a robot updated on
+a low pack rolls the release back, then judges its replacement on the same low pack, and cannot be
+updated at all until someone works out why. Motor temperature would do the same on a hot
+afternoon, and a throttled clock on a robot that had got warm once — which is the strongest case
+of the three, since the release that would fix the heat is the one the gate would refuse to
+keep.
 
 **Why they travel together anyway.** One method, because the question arrives once: a robot
 behaving oddly gets asked "what is going on", and a verdict without the numbers behind it just
@@ -885,8 +902,8 @@ intents the loop already arbitrates.
 | `chorale.rs` | several ducks singing one piece: the lowest id conducts, the conductor owns the seating, `btd` carries the beacons and does no thinking | the module header |
 | `pet-detect/` | a ~20 KB CNN over a 40-band log-mel window from the onboard mic, in its own worker | the crate header |
 
-Plus `soc.rs`, which reads the board's own thermal zones out of `sysfs` — not behind `RobotIo`,
-because it has to keep answering when the motor bus does not.
+Plus `soc.rs`, which reads the board's own thermal zones and clock ceiling out of `sysfs` — not
+behind `RobotIo`, because it has to keep answering when the motor bus does not.
 
 **None of them has a design page, and that is the rule working rather than a gap.** A service earns
 one when a second reader would otherwise have to derive its contract from the code

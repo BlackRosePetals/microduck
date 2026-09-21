@@ -2209,6 +2209,32 @@ impl View {
             ));
         }
 
+        // A capped clock is said here rather than added to the temperatures below, and it takes
+        // the board temperature with it. Two reasons, and they are the same one twice.
+        //
+        // It cannot be trimmed. The temperatures are nice to have and get dropped on a narrow
+        // row; this explains a duck walking badly, and it is the wrong thing to lose to a
+        // terminal's width — a board at 408 MHz of 1800 has under a quarter of the CPU the
+        // gaits were tuned on.
+        //
+        // And it is coloured, which the temperatures deliberately are not. No threshold is being
+        // invented here: the kernel's own thermal governor has already decided and acted, and
+        // this is a report of that action rather than an opinion about a number.
+        let capped = health.cpu_throttle.filter(proto::CpuThrottle::throttled);
+        if let Some(t) = capped {
+            // The temperature rides along when there is one, so the pair still reads as one
+            // fact — and is simply left out when the kernel offers cpufreq but no thermal
+            // zone, rather than filled in with a zero that would read as a cold board.
+            let temp = match health.cpu_temp_c {
+                Some(c) => format!("{c:.0} °C "),
+                None => String::new(),
+            };
+            said.push(Span::styled(
+                format!(" · cpu {temp}throttled to {} MHz", t.khz / 1000),
+                Style::new().fg(Color::Yellow),
+            ));
+        }
+
         // Uncoloured, deliberately: nothing in this workspace defines a servo temperature that
         // is too high, and a threshold invented here would be one `robotctl health` does not
         // agree with. The number and the joint are what somebody acts on.
@@ -2222,7 +2248,9 @@ impl View {
         // Beside the servos rather than merged with them: a robot that has been walking has hot
         // motors, a board in an enclosure with a blocked vent has a hot SoC, and the two are
         // fixed differently — which is the reason `HealthResult` carries them separately.
-        if let Some(cpu) = health.cpu_temp_c {
+        if let Some(cpu) = health.cpu_temp_c
+            && capped.is_none()
+        {
             trimmings.push(Span::raw(format!(" · cpu {cpu:.0} °C")));
         }
 
@@ -3608,6 +3636,42 @@ mod tests {
         // And the two temperatures, which fail differently and are fixed differently.
         assert!(screen.contains("41 °C max (left_knee)"), "{screen}");
         assert!(screen.contains("cpu 52 °C"), "{screen}");
+        // Nothing capping the clock, so the row says nothing about it.
+        assert!(!screen.contains("throttled"), "{screen}");
+    }
+
+    /// A board wound down to 408 MHz says so on the row, short form. The temperature alone
+    /// reads as a warm robot, and the reason a duck on a hot board walks badly is that it is
+    /// running at under a quarter of its clock — which is a fact somebody watching the robot
+    /// move needs without leaving the screen.
+    #[test]
+    fn the_frame_says_when_the_clock_is_capped() {
+        let health = proto::HealthResult {
+            cpu_temp_c: Some(95.5),
+            cpu_throttle: Some(proto::CpuThrottle {
+                level: 6,
+                max_level: 6,
+                khz: 408_000,
+                max_khz: 1_800_000,
+            }),
+            ..a_health()
+        };
+        let screen = draw_with_health(110, 32, &a_state(), health);
+
+        assert!(
+            screen.contains("cpu 96 °C throttled to 408 MHz"),
+            "{screen}"
+        );
+        // The servo temperatures are trimmed off this row to make room, which is the right
+        // trade at this width: a capped clock explains a robot that is moving badly, and 41 °C
+        // on a knee does not. Asserted on the row rather than the frame — every joint is named
+        // again in the table below, so a search of the whole screen would find `left_knee`
+        // whatever this row did.
+        let power = screen
+            .lines()
+            .find(|line| line.contains(" power "))
+            .expect("the row is drawn");
+        assert!(!power.contains("motors"), "{screen}");
     }
 
     /// An unread battery says so. Rendered as `0.00 V, 0%` it would put a flat-pack warning in

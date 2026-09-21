@@ -373,7 +373,16 @@ pub const JSONRPC_VERSION: &str = "2.0";
 ///
 /// Both default, so an older `updaterd` reads exactly as it did before: `degraded` false is the
 /// strict verdict, and `reason` absent is "it did not say".
-pub const API_VERSION: u32 = 32;
+/// # v33 — what the heat is costing, beside the temperature
+///
+/// One `Option<CpuThrottle>` on [`HealthResult`], beside `cpu_temp_c`. A board reported as
+/// "96 °C" reads as a warm robot; the same board is in fact pinned to 408 MHz of 1800 by the
+/// thermal governor, which is the sentence that explains a duck walking badly. Without it the
+/// clock ceiling is only reachable by sshing to the robot and reading `sysfs` — which is not
+/// something the one command a human already runs should send them away to do.
+///
+/// `None` is "this robot does not say": an older `robotd`, or a board with no `cpufreq` sysfs.
+pub const API_VERSION: u32 = 33;
 
 /// The observation width every policy this robot family runs is built against.
 ///
@@ -3343,6 +3352,16 @@ pub struct HealthResult {
     /// Absent off Linux, and on a kernel without thermal sysfs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cpu_temp_c: Option<f64>,
+    /// What the board is allowed to clock at, and how far the thermal governor has wound it
+    /// down. Reported, never judged — same rule as the battery above.
+    ///
+    /// Travels beside [`Self::cpu_temp_c`] because the temperature alone does not say what the
+    /// heat is costing: a board sitting at 95 °C has already been cut to a fraction of its
+    /// clock, and a duck walking badly at that point is short of CPU, not short of policy.
+    ///
+    /// Absent off Linux, and on a kernel with no `cpufreq` sysfs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_throttle: Option<CpuThrottle>,
     /// The control loop's own numbers — the ones `healthy` was decided from.
     ///
     /// Carried so a verdict can be *checked* rather than taken on faith. "unhealthy: control
@@ -3450,6 +3469,44 @@ impl ImuHealth {
     /// warning that fires on a healthy robot is a warning nobody reads.
     pub fn frozen(&self) -> bool {
         self.consecutive_stale_blocks >= Self::FROZEN_RUN
+    }
+}
+
+/// How hard the board is being clocked down, and what it is being clocked down to.
+///
+/// Two readings of one thing, because either alone is half an answer. The level is the thermal
+/// governor's own action — it says *heat* is the cause — but it is an index into a frequency
+/// table, so "6 of 6" tells nobody what the robot lost. The ceiling is what it lost, in the
+/// units the board is specified in, but a low ceiling can also be a userspace policy rather
+/// than heat. Together they say both, and disagreeing (`level: 0` under a lowered ceiling) is
+/// itself the useful reading.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CpuThrottle {
+    /// The cpufreq cooling device's current state: 0 is unthrottled, `max_level` is as far down
+    /// as the governor can go.
+    pub level: u32,
+    /// The deepest state that device has, so `level` means something without the reader
+    /// knowing the board. Zero when no cpufreq cooling device was found — the ceiling below is
+    /// then the whole answer.
+    pub max_level: u32,
+    /// What the CPU may currently clock to, in kHz — the kernel's `scaling_max_freq`, not the
+    /// instantaneous frequency. The instantaneous one is mostly a statement about how busy the
+    /// board is; this is a statement about what it is *allowed* to do.
+    pub khz: u32,
+    /// What it could clock to cold, in kHz — `cpuinfo_max_freq`.
+    pub max_khz: u32,
+}
+
+impl CpuThrottle {
+    /// Is anything holding the clock down?
+    ///
+    /// Either reading counts. The governor having wound the level up is the ordinary case, and
+    /// a ceiling below the hardware maximum with the level still at zero is the other one —
+    /// somebody pinned it from userspace, which is worth seeing rather than hiding because the
+    /// thermal governor was not the one who did it.
+    pub fn throttled(&self) -> bool {
+        self.level > 0 || (self.max_khz > 0 && self.khz < self.max_khz)
     }
 }
 
