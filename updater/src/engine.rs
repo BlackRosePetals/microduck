@@ -468,15 +468,35 @@ impl Engine {
         let mut out = Vec::new();
         for (name, cfg) in &self.config.components {
             let store = Store::new(cfg.install_dir.clone());
-            let healthy = match cfg.health {
+            // The verdict, not a boolean summary of it: `healthy` alone cannot tell a board
+            // with no servo power — which the gate commits onto — from a dead control loop.
+            let report = match cfg.health {
                 HealthCheck::None => None,
                 // Only a socket probe means "ask robotd". A command probe is a
                 // different question entirely; reporting robotd's health for it would
                 // be plainly wrong, so run the probe we were configured with.
                 HealthCheck::Socket { .. } => {
-                    Some(self.robot.health(ROBOT_QUERY_TIMEOUT).await.is_healthy())
+                    Some(self.robot.health(ROBOT_QUERY_TIMEOUT).await.report())
                 }
-                HealthCheck::Command { .. } => Some(self.health_gate(cfg).await.is_ok()),
+                // An exec probe has no way to say "degraded": pass, or fail with what it
+                // printed. The error is the only reason anyone will get, so pass it on.
+                HealthCheck::Command { .. } => Some(match self.health_gate(cfg).await {
+                    Ok(GatePassed::Healthy) => crate::robot::HealthReport {
+                        healthy: true,
+                        degraded: false,
+                        reason: None,
+                    },
+                    Ok(GatePassed::Degraded(reason)) => crate::robot::HealthReport {
+                        healthy: false,
+                        degraded: true,
+                        reason: Some(reason),
+                    },
+                    Err(e) => crate::robot::HealthReport {
+                        healthy: false,
+                        degraded: false,
+                        reason: Some(e.to_string()),
+                    },
+                }),
             };
             out.push(ComponentStatus {
                 component: ComponentId::new(name.clone()),
@@ -485,7 +505,9 @@ impl Engine {
                 // while an in-flight update holds it. A caller wanting live phase
                 // should subscribe to progress notifications instead.
                 phase: Phase::Idle,
-                healthy,
+                healthy: report.as_ref().map(|r| r.healthy),
+                degraded: report.as_ref().is_some_and(|r| r.degraded),
+                reason: report.and_then(|r| r.reason),
                 pinned: self.effective_pin(name),
                 last_attempt: self.journal.last_for(name)?,
             });
