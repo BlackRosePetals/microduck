@@ -553,6 +553,12 @@ struct RobotState {
     /// Hottest board thermal zone, as `f64::to_bits`. Zero means no reading — off Linux, or a
     /// kernel with no thermal sysfs ([`soc`]).
     cpu_temp_c: AtomicU64,
+    /// What the board's clock is capped at, and how far the thermal governor wound it down.
+    ///
+    /// A swap rather than four atomics, because the four numbers are one reading: a level
+    /// paired with the ceiling from a different sample would describe a board that never
+    /// existed. `None` until the first sample, and forever on a board with no `cpufreq` sysfs.
+    cpu_throttle: ArcSwapOption<proto::CpuThrottle>,
     /// Mirrors of the bus's own IMU diagnostics, refreshed with the thermal sample. Held here
     /// so the IPC side can report them without touching the loop's IO.
     imu_stale_blocks: AtomicU64,
@@ -694,6 +700,7 @@ impl RobotState {
             motor_mean_c: AtomicU64::new(0),
             motor_hottest: AtomicU32::new(0),
             cpu_temp_c: AtomicU64::new(0),
+            cpu_throttle: ArcSwapOption::empty(),
             imu_stale_blocks: AtomicU64::new(0),
             imu_stale_run: AtomicU64::new(0),
             imu_ready: AtomicBool::new(false),
@@ -749,6 +756,7 @@ impl RobotState {
                     let c = f64::from_bits(self.cpu_temp_c.load(Ordering::Relaxed));
                     (c > 0.0).then_some(c)
                 },
+                cpu_throttle: self.cpu_throttle.load_full().map(|t| *t),
                 control_loop: Some(self.loop_health()),
                 bus: proto::BusHealth {
                     consecutive_errors: self.consecutive_errors.load(Ordering::Relaxed),
@@ -3284,6 +3292,14 @@ fn publish_slow_sensors<T: RobotIo>(io: &mut Safety<T>, state: &RobotState) {
     // a robot whose servos have stopped answering, not less.
     if let Some(celsius) = soc::hottest_zone_c() {
         state.cpu_temp_c.store(celsius.to_bits(), Ordering::Relaxed);
+    }
+    // Same read, same reason, and kept as the last good one on a miss rather than cleared:
+    // `None` from here means the board has no `cpufreq` sysfs at all, which does not become
+    // true halfway through an uptime.
+    if let Some(throttle) = soc::cpu_throttle() {
+        state
+            .cpu_throttle
+            .store(Some(std::sync::Arc::new(throttle)));
     }
 
     match io.slow_sensors() {
@@ -6736,6 +6752,7 @@ mod tests {
         ticked(&s, 1);
         assert!(s.health().motors.is_none());
         assert!(s.health().cpu_temp_c.is_none());
+        assert!(s.health().cpu_throttle.is_none());
     }
 
     /// Board and servo temperatures are separate readings, and the case that justifies both is
@@ -6753,6 +6770,30 @@ mod tests {
         assert_eq!(health.cpu_temp_c, Some(84.0));
         assert_eq!(health.motors.expect("thermals").max_c, 31.0);
         // And neither touches the verdict — a warm afternoon is not a bad release.
+        assert!(health.healthy);
+    }
+
+    /// A board wound down to a fraction of its clock is still healthy. The rule the battery
+    /// and the servos already follow, and it matters most here: a duck throttled to 408 MHz
+    /// walks badly, and rolling the release back would judge its replacement on the same hot
+    /// board — so a robot that got warm once could never be updated again.
+    #[test]
+    fn a_throttled_board_is_reported_and_still_healthy() {
+        let s = state();
+        ticked(&s, 100);
+        s.cpu_temp_c.store(95.0f64.to_bits(), Ordering::Relaxed);
+        s.cpu_throttle
+            .store(Some(std::sync::Arc::new(proto::CpuThrottle {
+                level: 6,
+                max_level: 6,
+                khz: 408_000,
+                max_khz: 1_800_000,
+            })));
+
+        let health = s.health();
+        let throttle = health.cpu_throttle.expect("the reading was published");
+        assert!(throttle.throttled());
+        assert_eq!(throttle.khz, 408_000);
         assert!(health.healthy);
     }
 

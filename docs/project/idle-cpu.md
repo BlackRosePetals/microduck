@@ -144,7 +144,9 @@ is:
   no longer scales with the picture.
 - SoC temperature at idle over ten minutes, which is the number the whole exercise is for. The
   `videoflip` episode took this board to 97 °C and throttled it to 408 MHz, so idle headroom is
-  what decides whether a duck walks well while it is also looking at something.
+  what decides whether a duck walks well while it is also looking at something. `robotctl health`
+  now prints that ceiling beside the temperature, so the throttling half of this no longer needs
+  an ssh session to see (`../design/robotd-design.md` §2.1).
 - `tofd`'s guard against a real sensor clock. The poll is anchored on each frame's arrival and
   tolerates the sensor running 20 ms early — a 30% period error — but no VL53L8 has been watched
   doing it.
