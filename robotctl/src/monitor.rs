@@ -3662,10 +3662,16 @@ mod tests {
             screen.contains("cpu 96 °C throttled to 408 MHz"),
             "{screen}"
         );
-        // The servo temperatures are trimmed to make room, which is the right trade at this
-        // width: a capped clock explains a robot that is moving badly, and 41 °C on a knee
-        // does not.
-        assert!(!screen.contains("left_knee"), "{screen}");
+        // The servo temperatures are trimmed off this row to make room, which is the right
+        // trade at this width: a capped clock explains a robot that is moving badly, and 41 °C
+        // on a knee does not. Asserted on the row rather than the frame — every joint is named
+        // again in the table below, so a search of the whole screen would find `left_knee`
+        // whatever this row did.
+        let power = screen
+            .lines()
+            .find(|line| line.contains(" power "))
+            .expect("the row is drawn");
+        assert!(!power.contains("motors"), "{screen}");
     }
 
     /// An unread battery says so. Rendered as `0.00 V, 0%` it would put a flat-pack warning in
