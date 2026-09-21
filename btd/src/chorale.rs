@@ -114,7 +114,7 @@ pub use radio::{Sighting, broadcast, run, watch};
 mod radio {
     use std::time::Instant;
 
-    use bluer::adv::Advertisement;
+    use bluer::adv::{Advertisement, Type};
     use bluer::monitor::{Monitor, MonitorEvent, Pattern, RssiSamplingPeriod};
     use duck_ipc_proto::ChoraleBeacon;
     use futures::StreamExt;
@@ -144,6 +144,14 @@ mod radio {
     /// Carries neither the service UUID nor a local name: the scan filters on the manufacturer
     /// data, so an 18-byte UUID would buy nothing and a name would only make the payload big
     /// enough to change PDU type.
+    ///
+    /// **Non-connectable, which `Advertisement::default()` is not.** `bluer` defaults the type to
+    /// `Peripheral`, so this instance used to offer a second way in to a daemon that serves one
+    /// central — and, worse, a connectable instance is one Linux will not re-enable while a
+    /// peripheral-role connection is open (`is_advertising_allowed` in
+    /// `net/bluetooth/hci_sync.c`; see [`crate::bluez::advertise`]). A beacon is re-registered on
+    /// every change `robotd` asks for, so that rule meant a chorale went silent for as long as a
+    /// phone was connected, and came back only when it left. `Broadcast` is what this always meant.
     pub async fn broadcast(
         adapter: &bluer::Adapter,
         beacon: &ChoraleBeacon,
@@ -153,9 +161,10 @@ mod radio {
                 manufacturer_data: [(super::COMPANY_ID, beacon_data(beacon))]
                     .into_iter()
                     .collect(),
-                // Not discoverable: this instance is a beacon, not a way in. The robot's front
-                // door is the other advertisement, and it is unchanged.
-                discoverable: Some(false),
+                // A beacon, not a way in. The robot's front door is the other advertisement, and
+                // it is unchanged. `Discoverable` is left unset rather than set false, because
+                // `org.bluez.LEAdvertisement` says it shall not be set on a broadcast at all.
+                advertisement_type: Type::Broadcast,
                 min_interval: Some(BEACON_INTERVAL_MIN),
                 max_interval: Some(BEACON_INTERVAL_MAX),
                 ..Default::default()

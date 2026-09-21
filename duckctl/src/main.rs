@@ -819,9 +819,9 @@ async fn missed_the_named_robot(seen: &[Seen], target: &Target) -> String {
     message.push_str(
         "\n\nIf the robot is one of the unnamed lines, its name was in a scan response this scan \
          missed, and retrying usually finds it. If it is absent from that list entirely, it was \
-         not advertising for the whole eight seconds — check `journalctl -u btd -b` on the robot, \
-         and note that a robot stops advertising while a central is connected to it, so a link \
-         left over from the previous command can be the reason.",
+         not advertising for the whole eight seconds — check `journalctl -u btd -b` on the robot. \
+         A robot busy with another client is not this case: it still advertises, and is listed \
+         here, it just will not accept a second connection.",
     );
     message
 }
@@ -1560,8 +1560,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     step(
         "connecting",
-        "The robot advertised but would not accept a connection. If macOS shows it as paired, \
-         forget it there and retry; `sudo pkill bluetoothd` also clears a half-finished bond.",
+        "The robot advertised but would not accept a connection. The usual reason is that \
+         something else already holds it — the phone app, or another `duckctl` — because a robot \
+         serving one central advertises non-connectably and is listed without being reachable. \
+         Otherwise: if macOS shows it as paired, forget it there and retry; `sudo pkill \
+         bluetoothd` also clears a half-finished bond.",
         CONNECT_TIMEOUT,
         peripheral.connect(),
     )

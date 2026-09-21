@@ -435,6 +435,50 @@ stands between us and it — but the queue pressure that produced it came from f
 chunks at a link that could not say when it was ready, and a phone does not get near that. It is the
 difference between `system.logs` being a call an app may offer and one it may not.
 
+### 3.7 A robot serving one central is still findable  · **measured** (2026-09-21)
+
+A robot with the phone app connected disappeared from `duckctl scan` completely — not listed under
+another name, not listed without its services, absent. So the one command that answers "where do I
+ssh?" answered nothing for as long as someone was using the app, and the advice in the tool's own
+failure text was to go and disconnect the other client.
+
+Two mechanisms stack, and only the first is obvious:
+
+- A connection **stops the advertising set that produced it**. That is the spec, and nothing in
+  BlueZ or the kernel puts it back until the link drops.
+- Linux will not **enable a connectable set at all** while a peripheral-role connection is open,
+  unless the controller says it can. `is_advertising_allowed` in `net/bluetooth/hci_sync.c` reads
+  the controller's LE Supported States: non-connectable while connected as a peripheral needs state
+  20, connectable needs 38 and 21.
+
+Measured on the board (AIC8800, HCI 5.4), with the phone's connection sampled once a second from
+the robot so the window is not guesswork:
+
+| registered while the phone was connected | reached the air? |
+|---|---|
+| non-connectable, carrying the duck service UUID | **yes** — found by a laptop scan 8 s later |
+| connectable, same payload | no — BlueZ registered it, a scan never saw it |
+
+`hciconfig hci0 lestates` confirms states 20 and 21 on this controller; it does not decode as far as
+38, and the table above is what says 38 is absent.
+
+**So `btd` advertises a broadcast while a session is live, and a peripheral otherwise.** The payload
+does not change — same name, same service UUID, same four bytes of IPv4 — so a scan finds the robot,
+and `duckctl ip`, `ssh`, `scp` and `open` all work while the app holds the link, none of which needs
+the radio beyond the listing.
+
+That is the true statement as well as the only broadcastable one. `bluer` keeps one notification
+state per characteristic (§3.2), so a second central does not get a second session, it *replaces*
+the first — a connectable advertisement was inviting something this daemon cannot honour, and the
+client that accepted the invitation broke the session someone else was using.
+
+Two things this does not do. The address **changes**: the kernel requires privacy on a
+non-connectable set and gives it a non-resolvable private address, so a busy robot is a different
+peripheral identity to a scanner, matched by name and service UUID rather than by address. And a
+central that unsubscribes without disconnecting leaves `btd` registering a connectable advertisement
+the kernel will not enable — BlueZ accepts the registration either way — which is the old behaviour
+until the link drops, and self-heals when it does.
+
 ## 5. Pairing: just-works, and a PIN the transport checks
 
 A six-digit PIN, stored by `configd`, checked by `btd` before it serves anything. **Not** by the
