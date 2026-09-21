@@ -353,7 +353,7 @@ enum Namespace {
     /// loader that sources this at shell start rather than a snapshot of it: the snapshot
     /// would go stale the first time an update adds a subcommand.
     ///
-    ///   robotctl completions bash > /etc/bash_completion.d/robotctl
+    ///   robotctl completions bash > /usr/share/bash-completion/completions/robotctl
     Completions {
         /// bash, zsh, fish, elvish or powershell.
         shell: clap_complete::Shell,

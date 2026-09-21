@@ -947,7 +947,7 @@ EOF
 
     # Claimed only if there was somewhere to write it — an image without bash-completion
     # gets no completions and must not be told otherwise.
-    if [ -f /etc/bash_completion.d/robotctl ]; then
+    if [ -f /usr/share/bash-completion/completions/robotctl ]; then
         printf '\nTab-completion is installed; open a new shell to pick it up.\n'
     fi
 
