@@ -4719,6 +4719,28 @@ fn watch(client: &mut Client) -> Result<(), Failure> {
 
 /// Human-readable rendering. `status --json` and anything unrecognised print raw
 /// JSON, so scripts always have a machine-readable path.
+/// The health verdict on one `robotctl update status` line.
+///
+/// Pure, because the case that matters is the one a robot on a desk produces and a working robot
+/// never does. A board with its servo supply off answers `healthy: Some(false)` with `degraded`
+/// set, and this line used to print `UNHEALTHY` for it -- which reads as "the release is broken"
+/// about a release the health gate had just deliberately committed. `robotctl health` has drawn
+/// the distinction since it existed (see `render_health`); this listing did not, and that is how
+/// a rollback got attributed to the wrong cause.
+///
+/// `UNHEALTHY` stays shouted, because now it only prints when something really is.
+fn component_verdict(status: &proto::ComponentStatus) -> String {
+    let reason = status.reason.as_deref().unwrap_or("no reason given");
+    match (status.healthy, status.degraded) {
+        (None, _) => "no probe".to_owned(),
+        (Some(true), _) => "healthy".to_owned(),
+        // Same word and same shape as `robotctl health`, for the same reason: this release is
+        // fine, this board cannot move.
+        (Some(false), true) => format!("degraded: {reason}"),
+        (Some(false), false) => format!("UNHEALTHY: {reason}"),
+    }
+}
+
 fn print_result(command: &UpdateCommand, result: serde_json::Value) {
     let json = |value: &serde_json::Value| {
         println!(
@@ -4741,12 +4763,11 @@ fn print_result(command: &UpdateCommand, result: serde_json::Value) {
                             Some(version) => version.to_string(),
                             None => "none".to_owned(),
                         };
-                        let healthy = match status.healthy {
-                            Some(true) => "healthy",
-                            Some(false) => "UNHEALTHY",
-                            None => "no probe",
-                        };
-                        println!("{}: {installed} ({healthy})", status.component);
+                        println!(
+                            "{}: {installed} ({})",
+                            status.component,
+                            component_verdict(&status)
+                        );
                         if let Some(pinned) = &status.pinned {
                             println!("  pinned to {pinned}");
                         }
@@ -6116,6 +6137,76 @@ mod tests {
             out.contains("waiting for a robot to answer, 4 attempts"),
             "{out}"
         );
+    }
+
+    fn component(
+        healthy: Option<bool>,
+        degraded: bool,
+        reason: Option<&str>,
+    ) -> proto::ComponentStatus {
+        proto::ComponentStatus {
+            component: proto::ComponentId::new("daemon"),
+            installed: Some(semver::Version::new(0, 14, 1)),
+            phase: proto::Phase::Idle,
+            healthy,
+            degraded,
+            reason: reason.map(str::to_owned),
+            pinned: None,
+            last_attempt: None,
+        }
+    }
+
+    /// The case this was written for. A bench board with its servo supply off is the
+    /// configuration the update system is tested on, the gate commits releases onto it on
+    /// purpose, and reading `UNHEALTHY` there is what sent a rollback investigation at the
+    /// policy set for an afternoon.
+    #[test]
+    fn status_does_not_shout_unhealthy_at_a_degraded_board() {
+        let out = component_verdict(&component(
+            Some(false),
+            true,
+            Some("no robot on the motor bus after 4 attempts"),
+        ));
+
+        assert_eq!(out, "degraded: no robot on the motor bus after 4 attempts");
+    }
+
+    /// And the word still gets shouted where it belongs, with what the robot actually said --
+    /// which in this case is the line that should have been read in the first place.
+    #[test]
+    fn status_shouts_unhealthy_with_the_robots_own_reason() {
+        let out = component_verdict(&component(
+            Some(false),
+            false,
+            Some("policy unavailable: reading /opt/robot/policies/current/velstand.onnx"),
+        ));
+
+        assert!(out.starts_with("UNHEALTHY: policy unavailable"), "{out}");
+    }
+
+    /// A component with no probe configured is not a component that failed one.
+    #[test]
+    fn status_says_no_probe_rather_than_guessing() {
+        assert_eq!(component_verdict(&component(None, false, None)), "no probe");
+    }
+
+    /// An older `updaterd` sends neither field. It meant the strict verdict and nothing about a
+    /// reason, and that is what it must still read as -- serde's defaults, with nothing invented
+    /// to fill the gap.
+    #[test]
+    fn a_status_from_an_older_updaterd_still_reads_as_unhealthy() {
+        let status: proto::ComponentStatus = serde_json::from_value(serde_json::json!({
+            "component": "daemon",
+            "installed": "0.14.1",
+            "phase": "idle",
+            "healthy": false,
+            "pinned": null,
+            "last_attempt": null,
+        }))
+        .expect("the two new fields must not be required");
+
+        assert!(!status.degraded);
+        assert_eq!(component_verdict(&status), "UNHEALTHY: no reason given");
     }
 
     /// A pinned component and a rollback are both things nobody thinks to ask about, and both
