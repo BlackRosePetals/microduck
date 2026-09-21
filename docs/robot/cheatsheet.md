@@ -1160,9 +1160,11 @@ sudo cat /var/lib/robot/updater/runs/000042.jsonl
 
 ### Tab completion
 
-`install.sh` sets this up in `/etc/bash_completion.d/`, as a loader that asks the binary for its own
-completions — so they follow the installed release instead of going stale when an update adds a
-command. For a shell it did not cover, or for a build you are running straight out of `target/`:
+`install.sh` sets this up in `/usr/share/bash-completion/completions/`, as a loader that asks the
+binary for its own completions — so they follow the installed release instead of going stale when
+an update adds a command. It sits there rather than in `/etc/bash_completion.d/` so that it is read
+the first time you type `robotctl<TAB>` rather than at every login; an update moves the older
+copy. For a shell it did not cover, or for a build you are running straight out of `target/`:
 
 ```
 eval "$(robotctl completions bash)"
