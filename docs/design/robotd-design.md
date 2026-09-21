@@ -318,8 +318,22 @@ because every other transaction on this bus is an ordinary one that pays it per 
 It is the same all-or-nothing shape, for a new reason: the blocks arrive in one packet, so a
 device whose firmware does not implement 0x8A simply does not answer and the read times out
 rather than coming back short. **XL330 firmware must be v46 or newer**, and the `imu_to_dxl`
-board — `id 200`, the first block in the tick's read — has to implement it too, which is a
-property of a robot's hardware rather than of this code.
+board — `id 200`, the first block in the tick's read — has to implement it too.
+
+That is firmware, not software, and it is the one thing on this bus the daemon cannot talk its
+way out of — so it is `bus.fast_sync_read`, **on by default**, rather than a constant. Off, every
+sync read is a plain one and the robot behaves exactly as it did before the instruction was used
+at all; `open_bus` says so once in the journal, because otherwise a robot running the slow path
+is indistinguishable from a slow robot.
+
+The default is the brave one because getting it wrong is unambiguous rather than subtle. A device
+that does not implement 0x8A does not answer at all, so *every* read times out — not some of them
+returning something plausible. The loop reports bus drops from its first tick, `min_achieved_hz`
+(§3.4) sees an unhealthy robot, and a release that turned this on against firmware that cannot do
+it rolls itself back. A robot that predates the firmware needs one key set, once, by whoever
+notices; there is no version negotiation here and no probe at startup, because a device that does
+not answer looks exactly like one that is unpowered and a probe would have to tell those apart
+before it could say anything useful.
 
 **Board temperature is a third source, and not on the bus at all.** The hottest of the SoC's
 thermal zones, read from `sysfs` in the same once-a-second sample (`robotd/src/soc.rs`). It

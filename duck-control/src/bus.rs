@@ -7,7 +7,8 @@
 //! Every sync read here is a **fast** sync read (protocol 2.0 instruction 0x8A): the devices
 //! append their answers to one status packet from the broadcast id instead of each sending
 //! its own, which drops fifteen packet headers and fifteen bus turnarounds from the tick.
-//! See [`open_controller`].
+//! `bus.fast_sync_read` in `robotd.toml` turns it off for a robot whose devices do not
+//! implement the instruction. See [`open_controller`].
 //!
 //! Battery and thermals are the one thing that does not fit that shape: they live at registers
 //! outside the block the tick fetches, so [`RobotIo::slow_sensors`] is a transaction of its
@@ -111,6 +112,10 @@ pub struct DynamixelIo {
     port: String,
     /// IMU first, then the servos in [`JOINT_IDS`] order — the order blocks come back in.
     ids: Vec<u8>,
+    /// Kept for the same reason as `port`: [`Self::reopen`] builds a new controller, and one
+    /// built without this would silently drop back to a plain sync read for the rest of the
+    /// process — a motor swap quietly halving the tick's bus budget.
+    fast_sync_read: bool,
     imu: SflpDecoder,
     /// Blocks identical to their predecessor. The read succeeded but the board handed back
     /// the same sample, which means the policy is being fed dead orientation data — a
@@ -119,8 +124,10 @@ pub struct DynamixelIo {
 }
 
 impl DynamixelIo {
-    pub fn open(port: &str) -> Result<Self> {
-        let controller = open_controller(port, BAUD_RATE)?;
+    /// Open the bus. `fast_sync_read` is `bus.fast_sync_read` from `robotd.toml` — see
+    /// [`open_controller`] for what it costs to have wrong.
+    pub fn open(port: &str, fast_sync_read: bool) -> Result<Self> {
+        let controller = open_controller(port, BAUD_RATE, fast_sync_read)?;
 
         let mut ids = Vec::with_capacity(NUM_JOINTS + 1);
         ids.push(IMU_DXL_ID);
@@ -130,6 +137,7 @@ impl DynamixelIo {
             controller,
             port: port.to_owned(),
             ids,
+            fast_sync_read,
             imu: SflpDecoder::default(),
             stale_imu: StaleImuTracker::default(),
         })
@@ -324,7 +332,7 @@ impl DynamixelIo {
     /// — one with no port, never used — standing in while the real one is dropped.
     fn reopen(&mut self, baud: u32) -> Result<()> {
         self.controller = Xl330Controller::new();
-        self.controller = open_controller(&self.port, baud)?;
+        self.controller = open_controller(&self.port, baud, self.fast_sync_read)?;
         Ok(())
     }
 
@@ -401,7 +409,7 @@ impl DynamixelIo {
     }
 }
 
-/// The serial port at `baud`, wrapped in a Protocol 2 controller that reads fast.
+/// The serial port at `baud`, wrapped in a Protocol 2 controller.
 ///
 /// `with_fast_sync_read` routes every `sync_read_*` through instruction 0x8A, so it covers
 /// the tick's combined read, [`RobotIo::slow_sensors`] and [`DynamixelIo::present_positions`]
@@ -412,9 +420,15 @@ impl DynamixelIo {
 /// It is all or nothing: one status packet carries every block, so a device whose firmware
 /// does not implement 0x8A does not answer and the whole read times out. That is the same
 /// shape of failure a silent servo already causes on a plain sync read, and the tick coasts
-/// over a dropped read either way. XL330 firmware needs to be v46 or newer; the
-/// `imu_to_dxl` board is `id 200` on this bus and has to implement it too.
-fn open_controller(port: &str, baud: u32) -> Result<Xl330Controller> {
+/// over a dropped read either way. XL330 firmware needs to be v46 or newer, and the
+/// `imu_to_dxl` board is `id 200` on this bus and has to implement it too — which is a
+/// property of a robot's hardware and the reason `fast_sync_read` is a setting at all rather
+/// than something this code decides.
+///
+/// Nothing here probes for support. A device that does not answer looks exactly like one that
+/// is unpowered, and a startup probe would have to tell those apart to say anything useful —
+/// so the answer is a key someone turns off, not a guess this code makes every boot.
+fn open_controller(port: &str, baud: u32, fast_sync_read: bool) -> Result<Xl330Controller> {
     let serial = serialport::new(port, baud)
         .timeout(READ_TIMEOUT)
         .open()
@@ -422,10 +436,13 @@ fn open_controller(port: &str, baud: u32) -> Result<Xl330Controller> {
             path: port.to_owned(),
             source: std::io::Error::other(e),
         })?;
-    Ok(Xl330Controller::new()
-        .with_protocol_v2()
-        .with_fast_sync_read()
-        .with_serial_port(serial))
+    let controller = Xl330Controller::new().with_protocol_v2();
+    let controller = if fast_sync_read {
+        controller.with_fast_sync_read()
+    } else {
+        controller
+    };
+    Ok(controller.with_serial_port(serial))
 }
 
 /// Which servo a factory-fresh one should become, given the IDs that did not answer.

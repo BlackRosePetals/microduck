@@ -102,6 +102,14 @@ const fn feature(key: &'static str, kind: Kind, doc: &'static str) -> Entry {
 pub const REGISTRY: &[Entry] = &[
     // ── [bus] ────────────────────────────────────────────────────────────────
     entry("bus.port", Kind::Text, "Dynamixel serial port device"),
+    // Not a feature switch, though it is a `Bool`: the front page is "what does this robot
+    // do", and this is "what does this robot's firmware understand". It belongs beside the
+    // serial port, with the other thing you set once per board and then forget.
+    entry(
+        "bus.fast_sync_read",
+        Kind::Bool,
+        "Read the bus with fast sync read — needs XL330 firmware v46+",
+    ),
     // ── [control] ────────────────────────────────────────────────────────────
     entry("control.hz", Kind::Integer, "Control loop rate"),
     entry(

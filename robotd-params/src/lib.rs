@@ -1788,6 +1788,23 @@ pub struct Bus {
     /// Serial port the servos and the IMU board share. The Radxa Zero 3W wires them to
     /// `/dev/ttyS2`.
     pub port: String,
+    /// Read the bus with fast sync read (protocol 2.0 instruction 0x8A) rather than a plain
+    /// sync read: the sixteen devices append their blocks to one status packet instead of
+    /// each sending its own, which is fifteen packet headers and fifteen bus turnarounds off
+    /// every tick.
+    ///
+    /// On by default, because that is what this robot's hardware does and a setting nobody
+    /// has to find is worth more than a saving nobody gets. It is a setting rather than a
+    /// constant because the instruction is a property of *firmware* — XL330 v46 or newer, and
+    /// the `imu_to_dxl` board has to implement it too — so a board built before either is the
+    /// one case this code cannot talk its way out of. Turning it off is the whole remedy.
+    ///
+    /// The symptom of getting it wrong is unambiguous, which is why the default can be the
+    /// brave one: a device that does not implement 0x8A does not answer at all, so *every*
+    /// read times out rather than some of them returning something plausible. The loop reports
+    /// the bus drops, `update_gate` sees an unhealthy robot, and a release that turned this on
+    /// against firmware that cannot do it is rolled back on its own.
+    pub fast_sync_read: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1843,6 +1860,7 @@ impl Default for Bus {
     fn default() -> Self {
         Self {
             port: "/dev/ttyS2".into(),
+            fast_sync_read: true,
         }
     }
 }
@@ -3037,6 +3055,7 @@ mod tests {
         let built_in = Params::default();
 
         assert_eq!(from_file.bus.port, built_in.bus.port);
+        assert_eq!(from_file.bus.fast_sync_read, built_in.bus.fast_sync_read);
         assert_eq!(from_file.control.hz, built_in.control.hz);
         assert_eq!(from_file.control.cmd_alpha, built_in.control.cmd_alpha);
         assert_eq!(from_file.control.head_alpha, built_in.control.head_alpha);

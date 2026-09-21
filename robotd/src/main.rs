@@ -1043,7 +1043,7 @@ fn run_init(params: &Params, duration: Duration) -> ExitCode {
     // The same open as the daemon's, replacement adoption included: `init` is what someone
     // reaches for right after a motor swap, and it must not be the one path that refuses the
     // new servo.
-    let Some(mut io) = open_bus(&params.bus.port, 0) else {
+    let Some(mut io) = open_bus(&params.bus, 0) else {
         return ExitCode::FAILURE;
     };
     if let Err(e) = io.set_torque(true) {
@@ -1093,7 +1093,7 @@ fn spawn_control_thread(
     let period = params.period();
     let fake = args.fake;
     let sim = args.sim.clone();
-    let port = params.bus.port.clone();
+    let bus = params.bus.clone();
     let params = params.clone();
     // So a reload can re-read `[policy]` without a restart. The path rather than the loaded
     // params, because the point is to pick up what has been written since.
@@ -1155,7 +1155,7 @@ fn spawn_control_thread(
             // loop has not completed a cycle yet", forever, whatever happened to the robot
             // afterwards. Retrying the read alone was not enough: execution never got there.
             runtime.block_on(async move {
-                if let Some(io) = open_bus_waiting(&port, &state).await {
+                if let Some(io) = open_bus_waiting(&bus, &state).await {
                     control_loop(io, state, intents, params, params_path, period, poweroff).await;
                 }
             });
@@ -1175,13 +1175,13 @@ type BusIo = FakeIo;
 /// one to abandon the control loop over.
 ///
 /// Returns `None` only if shutdown is requested while waiting.
-async fn open_bus_waiting(port: &str, state: &RobotState) -> Option<BusIo> {
+async fn open_bus_waiting(bus: &params::Bus, state: &RobotState) -> Option<BusIo> {
     let mut attempt = 0u32;
 
     while !state.shutdown.load(Ordering::Relaxed) {
         // Logging lives in `open_bus`, which is chatty by design on the first attempt and
         // quiet thereafter — a board waiting overnight must not fill the journal.
-        if let Some(io) = open_bus(port, attempt) {
+        if let Some(io) = open_bus(bus, attempt) {
             state.startup_bus_failures.store(0, Ordering::Relaxed);
             return Some(io);
         }
@@ -1201,11 +1201,12 @@ async fn open_bus_waiting(port: &str, state: &RobotState) -> Option<BusIo> {
 
 /// Open and verify the bus, or explain why not.
 #[cfg(target_os = "linux")]
-fn open_bus(port: &str, attempt: u32) -> Option<BusIo> {
+fn open_bus(bus: &params::Bus, attempt: u32) -> Option<BusIo> {
     // First attempt and every thirtieth — about one line per 30 s while waiting.
     let loud = attempt == 0 || attempt.is_multiple_of(STARTUP_READ_LOG_EVERY);
+    let port = bus.port.as_str();
 
-    let mut io = match duck_control::bus::DynamixelIo::open(port) {
+    let mut io = match duck_control::bus::DynamixelIo::open(port, bus.fast_sync_read) {
         Ok(io) => io,
         Err(e) => {
             if loud {
@@ -1214,6 +1215,12 @@ fn open_bus(port: &str, attempt: u32) -> Option<BusIo> {
             return None;
         }
     };
+    // Under the same `loud` rule as everything else here — a board waiting on servo power
+    // retries this forever. Worth saying at all because the whole tick budget hangs off it,
+    // and "turned off in robotd.toml" is otherwise indistinguishable from "this board is slow".
+    if !bus.fast_sync_read && loud {
+        tracing::warn!("bus.fast_sync_read is off; every sync read is a plain one");
+    }
     if !adopt_missing_servo(&mut io, loud) {
         return None;
     }
@@ -1296,7 +1303,7 @@ fn adopt_missing_servo(io: &mut BusIo, loud: bool) -> bool {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn open_bus(_port: &str, _attempt: u32) -> Option<BusIo> {
+fn open_bus(_bus: &params::Bus, _attempt: u32) -> Option<BusIo> {
     tracing::error!("no bus on this platform; use --fake");
     None
 }
@@ -6786,11 +6793,12 @@ mod tests {
             false,
         ));
         let waiter_state = Arc::clone(&s);
-        let handle = tokio::spawn(async move {
-            open_bus_waiting("/dev/definitely-not-a-bus", &waiter_state)
-                .await
-                .is_none()
-        });
+        let nowhere = params::Bus {
+            port: "/dev/definitely-not-a-bus".into(),
+            ..Default::default()
+        };
+        let handle =
+            tokio::spawn(async move { open_bus_waiting(&nowhere, &waiter_state).await.is_none() });
 
         // Bounded, so a regression fails rather than hanging CI.
         for _ in 0..10_000 {
