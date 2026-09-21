@@ -3646,14 +3646,24 @@ fn run_policy_search(updater_socket: &Path, query: &str, json: bool) -> Result<(
         return Ok(());
     }
 
+    // The id column is still padded, because the origin and the like count line up under each
+    // other and a reader compares them down the column. The description does not join that table:
+    // it is a sentence of whatever length somebody wrote, and padding it would either truncate the
+    // one useful thing on the line or push the counts off the terminal.
     let width = found.models.iter().map(|m| m.id.len()).max().unwrap_or(20);
     for hit in &found.models {
         let likes = hit.likes.unwrap_or(0);
         println!("{:width$}  {:9}  {likes} likes", hit.id, hit.origin);
+        // `details`, so this and `duckctl` print a hit the same way. See `PolicySearchHit`.
+        for line in hit.details() {
+            println!("{line}");
+        }
     }
     println!(
         "\n`sudo robotctl policy load <slot> <repo>` tries one. Anything not marked official is \
-         somebody else's."
+         somebody else's. A repo with nothing written under it published no manifest, which says \
+         nothing about the policy in it — `policy fetch` reads the same field and refuses the \
+         shapes this robot cannot run."
     );
     Ok(())
 }

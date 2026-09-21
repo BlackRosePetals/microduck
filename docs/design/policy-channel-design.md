@@ -227,9 +227,11 @@ is worth having on a bench; it is also the one input with no provenance, which i
 a first-class origin in §2 rather than an accident.
 
 There is no separate `fetch`: `load` downloads when it has to, and the library accumulates, so
-loading A, then B, then A again costs one download each. `search` is thin — `api/models?search=`
-against the query — and until a `microduck` tag exists on the Hub, searching for the word is
-what there is.
+loading A, then B, then A again costs one download each. `search` is `api/models?search=` against
+the query, and until a `microduck` tag exists on the Hub, searching for the word is what there is.
+It asks for the file list with the hits, which is what names each repo's preview clip for free, and
+then reads one `manifest.json` per repo that has one for the description —
+[`policy-manifest.md`](../policy-manifest.md) owns both and the bounds they run under.
 
 ## 8. Wire, and what it costs
 
@@ -452,9 +454,14 @@ stand, and `will_stand` hands the robot to the standing network whenever command
 zero, which is exactly the state that policy is in when it is standing on two feet. Without a way
 to say `stand none`, running it meant editing the file this whole command exists to stop editing.
 
-`robotctl policy search microduck` lists what is out there, marking each hit's origin. No tag
+`robotctl policy search microduck` lists what is out there, marking each hit's origin, with the
+publisher's one-line description under it and a link to the clip when the repo carries one. No tag
 filter: a shared name is what the published policies have in common, and a tag is worth adding
 once there is something to tag.
+
+The description is the reason the listing is worth reading: every hit is somebody's
+`microduck-<something>`, and a name is not enough to choose between a flamingo cycle and a rough
+walk. Without it the only way to find out what a policy did was to install it.
 
 ### 9.3 The set describes itself
 

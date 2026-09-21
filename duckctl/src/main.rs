@@ -1114,10 +1114,14 @@ enum Account {
 
 /// The policy commands, named as `robotctl policy` names them.
 ///
-/// Same words in the same order as on the robot, for the reason [`Update`] gives. What is missing
-/// against `robotctl` is the Hub: `policy.check`, `policy.install` and `policy.search` are not
-/// served over this transport — they reach the network on the robot's behalf and write to the
-/// eMMC — so `load` here takes a path to a file already on the robot, never `org/repo`.
+/// Same words in the same order as on the robot, for the reason [`Update`] gives. The difference
+/// is `load`, which takes a path to a file already on the robot rather than `org/repo`: the
+/// download is its own command here, and `fetch` is what reaches the Hub and names the path.
+///
+/// The Hub commands themselves do cross this transport — `btd` routes `policy.check`, `policy.fetch`
+/// and `policy.search`, which is what makes a robot with no LAN configurable from a laptop that
+/// has one. What they cost is the robot's network rather than this one's, and the budget they get
+/// says so.
 #[derive(Subcommand)]
 enum Policy {
     /// What each slot is running, from where, and which skills this robot has.
@@ -1145,6 +1149,11 @@ enum Policy {
     /// What else is published for this robot.
     ///
     /// Reaches the Hub, changes nothing. `microduck` is the useful query until there is a tag.
+    ///
+    /// Each hit carries the one line its publisher wrote in `manifest.json` and a link to the clip
+    /// in the repo, when there is one — a list of `microduck-<something>` names is not something
+    /// anyone can choose from. A hit with nothing under it published no manifest, which says
+    /// nothing about the policy itself.
     Search {
         /// What to look for on the Hub.
         #[arg(default_value = "microduck")]
@@ -1737,6 +1746,19 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 return print_journal(&value["result"], service, *boot);
             }
 
+            // `search` asked "which of these do I want", and that is a reading question. Twenty-five
+            // hits as a JSON array is every field of every one of them, three lines apart, with the
+            // sentence that answers the question indented inside a string — so the reply this tool
+            // prints whole is the one shape nobody can skim. The third exception, and the last: a
+            // command whose answer is a list somebody chooses from earns a rendering; a command
+            // whose answer is a fact does not.
+            if let Command::Policy(Policy::Search { .. }) = &cli.command
+                && value.get("error").is_none()
+            {
+                let _ = peripheral.disconnect().await;
+                return print_search(&value["result"]);
+            }
+
             println!("{}", serde_json::to_string_pretty(&value)?);
             let _ = peripheral.disconnect().await;
             // A JSON-RPC error is the robot answering, not this tool failing — so it is
@@ -1759,6 +1781,49 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             };
         }
     }
+}
+
+/// Print search hits: the robots' answer as a list to choose from.
+///
+/// The same block `robotctl policy search` prints — [`proto::PolicySearchHit::details`] is shared
+/// so they cannot drift — with this tool's own next step under it, because the commands differ:
+/// on the robot, `policy load <slot> <repo>` takes the repo; over a radio, `policy fetch` puts it
+/// on the eMMC first and `load` then takes the path that comes back.
+///
+/// The advice goes to stderr, so `duckctl policy search microduck | grep flamingo` is a list of
+/// hits rather than a list of hits plus a sentence about what to do with them.
+fn print_search(result: &serde_json::Value) -> Result<(), Box<dyn std::error::Error>> {
+    use duck_ipc_proto as proto;
+
+    let found: proto::PolicySearchResult = serde_json::from_value(result.clone()).map_err(|e| {
+        // Printed rather than paraphrased, for `print_journal`'s reason: the reply is the only
+        // evidence of what the robot actually said.
+        format!(
+            "the robot answered policy.search in a shape this version of duckctl cannot read: \
+             {e}\n{}",
+            serde_json::to_string_pretty(result).unwrap_or_default()
+        )
+    })?;
+
+    if found.models.is_empty() {
+        eprintln!("nothing on the Hub matched.");
+        return Ok(());
+    }
+
+    let width = found.models.iter().map(|m| m.id.len()).max().unwrap_or(20);
+    for hit in &found.models {
+        let likes = hit.likes.unwrap_or(0);
+        println!("{:width$}  {:9}  {likes} likes", hit.id, hit.origin);
+        for line in hit.details() {
+            println!("{line}");
+        }
+    }
+    eprintln!(
+        "\n`duckctl policy fetch <repo>` downloads one onto the robot and names the path; \
+         `policy load <slot> <path>` then runs it. Anything not marked official is somebody \
+         else's, and a hit with nothing written under it published no manifest."
+    );
+    Ok(())
 }
 
 /// Print a journal tail: the lines on stdout, everything about them on stderr.

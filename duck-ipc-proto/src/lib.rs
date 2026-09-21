@@ -382,7 +382,18 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// something the one command a human already runs should send them away to do.
 ///
 /// `None` is "this robot does not say": an older `robotd`, or a board with no `cpufreq` sysfs.
-pub const API_VERSION: u32 = 33;
+/// # v34 — what a policy is, on the line that lists it
+///
+/// `description` and `preview` on [`PolicySearchHit`]. A search answered with `org/name`, an
+/// origin and a like count, which is enough to install something and not enough to choose it:
+/// every hit is somebody's `microduck-<something>`, and the name was the whole of what a person
+/// had to go on. The description was already in the manifest, already read on the fetch path and
+/// already shown by the policy playground — a list of policies is where it is wanted, and a
+/// search that makes someone install a policy to find out what it does is why it is here now.
+///
+/// Both are absent from an older `updaterd` and neither needs a fallback: a client with no
+/// description shows the id, which is what it showed before.
+pub const API_VERSION: u32 = 34;
 
 /// The observation width every policy this robot family runs is built against.
 ///
@@ -2651,6 +2662,44 @@ pub struct PolicySearchHit {
     pub origin: String,
     pub likes: Option<u64>,
     pub downloads: Option<u64>,
+    /// The one line the publisher wrote about it, from the repo's `manifest.json`.
+    ///
+    /// **Untrusted, and the same field the fetch path already reports.** It is a stranger's
+    /// sentence about a stranger's file, so a client displays it and decides nothing on it. `None`
+    /// covers a repo with no manifest, a manifest with no `description`, and one the robot could
+    /// not read inside the budget a search gets — three things a reader wants the same thing from.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// A video of the policy running, as a URL, when the repo carries one.
+    ///
+    /// Picked by file convention rather than declared — `docs/policy-manifest.md` owns the order —
+    /// because that is what publishers already do and what the policy playground already reads.
+    /// A client may link it or play it; nothing on the robot fetches it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preview: Option<String>,
+}
+
+impl PolicySearchHit {
+    /// The lines that go under a hit's own line: what the publisher said, and the clip.
+    ///
+    /// Here rather than in each client because `robotctl` and `duckctl` both print this list, and
+    /// two renderings of the same answer would drift exactly where somebody is comparing one tool
+    /// against the other. What each tool keeps is its own: the id column it pads, and the next
+    /// command it suggests, which is not the same command on the robot as it is over a radio.
+    ///
+    /// **The quotes are load-bearing.** The description is a stranger's sentence about a
+    /// stranger's file, and quoting it is what says the tool is repeating rather than asserting —
+    /// the same shape `policy fetch` prints it in.
+    pub fn details(&self) -> Vec<String> {
+        let mut lines = Vec::new();
+        if let Some(description) = &self.description {
+            lines.push(format!("  \"{description}\""));
+        }
+        if let Some(preview) = &self.preview {
+            lines.push(format!("  {preview}"));
+        }
+        lines
+    }
 }
 
 /// How often a subscriber wants [`method::ROBOT_STATE`].
@@ -6342,6 +6391,46 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<HelloResult>(&line).unwrap(),
             released
+        );
+    }
+
+    /// Both clients print a hit through this, so the contract is here rather than in either of
+    /// them: quoted description, bare URL, and nothing at all for what the publisher did not say.
+    #[test]
+    fn a_hit_renders_only_what_the_publisher_wrote() {
+        let bare = PolicySearchHit {
+            id: "someone/microduck-thing".into(),
+            origin: "community".into(),
+            ..Default::default()
+        };
+        assert!(bare.details().is_empty());
+
+        let described = PolicySearchHit {
+            description: Some("Bows from a stand.".into()),
+            ..bare.clone()
+        };
+        assert_eq!(described.details(), vec!["  \"Bows from a stand.\""]);
+
+        let both = PolicySearchHit {
+            preview: Some("https://huggingface.co/a/b/resolve/main/media/preview.mp4".into()),
+            ..described
+        };
+        assert_eq!(
+            both.details(),
+            vec![
+                "  \"Bows from a stand.\"",
+                "  https://huggingface.co/a/b/resolve/main/media/preview.mp4",
+            ]
+        );
+
+        // A clip and no sentence is an ordinary repo, not a shape to special-case.
+        let silent = PolicySearchHit {
+            preview: Some("https://huggingface.co/a/b/resolve/main/preview.mp4".into()),
+            ..bare
+        };
+        assert_eq!(
+            silent.details(),
+            vec!["  https://huggingface.co/a/b/resolve/main/preview.mp4"]
         );
     }
 }
