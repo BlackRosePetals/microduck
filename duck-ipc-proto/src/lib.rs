@@ -357,7 +357,23 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// `init` argues with that rather than winning. Without it a client either guesses — sitting a
 /// standing duck down every other press — or asks somebody to reach for the pad, which is what the
 /// playground did.
-pub const API_VERSION: u32 = 31;
+/// # v32 — a status that can say "degraded"
+///
+/// Two fields on [`ComponentStatus`], beside `healthy`, which was a boolean answering a
+/// three-way question. `updaterd` asks `robotd` for a verdict and gets one of five; the health
+/// gate sorts them into *commit* (healthy, degraded) and *revert* (unhealthy, unreachable,
+/// unreadable), which is the three-way question `updater-design.md` §8 states. Status collapsed
+/// all four non-healthy verdicts into `healthy: false`, so a bench board with no servo power —
+/// a release the gate had just committed, running correctly — was indistinguishable on the wire
+/// from a robot whose control loop was dead.
+///
+/// That cost real time: it is how a rolled-back release was read as having been rolled back over
+/// its policy set. §4.1 asks of this route that "the app must be able to see 'daemon unhealthy,
+/// version X, last update failed'", and the app could not.
+///
+/// Both default, so an older `updaterd` reads exactly as it did before: `degraded` false is the
+/// strict verdict, and `reason` absent is "it did not say".
+pub const API_VERSION: u32 = 32;
 
 /// The observation width every policy this robot family runs is built against.
 ///
@@ -3012,7 +3028,34 @@ pub struct ComponentStatus {
     pub installed: Option<semver::Version>,
     pub phase: Phase,
     /// `None` when no health probe is configured.
+    ///
+    /// `Some(true)` only for a robot that reported healthy. Four different verdicts answer
+    /// `Some(false)` — including *degraded*, which the health gate deliberately **commits** a
+    /// release onto — so this boolean cannot be shown to anyone on its own. Read it with
+    /// [`Self::degraded`] and [`Self::reason`].
     pub healthy: Option<bool>,
+    /// Set when the fault belongs to the board rather than to the installed release.
+    ///
+    /// The same meaning as [`HealthResult::degraded`], and true in exactly the cases the health
+    /// gate would commit — so a bench board with its servo supply off is `healthy: Some(false)`
+    /// with this set, and nothing is wrong with the release it is running.
+    ///
+    /// Sent because it was needed and missing: `robotctl update status` printed `UNHEALTHY` for
+    /// such a board, which is what made a release that had rolled back for an unrelated reason
+    /// look as though the missing policy set had caused it.
+    ///
+    /// Only meaningful when `healthy` is `Some(false)`. Defaults to false, so an older
+    /// `updaterd` that does not send it still reads as the strict verdict it meant.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub degraded: bool,
+    /// The verdict in words: the reason `robotd` gave, or what went wrong in the asking.
+    /// Absent for a healthy robot and for a component with no probe.
+    ///
+    /// Also where the two verdicts the booleans cannot tell apart go — a `robotd` that did not
+    /// answer at all, and one that answered in a shape this `updaterd` cannot parse, which is a
+    /// robot that is very likely fine. Both fail the gate; only this string says which happened.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
     pub pinned: Option<semver::Version>,
     pub last_attempt: Option<LogEntry>,
 }
