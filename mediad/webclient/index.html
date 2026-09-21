@@ -92,6 +92,11 @@
      including the two window handlers, so routing it here catches all of them with one hook.
      Separate from `#banner`, which is the API-skew notice: one is a standing condition, the other
      is an event, and a red box replacing an amber one loses the standing condition. */
+  /* **`display: flex` beats the `hidden` attribute, and that is not obvious.** `hidden` works by
+     way of `display: none` in the UA stylesheet, so any author `display` on the same element wins
+     and the box is visible from page load — empty, red, and above the fold. `#banner` sets no
+     `display` and so never had the problem, which is exactly why this was easy to miss. */
+  #alert[hidden] { display: none; }
   #alert { display: flex; gap: .5rem; align-items: flex-start; padding: .5rem .75rem;
            border-radius: 4px; border: 1px solid var(--bad);
            background: color-mix(in srgb, var(--bad) 12%, transparent); }
