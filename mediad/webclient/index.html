@@ -49,8 +49,21 @@
     color-scheme: light dark;
     --line: color-mix(in srgb, currentColor 15%, transparent);
     --fill: color-mix(in srgb, currentColor 8%, transparent);
+    /* The four accents, as tokens rather than literals in six rules. Tuned for a dark
+       background, which is what `color-scheme` picks by default here. */
+    --in: #2a7; --out: #59f; --bad: #e55; --warn: #d90;
+  }
+  /* **The same four, darker, on light.** `#d90` and `#59f` are thin on white — a warning banner
+     whose border you have to look for is a warning that failed — and the skew banner is exactly
+     where that matters. Only the light branch is overridden, so the dark values above stay the
+     ones that were chosen against the palette they were chosen for. */
+  @media (prefers-color-scheme: light) {
+    :root { --in: #0a6b45; --out: #1c4ed8; --bad: #b91c1c; --warn: #92600e; }
   }
   * { box-sizing: border-box; }
+  /* One visible focus ring for every control, because there was a `:hover` style and no focus
+     style at all: a keyboard user got the browser default drawn over a custom background. */
+  :focus-visible { outline: 2px solid var(--out); outline-offset: 2px; }
   body { font: 14px/1.5 ui-sans-serif, system-ui, sans-serif; margin: 0; padding: 1rem;
          display: grid; gap: 1rem; }
   h1 { font-size: 1rem; margin: 0; font-weight: 600; }
@@ -66,14 +79,59 @@
   header .grow { flex: 1; }
   .pill { padding: .1rem .5rem; border-radius: 99px; font-size: 12px; background: var(--fill);
           white-space: nowrap; }
-  .in { color: #2a7; } .out { color: #59f; } .bad { color: #e55; } .warn { color: #d90; }
+  .in { color: var(--in); } .out { color: var(--out); } .bad { color: var(--bad); }
+  .warn { color: var(--warn); }
   .dim { opacity: .55; }
 
-  #banner { padding: .5rem .75rem; border-radius: 4px; border: 1px solid #d90;
-            background: color-mix(in srgb, #d90 12%, transparent); }
+  #banner { padding: .5rem .75rem; border-radius: 4px; border: 1px solid var(--warn);
+            background: color-mix(in srgb, var(--warn) 12%, transparent); }
 
-  main { display: grid; gap: 1rem; grid-template-columns: minmax(340px, 1.3fr) minmax(300px, 1fr); }
-  @media (max-width: 800px) { main { grid-template-columns: 1fr; } }
+  /* **The last thing that went wrong, where somebody is looking.** Every failure on this page is
+     explained in the log — and the log is a collapsed drawer, so "nothing happened" was the whole
+     user-visible story. `log("bad", …)` is the one funnel every error already goes through,
+     including the two window handlers, so routing it here catches all of them with one hook.
+     Separate from `#banner`, which is the API-skew notice: one is a standing condition, the other
+     is an event, and a red box replacing an amber one loses the standing condition. */
+  #alert { display: flex; gap: .5rem; align-items: flex-start; padding: .5rem .75rem;
+           border-radius: 4px; border: 1px solid var(--bad);
+           background: color-mix(in srgb, var(--bad) 12%, transparent); }
+  /* `min-width: 0` and a break-anywhere rule, because these two boxes are the only places on the
+     page that render text this page did not write. Several of the messages carry a URL — a
+     redirect URI, a signalling address — and one unbreakable token in a flex item takes its
+     min-content width from that token: at phone width the whole page then scrolled sideways and
+     the connect button went off the edge. An error that breaks the layout is worse than the
+     error. */
+  #alert > span { flex: 1; min-width: 0; }
+  #alert, #banner { overflow-wrap: anywhere; }
+  #alert button { border: 0; background: none; padding: 0 .25rem; opacity: .7; }
+
+  /* **Named areas, because five sections flowing into two columns is arbitrary.** `video` and
+     `drive` are what a person came to use and belong together; `telemetry` is a nine-row table
+     you glance at, and it used to be able to land beside the video and size the whole left column
+     to itself. Spelling the placement out is also what makes the one-column fallback a reorder
+     rather than whatever the source order happened to be. */
+  main { display: grid; gap: 1rem; align-items: start;
+         grid-template-columns: minmax(340px, 1.3fr) minmax(300px, 1fr);
+         grid-template-areas: "video rail" "drive rail"; }
+  #s-video { grid-area: video; } #s-drive { grid-area: drive; }
+  .rail { grid-area: rail; display: grid; gap: 1rem; align-content: start; }
+  @media (max-width: 800px) {
+    main { grid-template-columns: 1fr; grid-template-areas: "video" "drive" "rail"; }
+  }
+
+  /* **Nothing that needs the robot is pressable before there is one.** Every button in `posture`
+     and `do · sound` used to be live from page load, so pressing `init` on a page with no session
+     did nothing and said so only in the drawer. "I pressed it and nothing happened" is the least
+     debuggable sentence in software and this page had already produced it once. */
+  /* The controls dim, not the section: the line explaining *why* they are unavailable lives in
+     the same box, and fading it out with them is the one thing that must not happen. */
+  body:not([data-live]) #s-posture .row, body:not([data-live]) #s-do .row,
+  body:not([data-live]) .pads { opacity: .45; }
+  body:not([data-live]) .pad { cursor: not-allowed; }
+  /* And it reads as a statement rather than a footnote — `.hint` is 60% opacity by design. */
+  .gate-hint { display: none; }
+  body:not([data-live]) .gate-hint { display: block; opacity: 1; color: var(--warn);
+                                     font-weight: 600; margin-bottom: .35rem; }
   section { border: 1px solid var(--line); border-radius: 6px; padding: .75rem; }
   .row { display: flex; gap: .4rem; flex-wrap: wrap; align-items: center; }
   .hint { margin: .5rem 0 0; font-size: 12px; opacity: .6; }
@@ -134,23 +192,29 @@
 </head>
 <body>
 
+<!--
+  **Status, and nothing that merely is the case.** This header carried nine elements and wrapped
+  into three rows of near-identical grey lozenges on any narrow window. `state` and `dcstate`
+  change and are why somebody looks here; `release`, `api` and `signalling` are facts you check
+  once, so they moved to the drawer's own row. Their ids are unchanged — the code that fills them
+  does not know or care where they are.
+-->
 <header>
   <h1 id="robot">duck console</h1>
-  <span id="release" class="pill dim">release unknown</span>
-  <span id="api" class="pill dim">api unknown</span>
   <span class="grow"></span>
   <span id="state" class="pill">idle</span>
   <span id="dcstate" class="pill dim">no control channel</span>
-  <span id="signalling" class="pill dim"></span>
   <select id="robots" hidden></select>
   <span id="account" class="pill dim" hidden></span>
   <button id="connect">connect</button>
 </header>
 
 <div id="banner" hidden></div>
+<div id="alert" hidden><span id="alert-text"></span><button id="alert-close"
+  title="dismiss" aria-label="dismiss this message">&times;</button></div>
 
 <main>
-  <section>
+  <section id="s-video">
     <h2>video</h2>
     <!-- The wrapper is the *upright* picture and the video is turned inside it, because the robot
          no longer rotates pixels: doing that in the pipeline cost the encoder its zero-copy path to
@@ -174,7 +238,7 @@
       point is out of reach.</p>
   </section>
 
-  <section>
+  <section id="s-drive">
     <h2>drive</h2>
     <div class="pads">
       <div>
@@ -187,6 +251,7 @@
       </div>
     </div>
     <p class="hint">
+      <b class="gate-hint">Connect to a robot to drive it.</b>
       <b>W</b>/<b>S</b> forward and back, <b>A</b>/<b>D</b> strafe, <b>Q</b>/<b>E</b> turn — arrows
       drive and turn. Full deflection is 0.3 m/s and 1.5 rad/s, the same as a gamepad's.
       Intents are resent at 10 Hz while anything is held: the robot stops on its own 500 ms after
@@ -194,81 +259,98 @@
     </p>
   </section>
 
-  <section>
-    <h2>posture</h2>
-    <div class="row">
-      <button data-call="robot.enable" data-params='{"on":true,"toggle":true}'>enable ⇄</button>
-      <button data-call="robot.init">init</button>
-      <button data-call="robot.relax">relax</button>
-      <button data-call="robot.stop" data-confirm="Zero the robot's intents?">stop</button>
-      <button data-call="robot.shutdown" data-confirm="Power the robot off?">shutdown</button>
-    </div>
-    <p class="hint">
-      <b>stop</b> zeroes the intents this session is sending. It is not a physical emergency stop —
-      nothing here cuts power to the servos — and it is a plain button for that reason.
-      <b>enable</b> toggles, so it always means "the other one" and cannot go stale.
-    </p>
-  </section>
 
-  <section>
-    <h2>do · sound</h2>
-    <div class="row">
-      <!-- Filled from `robot.policies` when the channel opens. Which skills a robot has is
-           config, so a list written here would be five guesses: wrong on a robot that has been
-           given a bow, and offering a dead entry on one that has had a kick taken away. -->
-      <select id="skill">
-        <option value="">asking the robot…</option>
-      </select>
-      <button id="do">do</button>
-      <span class="grow"></span>
-      <select id="sound">
-        <option value="chirp">chirp</option>
-        <option value="greet">greet</option>
-        <option value="inquire">inquire</option>
-        <option value="alarm">alarm</option>
-        <option value="peck">peck</option>
-        <option value="coo">coo</option>
-        <option value="wheee">wheee (hold)</option>
-      </select>
-      <button id="play">play</button>
-    </div>
-    <p class="hint">One request is one skill; holding <b>play</b> on <b>wheee</b> keeps the ride
-      going, and letting go releases it.</p>
-  </section>
 
-  <section>
-    <h2>telemetry</h2>
-    <table>
-      <tr><th>mode</th><td id="t-mode">–</td></tr>
-      <tr><th>policy</th><td id="t-policy">–</td></tr>
-      <tr><th>loop</th><td id="t-loop">–</td></tr>
-      <tr><th>safety</th><td id="t-safety">–</td></tr>
-      <tr><th>requested</th><td id="t-requested">–</td></tr>
-      <tr><th>applied</th><td id="t-applied">–</td></tr>
-      <tr><th>health</th><td id="t-health">–</td></tr>
-      <tr><th>battery</th><td id="t-battery">–</td></tr>
-      <tr><th>temperatures</th><td id="t-temps">–</td></tr>
-    </table>
-    <p class="hint">The frame is <code>robot.subscribe</code> at 2 Hz; the last three rows are
-      <code>robot.health</code>, polled, because none of it is on that stream.</p>
-  </section>
+  <!--
+    **The right rail is one column, not three grid cells.** As five sections in a two-column grid,
+    the row holding `video` was as tall as the video and the panel beside it was not, which left a
+    void under it — and on a wide window `telemetry` could land there and size the left column to a
+    nine-row table. Wrapped, the rail flows: each panel is as tall as its contents and the next one
+    starts underneath. Actions first, reference last, because the table is a thing you glance at.
+  -->
+  <div class="rail">
+    <section id="s-posture">
+      <h2>posture</h2>
+      <div class="row">
+        <button data-needs-channel data-call="robot.enable" data-params='{"on":true,"toggle":true}'>enable ⇄</button>
+        <button data-needs-channel data-call="robot.init">init</button>
+        <button data-needs-channel data-call="robot.relax">relax</button>
+        <button data-needs-channel data-call="robot.stop" data-confirm="Zero the robot's intents?">stop</button>
+        <button data-needs-channel data-call="robot.shutdown" data-confirm="Power the robot off?">shutdown</button>
+      </div>
+      <p class="hint">
+        <b class="gate-hint">Connect to a robot to use these.</b>
+        <b>stop</b> zeroes the intents this session is sending. It is not a physical emergency stop —
+        nothing here cuts power to the servos — and it is a plain button for that reason.
+        <b>enable</b> toggles, so it always means "the other one" and cannot go stale.
+      </p>
+    </section>
+    <section id="s-do">
+      <h2>do · sound</h2>
+      <div class="row">
+        <!-- Filled from `robot.policies` when the channel opens. Which skills a robot has is
+             config, so a list written here would be five guesses: wrong on a robot that has been
+             given a bow, and offering a dead entry on one that has had a kick taken away. -->
+        <select id="skill" data-needs-channel>
+          <option value="">asking the robot…</option>
+        </select>
+        <button id="do" data-needs-channel>do</button>
+        <span class="grow"></span>
+        <select id="sound" data-needs-channel>
+          <option value="chirp">chirp</option>
+          <option value="greet">greet</option>
+          <option value="inquire">inquire</option>
+          <option value="alarm">alarm</option>
+          <option value="peck">peck</option>
+          <option value="coo">coo</option>
+          <option value="wheee">wheee (hold)</option>
+        </select>
+        <button id="play" data-needs-channel>play</button>
+      </div>
+      <p class="hint"><b class="gate-hint">Connect to a robot to use these.</b>
+        One request is one skill; holding <b>play</b> on <b>wheee</b> keeps the ride
+        going, and letting go releases it.</p>
+    </section>
+    <section id="s-telemetry">
+      <h2>telemetry</h2>
+      <table>
+        <tr><th>mode</th><td id="t-mode">–</td></tr>
+        <tr><th>policy</th><td id="t-policy">–</td></tr>
+        <tr><th>loop</th><td id="t-loop">–</td></tr>
+        <tr><th>safety</th><td id="t-safety">–</td></tr>
+        <tr><th>requested</th><td id="t-requested">–</td></tr>
+        <tr><th>applied</th><td id="t-applied">–</td></tr>
+        <tr><th>health</th><td id="t-health">–</td></tr>
+        <tr><th>battery</th><td id="t-battery">–</td></tr>
+        <tr><th>temperatures</th><td id="t-temps">–</td></tr>
+      </table>
+      <p class="hint">The frame is <code>robot.subscribe</code> at 2 Hz; the last three rows are
+        <code>robot.health</code>, polled, because none of it is on that stream.</p>
+    </section>
+  </div>
 </main>
 
 <details>
   <summary>console — raw calls, refusals, and the log</summary>
 
-  <div class="row">
-    <!-- Permitted over BLE and refused here, because reconfiguring wifi would take this session
-         with it. The interesting buttons: they prove the route table is being consulted. -->
-    <button data-call="net.connect" data-params='{"ssid":"x","psk":"y"}'>net.connect
-      <span class="dim">(refused)</span></button>
-    <button data-call="system.pairingPin">system.pairingPin <span class="dim">(refused)</span></button>
+  <div class="row stats">
+    <span id="release" class="pill dim">release unknown</span>
+    <span id="api" class="pill dim">api unknown</span>
+    <span id="signalling" class="pill dim"></span>
   </div>
 
   <div class="row">
-    <input id="raw" type="text" spellcheck="false"
+    <!-- Permitted over BLE and refused here, because reconfiguring wifi would take this session
+         with it. The interesting buttons: they prove the route table is being consulted. -->
+    <button data-needs-channel data-call="net.connect" data-params='{"ssid":"x","psk":"y"}'>net.connect
+      <span class="dim">(refused)</span></button>
+    <button data-needs-channel data-call="system.pairingPin">system.pairingPin <span class="dim">(refused)</span></button>
+  </div>
+
+  <div class="row">
+    <input id="raw" type="text" spellcheck="false" data-needs-channel
            value='{"jsonrpc":"2.0","id":99,"method":"robot.health"}'>
-    <button id="send">send</button>
+    <button id="send" data-needs-channel>send</button>
   </div>
 
   <pre id="log"></pre>
@@ -463,7 +545,26 @@ function log(cls, ...parts) {
   logEl.append(line);
   while (logEl.childElementCount > 400) logEl.firstElementChild.remove();
   logEl.scrollTop = logEl.scrollHeight;
+  // **Every failure this page has already comes through here**, including the two `window`
+  // handlers at the bottom, so this one hook puts all of them where somebody is looking. The
+  // drawer keeps the whole record; it just stops being the only copy.
+  if (cls === "bad") alert_(parts.join(" ").replace(/^!!\s*/, ""));
 }
+
+/// The last thing that went wrong, on the page.
+///
+/// Named with a trailing underscore because `alert` is a global this page would otherwise
+/// shadow — and shadowing it inside one function while the rest of the file still sees the
+/// browser's is the kind of difference nobody spots twice.
+function alert_(text) {
+  // **An empty red box is worse than no box**, and it is reachable: a `log("bad", …)` whose parts
+  // are only the `!!` marker strips to nothing. Nothing to say, nothing to show — the drawer still
+  // has the line either way.
+  if (!text.trim()) return;
+  $("alert-text").textContent = text;
+  $("alert").hidden = false;
+}
+function clearAlert() { $("alert").hidden = true; }
 
 function setState(text, cls = "pill") { $("state").textContent = text; $("state").className = cls + " pill"; }
 
@@ -477,6 +578,19 @@ function setState(text, cls = "pill") { $("state").textContent = text; $("state"
 function connectLabel() { return REMOTE && !token ? "sign in with Hugging Face" : "connect"; }
 function setConnectLabel() { $("connect").textContent = connectLabel(); }
 function setDc(text, cls = "dim") { $("dcstate").textContent = text; $("dcstate").className = cls + " pill"; }
+
+/// Whether the controls that need a robot are usable, and the one place that is decided.
+///
+/// **Driven off the control channel, not off "connected".** A session whose ICE is up but whose
+/// datachannel has not opened cannot carry a command, and `call` would refuse it — so the gate
+/// asks the same question `call` asks. `data-needs-channel` in the markup is the list, which
+/// keeps it next to the controls rather than in a query nobody updates.
+function setLive(live) {
+  if (live) document.body.dataset.live = "1";
+  else delete document.body.dataset.live;
+  for (const el of document.querySelectorAll("[data-needs-channel]")) el.disabled = !live;
+}
+setLive(false);
 
 function banner(html) { $("banner").innerHTML = html; $("banner").hidden = false; }
 
@@ -742,7 +856,7 @@ $("robots").onchange = () => {
     send({ type: "endSession", sessionId });
     sessionId = null;
     if (pc) { pc.close(); pc = null; }
-    setDc("no control channel");
+    setDc("no control channel"); setLive(false);
     stopTelemetry();
   }
   send({ type: "list" });
@@ -751,6 +865,7 @@ $("robots").onchange = () => {
 /// Everything that has to be forgotten when a link goes away, whichever link it was.
 function teardown() {
   setState("closed", "bad"); setDc("no control channel");
+  setLive(false);
   setConnectLabel();
   ws = null; stream = null; sessionId = null; control = null;
   wanted = false; starting = false;
@@ -949,7 +1064,7 @@ async function onSignalling(raw) {
         wanted = false;
         starting = false;
         if (pc) { pc.close(); pc = null; }
-        setState("signalling"); setDc("no control channel");
+        setState("signalling"); setDc("no control channel"); setLive(false);
         stopTelemetry();
         break;
 
@@ -1076,9 +1191,16 @@ function newPeerConnection() {
   pc.ondatachannel = (event) => {
     control = event.channel;
     log("dim", "datachannel:", control.label);
-    control.onopen = () => { setDc("control open", "in"); startTelemetry(); };
+    control.onopen = () => {
+      setDc("control open", "in");
+      // The session got where it was going, so whatever failed on the way there is no longer
+      // the most useful thing on the screen.
+      setLive(true); clearAlert();
+      startTelemetry();
+    };
     control.onclose = () => {
       setDc("control closed", "bad");
+      setLive(false);
       stopTelemetry();
       // The detector's boxes came down this channel; with it gone they are stale by definition.
       clearDetections("–");
@@ -1391,6 +1513,7 @@ addEventListener("keydown", (event) => {
   const key = event.key.toLowerCase();
   if (!["w", "a", "s", "d", "q", "e", "arrowup", "arrowdown", "arrowleft", "arrowright"].includes(key)) return;
   event.preventDefault();
+  if (!open()) { log("bad", "!! no control channel — connect to a robot first"); return; }
   keys.add(key);
   refreshTwist();
 });
@@ -1415,6 +1538,9 @@ function wirePad(pad, knob, onMove) {
     knob.style.top = `${50 + 50 * y}%`;
   };
   pad.addEventListener("pointerdown", (event) => {
+    // A knob that slides under your thumb and moves nothing is worse than one that will not
+    // move: it says the robot is being driven. The section is dimmed for the same reason.
+    if (!open()) { log("bad", "!! no control channel — connect to a robot first"); return; }
     pad.setPointerCapture(event.pointerId);
     const at = read(event);
     draw(at.x, at.y); onMove(at);
@@ -1608,6 +1734,8 @@ addEventListener("blur", endRide);
 //
 // A whole line rather than a method and params, because what it is for is sending something this
 // page has no button for — including something malformed, to see what the robot says about it.
+
+$("alert-close").onclick = clearAlert;
 
 $("send").onclick = () => {
   if (!open()) { log("bad", "!! no control channel yet"); return; }
