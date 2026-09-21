@@ -18,13 +18,13 @@ tags:
 Sign in, wake your duck up, press a trick. The trick is downloaded from the Hub onto the duck and
 run, and the card you pressed says which of those it is doing.
 
-**Do not edit this Space directly.** The source is `spaces/policy-playground-next/` in
+**Do not edit this Space directly.** The source is `spaces/policy-playground/` in
 `pollen-robotics/microduck`, and `scripts/publish-space.sh` is what puts it here.
 
 ## Working on it
 
 ```bash
-cd spaces/policy-playground-next/web && npm install
+cd spaces/policy-playground/web && npm install
 ```
 
 ```bash

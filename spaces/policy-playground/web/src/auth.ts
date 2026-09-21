@@ -2,21 +2,21 @@
  * Signing in with Hugging Face, from the page, with no secret anywhere near it.
  *
  * PKCE: the browser proves it started the flow, so the app needs no client secret and this page
- * can be read by anybody. `OAUTH_CLIENT_SECRET` is in the Space's environment and must never reach
- * here — `entrypoint.sh` substitutes only the id, which identifies the app and authorises nothing.
+ * can be read by anybody. `OAUTH_CLIENT_SECRET` is in the Space's environment and must never
+ * reach here — `entrypoint.sh` publishes only the variables a static Space publishes, and that
+ * is not one of them.
  *
- * **The client id is substituted by the server, not injected by the platform.** A static Space is
- * documented to provide `window.huggingface.variables.OAUTH_CLIENT_ID`, and for the console Space
- * it never did — through a rebuild, a privacy flip and a recreation. Its Dockerfile records that
- * afternoon. So this takes the path that depends on nothing that can silently stop happening:
- * `hf_oauth: true` puts the id in the container's environment and eight lines of `sh` put it in
- * the page. `?client_id=` still overrides, which is how a new app is tried before it is written
- * down anywhere.
+ * **The same process as the `telepresence` Space**, whose sign-in works from the Hugging Face
+ * page while this one's did not. Both are Docker Spaces, so neither gets the
+ * `window.huggingface.variables` object a static Space is served with; both therefore write it
+ * themselves out of the environment `hf_oauth: true` provides — `server.mjs` there,
+ * `entrypoint.sh` here. What that buys is below: the app id *and the scopes the app was
+ * provisioned with* come from one place, and this file is then ordinary `@huggingface/hub` code.
+ *
+ * `?client_id=` still overrides, which is how a new app is tried before it is written down
+ * anywhere.
  */
 import { oauthHandleRedirectIfPresent, oauthLoginUrl } from "@huggingface/hub";
-
-/** Substituted by `entrypoint.sh`. Left as the placeholder when the page is served any other way. */
-const SERVED_CLIENT_ID = "{{OAUTH_CLIENT_ID}}";
 
 /**
  * Where the sign-in is remembered.
@@ -31,22 +31,71 @@ export interface SignedIn {
   username: string;
 }
 
-function clientId(): string {
-  const asked = new URLSearchParams(location.search).get("client_id");
-  if (asked) return asked;
+/** What `entrypoint.sh` injected, in the shape a static Space would have been served with. */
+function hfVariables(): Record<string, string> {
   const injected = (window as unknown as { huggingface?: { variables?: Record<string, string> } })
-    .huggingface?.variables?.OAUTH_CLIENT_ID;
-  if (injected) return injected;
-  return SERVED_CLIENT_ID.startsWith("{{") ? "" : SERVED_CLIENT_ID;
+    .huggingface?.variables;
+  return injected ?? {};
+}
+
+function clientId(): string {
+  return new URLSearchParams(location.search).get("client_id")
+    || hfVariables().OAUTH_CLIENT_ID
+    || "";
+}
+
+/**
+ * The scopes to ask for.
+ *
+ * Read rather than assumed, because they are not ours to assume: Hugging Face provisions the
+ * Space's OAuth app from the README and reports back in `OAUTH_SCOPES` what it provisioned.
+ * `openid profile` stays as the fallback for a page served without the injection — a dev server
+ * with `?client_id=` — where there is nothing to read.
+ */
+function scopes(): string {
+  return hfVariables().OAUTH_SCOPES || "openid profile";
 }
 
 /** The redirect the OAuth app must have registered, character for character. */
 const REDIRECT = location.origin + location.pathname;
 
-type Stored = { accessToken: string; userInfo?: { preferred_username?: string; name?: string } };
+interface Named {
+  userInfo?: { preferred_username?: string; name?: string };
+}
 
-function nameOf(result: Stored): string {
-  return result.userInfo?.preferred_username || result.userInfo?.name || "you";
+/** What the library hands back from a redirect: the expiry is a `Date` at this point. */
+type Fresh = Named & { accessToken: string; accessTokenExpiresAt: Date };
+
+/** The same thing after `localStorage`, where `JSON.stringify` turned that `Date` into an ISO string. */
+type Stored = Named & { accessToken: string; accessTokenExpiresAt?: string };
+
+function nameOf(who: Named): string {
+  return who.userInfo?.preferred_username || who.userInfo?.name || "you";
+}
+
+/**
+ * Whether a remembered sign-in is still one.
+ *
+ * **The expiry was remembered and never read.** An access token from `hf_oauth` lives for
+ * `hf_oauth_expiration_minutes` — a day, per the README — and this page stored the whole OAuth
+ * result in `localStorage`, expiry included, then handed the token to the rendezvous forever
+ * after without ever looking at it. A day later the page still said "signed in as …", because a
+ * name is all a stored blob has to offer, and the only sign anything was wrong was the
+ * rendezvous declining to name a duck. Nothing on the screen said "sign in again", because
+ * nothing on the page knew.
+ *
+ * The SDK the `telepresence` Space is built on has always enforced this (`lib/token-store.ts`),
+ * and that is why signing in there kept working. A token past its expiry is treated as absent,
+ * so the page asks for a new one instead of explaining a robot's absence.
+ */
+function stillValid(stored: Stored, now = Date.now()): boolean {
+  if (!stored.accessToken) return false;
+  // A blob written before this check existed has no expiry to read. Treated as usable rather
+  // than dropped: the rendezvous is the one that decides, and a rollout should not sign
+  // everybody out.
+  if (!stored.accessTokenExpiresAt) return true;
+  const expires = new Date(stored.accessTokenExpiresAt).getTime();
+  return Number.isFinite(expires) && expires > now;
 }
 
 /**
@@ -78,9 +127,9 @@ export async function completeSignIn(): Promise<SignedIn | null> {
     return { token: pasted, username: "you (a token from the address bar)" };
   }
 
-  let result: Stored | null = null;
+  let result: Fresh | null = null;
   try {
-    result = (await oauthHandleRedirectIfPresent()) as Stored | null;
+    result = ((await oauthHandleRedirectIfPresent()) || null) as Fresh | null;
   } catch {
     result = null;
   }
@@ -92,13 +141,18 @@ export async function completeSignIn(): Promise<SignedIn | null> {
 
   const remembered = localStorage.getItem(REMEMBERED);
   if (!remembered) return null;
+  let stored: Stored;
   try {
-    const stored = JSON.parse(remembered) as Stored;
-    return stored.accessToken ? { token: stored.accessToken, username: nameOf(stored) } : null;
+    stored = JSON.parse(remembered) as Stored;
   } catch {
-    localStorage.removeItem(REMEMBERED);
+    forgetSignIn();
     return null;
   }
+  if (!stillValid(stored)) {
+    forgetSignIn();
+    return null;
+  }
+  return { token: stored.accessToken, username: nameOf(stored) };
 }
 
 /** Send the visitor to Hugging Face. This page is replaced, so nothing after it runs. */
@@ -113,7 +167,7 @@ export async function beginSignIn(): Promise<void> {
   location.href = await oauthLoginUrl({
     clientId: id,
     redirectUrl: REDIRECT,
-    scopes: "openid profile",
+    scopes: scopes(),
   });
 }
 
