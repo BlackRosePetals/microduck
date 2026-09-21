@@ -1,11 +1,12 @@
-# A page that needs a server only so it can read its own OAuth client id.
+# A page that needs a server only so it can read its own Hugging Face runtime variables.
 #
 # **Why Docker rather than a static Space.** A static Space is documented to inject
-# `window.huggingface.variables.OAUTH_CLIENT_ID`, and for `microduck-console` it never did —
-# through a rebuild, a privacy flip, a recreation, and a page given a real `<head>` to be injected
-# into. Its Dockerfile records that afternoon, and this takes the same way out: `hf_oauth: true`
-# puts the id in the environment and eight lines of `sh` put it in the page. That depends on
-# nothing that can silently stop happening.
+# `window.huggingface.variables`, and for `microduck-console` it never did — through a rebuild, a
+# privacy flip, a recreation, and a page given a real `<head>` to be injected into. Its
+# Dockerfile records that afternoon, and this takes the same way out, which is also the one the
+# `telepresence` Space takes: `hf_oauth: true` puts the values in the environment and
+# `entrypoint.sh` writes that same object into the page itself. That depends on nothing on
+# Hugging Face's side that can silently stop happening.
 #
 # **And no build step here.** The page is built by `npm run build` in `web/` and committed as one
 # self-contained `index.html`, so this image copies a file rather than installing a toolchain.
