@@ -2679,6 +2679,29 @@ pub struct PolicySearchHit {
     pub preview: Option<String>,
 }
 
+impl PolicySearchHit {
+    /// The lines that go under a hit's own line: what the publisher said, and the clip.
+    ///
+    /// Here rather than in each client because `robotctl` and `duckctl` both print this list, and
+    /// two renderings of the same answer would drift exactly where somebody is comparing one tool
+    /// against the other. What each tool keeps is its own: the id column it pads, and the next
+    /// command it suggests, which is not the same command on the robot as it is over a radio.
+    ///
+    /// **The quotes are load-bearing.** The description is a stranger's sentence about a
+    /// stranger's file, and quoting it is what says the tool is repeating rather than asserting —
+    /// the same shape `policy fetch` prints it in.
+    pub fn details(&self) -> Vec<String> {
+        let mut lines = Vec::new();
+        if let Some(description) = &self.description {
+            lines.push(format!("  \"{description}\""));
+        }
+        if let Some(preview) = &self.preview {
+            lines.push(format!("  {preview}"));
+        }
+        lines
+    }
+}
+
 /// How often a subscriber wants [`method::ROBOT_STATE`].
 ///
 /// Decimation is per-subscriber and happens server-side, so a dashboard asking for 10 Hz
@@ -6368,6 +6391,46 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<HelloResult>(&line).unwrap(),
             released
+        );
+    }
+
+    /// Both clients print a hit through this, so the contract is here rather than in either of
+    /// them: quoted description, bare URL, and nothing at all for what the publisher did not say.
+    #[test]
+    fn a_hit_renders_only_what_the_publisher_wrote() {
+        let bare = PolicySearchHit {
+            id: "someone/microduck-thing".into(),
+            origin: "community".into(),
+            ..Default::default()
+        };
+        assert!(bare.details().is_empty());
+
+        let described = PolicySearchHit {
+            description: Some("Bows from a stand.".into()),
+            ..bare.clone()
+        };
+        assert_eq!(described.details(), vec!["  \"Bows from a stand.\""]);
+
+        let both = PolicySearchHit {
+            preview: Some("https://huggingface.co/a/b/resolve/main/media/preview.mp4".into()),
+            ..described
+        };
+        assert_eq!(
+            both.details(),
+            vec![
+                "  \"Bows from a stand.\"",
+                "  https://huggingface.co/a/b/resolve/main/media/preview.mp4",
+            ]
+        );
+
+        // A clip and no sentence is an ordinary repo, not a shape to special-case.
+        let silent = PolicySearchHit {
+            preview: Some("https://huggingface.co/a/b/resolve/main/preview.mp4".into()),
+            ..bare
+        };
+        assert_eq!(
+            silent.details(),
+            vec!["  https://huggingface.co/a/b/resolve/main/preview.mp4"]
         );
     }
 }

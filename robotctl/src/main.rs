@@ -3654,13 +3654,9 @@ fn run_policy_search(updater_socket: &Path, query: &str, json: bool) -> Result<(
     for hit in &found.models {
         let likes = hit.likes.unwrap_or(0);
         println!("{:width$}  {:9}  {likes} likes", hit.id, hit.origin);
-        // Quoted, like `policy fetch` prints it, and for the same reason: it is the publisher's
-        // sentence rather than this tool's, and the quotes are what say so.
-        if let Some(description) = &hit.description {
-            println!("  \"{description}\"");
-        }
-        if let Some(preview) = &hit.preview {
-            println!("  {preview}");
+        // `details`, so this and `duckctl` print a hit the same way. See `PolicySearchHit`.
+        for line in hit.details() {
+            println!("{line}");
         }
     }
     println!(
