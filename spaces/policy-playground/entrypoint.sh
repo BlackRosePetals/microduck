@@ -32,20 +32,35 @@ mkdir -p /srv
 python3 - /app/index.html /srv/index.html <<'PY'
 import json
 import os
+import re
 import sys
 
 # Only what a static Space exposes to the page. Anything absent is left out rather than emitted
 # as null, so a reader's `||` fallback fires the way it would on a static Space.
 PUBLIC = ("OAUTH_CLIENT_ID", "OAUTH_SCOPES", "OPENID_PROVIDER_URL", "SPACE_HOST", "SPACE_ID")
 
+# **The opening tag on a line of its own, not the first `<head>` in the file.** The page's own
+# comments talk about `<head>` — that skeleton being load-bearing is the whole reason it has
+# any — and a plain first-match replace puts the bootstrap *inside an HTML comment*, where it
+# never runs. The page then looks exactly like a Space with no OAuth app, which is the failure
+# those comments are a record of. Anchored, and required to match once.
+HEAD = re.compile(r"^([ \t]*)<head>[ \t]*$", re.MULTILINE)
+
 variables = {name: os.environ[name] for name in PUBLIC if os.environ.get(name)}
 bootstrap = "<script>window.huggingface=%s;</script>" % json.dumps({"variables": variables})
 
 source, target = sys.argv[1], sys.argv[2]
 page = open(source, encoding="utf-8").read()
-if "<head>" not in page:
-    sys.exit("the built page has no <head> to inject into")
-open(target, "w", encoding="utf-8").write(page.replace("<head>", "<head>" + bootstrap, 1))
+found = HEAD.search(page)
+if found is None:
+    sys.exit("no <head> line to inject into; the page cannot sign anybody in")
+if HEAD.search(page, found.end()) is not None:
+    sys.exit("more than one <head> line; refusing to guess which one serves the page")
+
+indent = found.group(1)
+open(target, "w", encoding="utf-8").write(
+    page[: found.start()] + indent + "<head>" + bootstrap + page[found.end() :]
+)
 PY
 
 echo "serving the playground on 7860 (oauth client ${OAUTH_CLIENT_ID:-none})"

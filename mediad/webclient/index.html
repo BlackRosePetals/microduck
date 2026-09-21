@@ -2,10 +2,10 @@
 <!--
   **The `<html>`/`<head>`/`<body>` skeleton is load-bearing, however tempting it is to drop.**
   This page was a bare doctype plus content for most of its life, which browsers parse into the
-  same tree — and Hugging Face's static hosting injects `window.huggingface.variables` (the OAuth
-  client id a remote sign-in needs) by rewriting `<head>`. With no `<head>` there is nothing to
-  rewrite, no client id, and a console that cannot sign anybody in with nothing anywhere saying
-  why. `docs/design/remote-access-design.md` §5.
+  same tree — and the Space that serves it remotely writes `window.huggingface.variables` (the
+  OAuth client id and scopes a remote sign-in needs) into `<head>` as it serves. With no `<head>`
+  there is nothing to write into, no client id, and a console that cannot sign anybody in with
+  nothing anywhere saying why. `docs/design/remote-access-design.md` §5.
 -->
 <html lang="en">
 <head>
@@ -308,8 +308,6 @@ const SIGNALLING_URL = `ws://${location.hostname || "localhost"}:${SIGNALLING_PO
 // a static host caches and a browser caches harder: an hour was spent on a fix that was never
 // being loaded, and the only way to know is for the page to say so itself.
 const BUILD = "{{CONSOLE_BUILD}}";
-// The OAuth app of whatever is serving this page, put here by `entrypoint.sh`.
-const SERVER_CLIENT_ID = "{{OAUTH_CLIENT_ID}}";
 const BUILD_LABEL = BUILD.startsWith("{{") ? "unpublished (served by a robot or a checkout)" : BUILD;
 
 const PARAMS = new URLSearchParams(location.search);
@@ -340,35 +338,39 @@ const KIND = "microduck";
 // than tracking a major.
 const HUB_ESM = "https://cdn.jsdelivr.net/npm/@huggingface/hub@2.11.2/+esm";
 
-// The OAuth app this page signs in with.
-//
-// **Explicit, rather than the client id a Space is documented to inject.** `hf_oauth: true` in a
-// static Space's front matter did not produce a `window.huggingface` on this page however it was
-// loaded, and chasing why is chasing somebody else's platform. An app registered once at
-// `huggingface.co/settings/applications/new` — client ids are public, which is why one can sit in
-// a page — takes that whole question out of the picture, and takes with it the assumption that
-// this page is served by a Space at all: the same id works from anywhere its redirect URI names.
-//
-// `?client_id=` overrides, which is how a new one is tried before it is written down here. An
-// injected one is still preferred if a Space ever provides it, because that one cannot go stale.
-/// The client id, read **when it is needed** rather than when this file is parsed.
+/// What the Space injected: the object a `sdk: static` Space is served with.
 ///
-/// **That distinction was the whole bug.** Hugging Face injects `window.huggingface.variables`
-/// into a static Space with a script tag of its own, and this page's script is inline in the body
-/// — so anything read at parse time is read before the platform's script has run. A bundled app
+/// **Read when it is needed, not when this file is parsed.** This page's script is inline in the
+/// body, so anything read at parse time is read before a `<head>` script has run. A bundled app
 /// (`reachy_mini_website`, the SDK's host shell) never notices, because a module bundle executes
 /// after the document. Read late and it is there; read early and a Space with a perfectly good
 /// OAuth app looks like a Space with none, which is exactly what this page reported for a day.
+///
+/// **And the injection is the Space's own**, written by its `entrypoint.sh` out of the
+/// environment `hf_oauth: true` provides — the same move `telepresence`'s `server.mjs` makes, and
+/// the reason its sign-in works from the Hugging Face page. Hugging Face's own injection is for
+/// static Spaces and never reached this one; waiting for it was the day above. Served by a robot
+/// or opened from a checkout there is no object at all, which is correct: signing in to a
+/// rendezvous is not a thing anybody is doing there.
+function hfVariables() {
+  return (window.huggingface && window.huggingface.variables) || {};
+}
+
+/// The OAuth app this page signs in with. `?client_id=` overrides, which is how a new one is
+/// tried before it is registered anywhere.
 function oauthClientId() {
-  // Substituted by the Space's `entrypoint.sh` from its `OAUTH_CLIENT_ID` environment variable.
-  // Left as a literal token on the robot's copy and in a checkout, where signing in to a
-  // rendezvous is not a thing anybody is doing.
-  const served = SERVER_CLIENT_ID.startsWith("{{") ? "" : SERVER_CLIENT_ID;
-  // Static Spaces are documented to inject this. This one never did — see the Space's README —
-  // but it is read first anyway, because an id from the platform cannot go stale the way a
-  // baked-in one can.
-  const injected = (window.huggingface && window.huggingface.variables) || {};
-  return PARAMS.get("client_id") || injected.OAUTH_CLIENT_ID || served;
+  return PARAMS.get("client_id") || hfVariables().OAUTH_CLIENT_ID || "";
+}
+
+/// The scopes to ask for.
+///
+/// `openid profile` is all this needs — the token's whole job is proving an identity to the
+/// rendezvous, and the argument for keeping it that narrow is `remote-access-design.md` §2.4's.
+/// It is read from the Space rather than written here anyway, because the Space's app is
+/// provisioned from its README and `OAUTH_SCOPES` is Hugging Face reporting back what it
+/// provisioned. A page asking for scopes its app does not have is a refusal nobody can read.
+function oauthScopes() {
+  return hfVariables().OAUTH_SCOPES || "openid profile";
 }
 
 // Where Hugging Face sends the browser back to. This page, without its query string — and it has
@@ -378,6 +380,46 @@ const OAUTH_REDIRECT = location.origin + location.pathname;
 // Where the sign-in is remembered. `localStorage`, not `sessionStorage`: the OAuth redirect can
 // land in a new tab, and a session store is per-tab.
 const OAUTH_KEY = "duck-console-oauth-v2";
+
+/// The remembered sign-in, if it is still one.
+///
+/// **The expiry was remembered and never read.** An `hf_oauth` access token lives for
+/// `hf_oauth_expiration_minutes` — a day, per the Space's card — and this page stored the whole
+/// OAuth result, expiry included, then handed the token to the rendezvous forever after without
+/// ever looking at it. A day later the header still said who you were, because a name is all a
+/// stored blob has to offer, and the rendezvous answered a token it could not resolve the only
+/// way it can: with no duck. Which reads as the duck being off.
+///
+/// The SDK behind `telepresence` has always enforced this (`lib/token-store.ts`), and that is why
+/// signing in there kept working. A token past its expiry is treated as absent, so the page asks
+/// for a new one instead of explaining a robot's absence.
+function rememberedSignIn() {
+  const raw = localStorage.getItem(OAUTH_KEY);
+  if (!raw) return null;
+  let stored;
+  try {
+    stored = JSON.parse(raw);
+  } catch {
+    localStorage.removeItem(OAUTH_KEY);
+    return null;
+  }
+  if (!stored || !stored.accessToken) {
+    localStorage.removeItem(OAUTH_KEY);
+    return null;
+  }
+  // `JSON.stringify` turned the library's `Date` into an ISO string on the way in. A blob written
+  // before this check existed has no expiry to read: treated as usable rather than dropped,
+  // because the rendezvous is the one that decides and a deploy should not sign everybody out.
+  if (stored.accessTokenExpiresAt) {
+    const expires = new Date(stored.accessTokenExpiresAt).getTime();
+    if (!Number.isFinite(expires) || expires <= Date.now()) {
+      log("dim", "the remembered sign-in expired; signing in again");
+      localStorage.removeItem(OAUTH_KEY);
+      return null;
+    }
+  }
+  return stored;
+}
 
 // How long any step of the sign-in gets before the page says so and moves on.
 //
@@ -424,6 +466,16 @@ function log(cls, ...parts) {
 }
 
 function setState(text, cls = "pill") { $("state").textContent = text; $("state").className = cls + " pill"; }
+
+/// What the one button on this page does next, which is not always "connect".
+///
+/// **A signed-out remote console used to say so only in the log**, which is a collapsed drawer
+/// nobody opens before they have a reason to. So the first visit offered `connect`, the press
+/// went to Hugging Face, and the round trip was the explanation. Now the button names the step.
+/// It matters more since a remembered sign-in expires on its own: landing on a page that has just
+/// dropped one is the same first visit, and it should read like one.
+function connectLabel() { return REMOTE && !token ? "sign in with Hugging Face" : "connect"; }
+function setConnectLabel() { $("connect").textContent = connectLabel(); }
 function setDc(text, cls = "dim") { $("dcstate").textContent = text; $("dcstate").className = cls + " pill"; }
 
 function banner(html) { $("banner").innerHTML = html; $("banner").hidden = false; }
@@ -552,20 +604,23 @@ async function resumeSignIn() {
   log("dim", `remote mode: rendezvous ${RENDEZVOUS}`);
 
   const returning = PARAMS.has("code") || location.hash.includes("code=");
-  const stored = localStorage.getItem(OAUTH_KEY);
+  const stored = rememberedSignIn();
   const clientId = oauthClientId();
   if (!clientId) {
-    log("bad", "!! no OAuth client id. On a Space this arrives as",
-               "`window.huggingface.variables.OAUTH_CLIENT_ID` from `hf_oauth: true` in the",
-               "README — if that is set and this still fires, the platform's script had not run",
-               "yet. Otherwise register an app with", OAUTH_REDIRECT, "as its redirect URI, or",
-               "pass `?client_id=` to try one.");
+    log("bad", "!! no OAuth client id. On the Space it arrives as",
+               "`window.huggingface.variables.OAUTH_CLIENT_ID`, written into this page's `<head>`",
+               "by `entrypoint.sh` from what `hf_oauth: true` puts in its environment — if the",
+               "Space is serving this and the object is missing, that is the injection to look",
+               "at. Otherwise register an app with", OAUTH_REDIRECT, "as its redirect URI, and",
+               "pass `?client_id=` to use it.");
     setState("no sign-in", "bad");
     return;
   }
   log("dim", `oauth client ${clientId.slice(0, 8)}…, redirect ${OAUTH_REDIRECT}`);
   if (!returning && !stored) {
-    log("dim", "not signed in. `connect` signs in with Hugging Face.");
+    setState("not signed in");
+    setConnectLabel();
+    log("dim", "not signed in. The button signs in with Hugging Face.");
     return;
   }
 
@@ -588,7 +643,7 @@ async function resumeSignIn() {
       localStorage.setItem(OAUTH_KEY, JSON.stringify(result));
       history.replaceState(null, "", location.pathname);
     } else {
-      result = JSON.parse(stored);
+      result = stored;
     }
     token = result.accessToken;
     const who = result.userInfo && (result.userInfo.preferred_username || result.userInfo.name);
@@ -596,6 +651,7 @@ async function resumeSignIn() {
     $("account").hidden = false;
     log("dim", `signed in as ${who || "somebody"}; \`connect\` opens the session`);
     setState("signed in");
+    setConnectLabel();
   } catch (e) {
     log("bad", "!! the sign-in did not complete:", e.message || String(e));
     if (returning) {
@@ -603,7 +659,9 @@ async function resumeSignIn() {
       history.replaceState(null, "", location.pathname);
     }
     localStorage.removeItem(OAUTH_KEY);
+    token = null;
     setState("no sign-in", "bad");
+    setConnectLabel();
   }
 }
 
@@ -636,18 +694,19 @@ async function signIn() {
   }
 
   if (!oauthClientId()) {
-    throw new Error("this page has no OAuth client id, so it cannot sign anybody in. Register an "
-      + "app at huggingface.co/settings/applications/new with this page's URL as its redirect "
-      + `URI (${OAUTH_REDIRECT}) and the scopes \`openid profile\`, then put its client id in `
-      + "this page — or pass it as `?client_id=` to try one.");
+    throw new Error("this page has no OAuth client id, so it cannot sign anybody in. On the "
+      + "Space it arrives from `hf_oauth: true` in the README, which `entrypoint.sh` writes into "
+      + "the page as `window.huggingface.variables`. Anywhere else, register an app at "
+      + `huggingface.co/settings/applications/new with ${OAUTH_REDIRECT} as its redirect URI and `
+      + "the scopes `openid profile`, then pass it as `?client_id=`.");
   }
 
-  const stored = localStorage.getItem(OAUTH_KEY);
+  const stored = rememberedSignIn();
   log("dim", "asking Hugging Face who you are…");
   let result;
   try {
     result = (await within("the sign-in code exchange", hub.oauthHandleRedirectIfPresent()))
-      || (stored ? JSON.parse(stored) : null);
+      || stored;
   } catch (e) {
     localStorage.removeItem(OAUTH_KEY);
     throw new Error(`the sign-in did not complete (${e.message || e})`);
@@ -660,7 +719,7 @@ async function signIn() {
       url = await hub.oauthLoginUrl({
         clientId: oauthClientId(),
         redirectUrl: OAUTH_REDIRECT,
-        scopes: "openid profile",
+        scopes: oauthScopes(),
       });
     } catch (e) {
       throw new Error(`this page cannot build a sign-in URL (${e.message || e}). The client id it `
@@ -692,7 +751,7 @@ $("robots").onchange = () => {
 /// Everything that has to be forgotten when a link goes away, whichever link it was.
 function teardown() {
   setState("closed", "bad"); setDc("no control channel");
-  $("connect").textContent = "connect";
+  setConnectLabel();
   ws = null; stream = null; sessionId = null; control = null;
   wanted = false; starting = false;
   stopTelemetry();
