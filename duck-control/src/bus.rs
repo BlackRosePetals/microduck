@@ -4,6 +4,11 @@
 //! `sync_write` of goal positions. The IMU is listed first so it answers before the servo
 //! burst.
 //!
+//! Every sync read here is a **fast** sync read (protocol 2.0 instruction 0x8A): the devices
+//! append their answers to one status packet from the broadcast id instead of each sending
+//! its own, which drops fifteen packet headers and fifteen bus turnarounds from the tick.
+//! See [`open_controller`].
+//!
 //! Battery and thermals are the one thing that does not fit that shape: they live at registers
 //! outside the block the tick fetches, so [`RobotIo::slow_sensors`] is a transaction of its
 //! own, meant to be called about once a second rather than every tick.
@@ -396,7 +401,19 @@ impl DynamixelIo {
     }
 }
 
-/// The serial port at `baud`, wrapped in a Protocol 2 controller.
+/// The serial port at `baud`, wrapped in a Protocol 2 controller that reads fast.
+///
+/// `with_fast_sync_read` routes every `sync_read_*` through instruction 0x8A, so it covers
+/// the tick's combined read, [`RobotIo::slow_sensors`] and [`DynamixelIo::present_positions`]
+/// without any of them naming it. The saving is a packet header and a turnaround — the
+/// device's `return_delay_time`, which [`EXPECTED_REGISTERS`] pins low precisely because it
+/// is paid per device — for each of the sixteen devices on the bus.
+///
+/// It is all or nothing: one status packet carries every block, so a device whose firmware
+/// does not implement 0x8A does not answer and the whole read times out. That is the same
+/// shape of failure a silent servo already causes on a plain sync read, and the tick coasts
+/// over a dropped read either way. XL330 firmware needs to be v46 or newer; the
+/// `imu_to_dxl` board is `id 200` on this bus and has to implement it too.
 fn open_controller(port: &str, baud: u32) -> Result<Xl330Controller> {
     let serial = serialport::new(port, baud)
         .timeout(READ_TIMEOUT)
@@ -407,6 +424,7 @@ fn open_controller(port: &str, baud: u32) -> Result<Xl330Controller> {
         })?;
     Ok(Xl330Controller::new()
         .with_protocol_v2()
+        .with_fast_sync_read()
         .with_serial_port(serial))
 }
 
