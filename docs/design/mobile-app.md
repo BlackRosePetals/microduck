@@ -25,7 +25,7 @@ over the same radio, with the same reply.
 | screen | calls |
 |---|---|
 | pick a robot | the advertisement — name and IPv4 — then `hello` and `system.authenticate` |
-| the robot | `system.info`, `robot.health`, `system.services`, `system.setName`, `system.reboot`, `robot.init`, `robot.enable` |
+| the robot | `system.info`, `robot.health`, `system.services`, `system.setName`, `system.reboot`, `robot.init`, `robot.enable`, `robot.rebootMotors` |
 | drive | WebRTC: video, `robot.move`, `robot.subscribe` |
 | moves | `robot.skills`, `robot.do`, `robot.policies`, `robot.loadPolicy`, `policy.check`, `policy.search`, `policy.fetch`, `policy.install` |
 | wifi | `net.status`, `net.scan`, `net.connect`, `net.forget` |
@@ -35,9 +35,9 @@ over the same radio, with the same reply.
 
 Anything it turns out to need that is not routed is a one-line change to `route.rs` and a decision
 about whether it belongs on a radio — which is the property §3.1 exists to give us. The app has now
-tested that property four times: `update.rollback` and `update.select`, then `robot.init`, then
-`robot.enable`, each opened because using the app found the refusal costing something the refusal's
-own reasoning had not accounted for.
+tested that property five times: `update.rollback` and `update.select`, then `robot.init`, then
+`robot.enable`, then `robot.rebootMotors`, each opened because using the app found the refusal
+costing something the refusal's own reasoning had not accounted for.
 
 ### 1.1 It is the robot's interface, not a settings utility
 
@@ -50,9 +50,15 @@ That is why the machinery below is not over-engineering. A settings utility coul
 call and a spinner; an interface cannot.
 
 What stays off the radio: continuous intent and anything streaming (`robot.move`, `robot.subscribe`,
-`tof.stream`, `pad.input`), the pairing PIN, `update.pin` and `update.resetToGolden`, and the two
-calls whose failure mode is the floor — `robot.relax` and `robot.rebootMotors`. The first group
-belongs to the other transport; the rest belongs to a person at a terminal on the robot.
+`tof.stream`, `pad.input`), the pairing PIN, `update.pin` and `update.resetToGolden`, and the one
+call whose only outcome is the floor — `robot.relax`. The first group belongs to the other
+transport; the rest belongs to a person at a terminal on the robot.
+
+`robot.rebootMotors` was in that last group and is not any more, and the pair is worth keeping
+straight: relaxing a robot that is holding itself up *produces* the fall, while rebooting a servo
+that has latched an overload recovers a robot which stopped holding itself some time ago — and
+until this was routed, the app could name the tripped joint on `robot.health` and offer nothing but
+ssh. The arm in `route.rs` carries the reasoning.
 
 ### 1.2 Two transports, and they are not rivals
 

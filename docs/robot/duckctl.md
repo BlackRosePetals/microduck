@@ -274,6 +274,22 @@ duckctl --name <robot-name> health
 Whether the control loop is healthy.
 
 ```bash
+duckctl --name <robot-name> reboot-motors
+```
+
+The way back from a servo in hardware error — overload, overheating, electrical shock — which
+otherwise holds torque off until the battery is pulled. `health` names the joint. Add ids to reboot
+only those:
+
+```bash
+duckctl --name <robot-name> reboot-motors 3 11
+```
+
+**Torque goes off on every joint first**, so hold the robot or have it lying down. It stays limp
+afterwards, with the gains restored on the next write — press Start on the pad, or
+`duckctl call robot.init`, to stand it back up.
+
+```bash
 duckctl --name <robot-name> status
 ```
 
@@ -649,15 +665,17 @@ watching, and `update status` afterwards says how it went.
 
 ## What is refused
 
-Teleop (`robot.move`, `robot.head`, `robot.enable`, `robot.stop`, `robot.init`, `robot.relax`),
-high-rate telemetry (`robot.subscribe`), the two update commands a person has to mean
-(`update.pin`, `update.resetToGolden`) and the pairing PIN (`system.pairingPin`,
-`system.setPairingPin`) are refused by `btd` itself and never reach a daemon.
+Teleop (`robot.move`, `robot.head`, `robot.look`, `robot.pose`, `robot.mouth`), the emergency stop
+(`robot.stop`), letting the joints go (`robot.relax`), high-rate telemetry (`robot.subscribe`), the
+two update commands a person has to mean (`update.pin`, `update.resetToGolden`) and the pairing PIN
+(`system.pairingPin`, `system.setPairingPin`) are refused by `btd` itself and never reach a daemon.
+They come back as error code 14, "not available over Bluetooth".
 
-`robot.do` is **not** in that list, though it moves the robot: teleop is a stream of fifty small
-updates a second, which is what a 20-byte notification budget cannot carry, and a skill is one
-request. They come back as
-error code 14, "not available over Bluetooth".
+`robot.do`, `robot.init`, `robot.enable` and `robot.rebootMotors` are **not** in that list, though
+all four move the robot: teleop is a stream of fifty small updates a second, which is what a
+20-byte notification budget cannot carry, and each of these is one request. `robot.relax` is the
+one that stays refused on grounds other than rate — its only outcome is a robot that was holding
+itself up and now is not.
 
 That is a security boundary rather than a missing feature, and each refusal has its reason next
 to it in `btd/src/route.rs` — [`app-path-design.md`](../design/app-path-design.md) §3.1 is the
