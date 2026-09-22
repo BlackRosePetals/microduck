@@ -87,7 +87,8 @@ short ray for its heading, screen-up is the heading it booted with. There is no 
 this is relative motion and it drifts; it answers "did it walk in a circle" and not "where is it".
 
 `q` quits; `↑`/`↓` scroll the joint list on a window too short for all of it; `u` switches the
-angles between degrees and radians; `t` opens the [ToF matrix](#the-tof-sensor-tofd); `d` toggles
+angles between degrees and radians; `t` opens the [ToF matrix](#the-tof-sensor-tofd); `c` opens
+[the camera](#the-camera-mediad); `d` toggles
 the robot view and `[` / `]` orbit it; `p` opens the pad's raw input stream — every evdev report
 from the gamepad, with the gaps between them, which is the only place a stalled radio is visible
 ([pair a gamepad](pair-a-gamepad.md#when-it-drops-while-you-are-driving)). A pad with an inertial
@@ -122,7 +123,8 @@ about a robot behaving oddly, and until now answering it meant a full-screen edi
 An interactive editor over `/etc/robot/robotd.toml`: every key the daemons know, the feature
 switches first (policy on/off, walk/roller, limp-fall, audio, pet detection, battery
 shutdown, camera and video quality…), current value against default, one line of doc. SPACE toggles, ENTER types a
-value, `u` reverts a key to its default. Values in yellow (marked `•`) are the keys where
+value, `u` reverts a key to its default, `ctrl+f` opens a fuzzy search over everything on
+screen (the selection follows as you type; ENTER or ESC keeps it there). Values in yellow (marked `•`) are the keys where
 this robot diverges from the defaults; everything else is the built-in default, and `unset`
 optionals show what they resolve to `(auto)`.
 
@@ -138,8 +140,10 @@ Three properties worth trusting:
 - **It cannot write a file robotd refuses to start on.** Every save is validated through the
   daemon's own loader first, atomically (temp file + rename), and rejected with the reason.
 
-The daemons read the file once at startup, so saving offers a restart — of the ones that read
-what you changed: `[media]` is `mediad`, everything else is `robotd`. `sudo`, because the file
+Saving offers what the change actually needs, from the daemon that actually reads it: a restart
+for most keys (`[media]` and `[duck_detector]` are `mediad`'s, `[head_imu]` is `tofd`'s), a `robotd`
+*reload* for `[policy]` — the motors stay powered — and nothing at all for `[pad]` and
+`[pad_imu_head_control]`, which `padd` picks up within a second. `sudo`, because the file
 is root-owned — without it the editor opens read-only and says so on the first write.
 `--file` points it elsewhere for a bench copy. The shipped `deploy/robotd.toml` stays the
 reference for *why* each knob exists; this is for flipping them.
@@ -151,9 +155,12 @@ sudo robotctl configure
 ```
 
 Set `media.quality` — `1080p30`, `720p30`, `720p15` or `360p30` — and take the restart it
-offers. `media.camera` off streams a test pattern instead, which is what a board with no camera
+offers. `media.source` set to `test` streams a test pattern instead, which is what a board with
+no camera
 wants: the WebRTC *control* channel rides on the video track, so a pipeline that cannot start
-costs both. `media.bitrate` follows the quality unless you set it; the unit is bits per second.
+costs both. The pattern ignores `media.quality` and runs at 256x144@5 — it is there to make the
+session exist, and drawing a 720p one costs five times the CPU a real camera does.
+`media.bitrate` follows the quality unless you set it; the unit is bits per second.
 
 `media.congestion_control` is the other knob in that section, and it is the one that moves CPU:
 `disabled` drops the bandwidth estimator, which is the largest single consumer in `mediad` (7.6% of
@@ -215,6 +222,23 @@ nothing and says so plainly when the Hub cannot be reached. `update` takes the n
 name one — `--version v1` is how to go back. The robot returns to its home pose, re-reads every
 slot and drives again, and **a slot you loaded yourself is left alone**, because it points
 somewhere else entirely.
+
+#### A newer duck detector
+
+The model `mediad` finds other ducks with lives on the Hub the same way
+(`pollen-robotics/microduck-duck-detector`) and versions on its own line:
+
+```
+robotctl duck-detector check
+```
+
+```
+sudo robotctl duck-detector update
+```
+
+Same shape as the policy pair — `--version <tag>` names one, and `check` changes nothing. `update`
+restarts `mediad`, which drops the console's video for a moment; whether the detector then runs at
+all is `[duck_detector] enabled` in `robotctl configure`.
 
 #### Trying your own file
 
@@ -434,6 +458,9 @@ corrupt each other's replies:
 sudo systemctl stop robotd && sudo /opt/robot/daemon/current/bin/robotd init && sudo systemctl start robotd
 ```
 
+`reboot-motors` is also reachable over Bluetooth, as `duckctl reboot-motors`
+([`duckctl.md`](duckctl.md)) — `relax` is not.
+
 **Replacing a motor** needs no configuration tool. Fit the new servo straight from the box (ID 1,
 57 600 baud), power the servos, and `robotd` — or `robotd init` — finds the one joint that no longer
 answers, flashes the new servo as that joint, sets its registers and reboots it. The journal says
@@ -480,7 +507,7 @@ mapping is the prototype's, so muscle memory carries over:
 | left stick | drive: forward/back and strafe · head: head yaw and pitch · body pose: up and crouch |
 | right stick | drive: turn · head: neck pitch and head roll · body pose: pitch and roll |
 | **Start** | first press: torque on and a 2 s ramp to the home pose, then hold. Second press: the policy drives. After that it toggles the policy |
-| **Y** / triangle | head mode: sticks pose the head (body holds still). With `[imu_head] enabled` and a pad that has an IMU: the pad's tilt poses the head and the sticks keep driving — see below |
+| **Y** / triangle | head mode: sticks pose the head (body holds still). With `[pad_imu_head_control] enabled` and a pad that has an IMU: the pad's tilt poses the head and the sticks keep driving — see below |
 | **B** / circle | body-pose mode: sticks lean and crouch the standing robot |
 | **A** / cross | ground pick |
 | **X** / square | roulade — one forward roll; hold to chain rolls |
@@ -757,6 +784,54 @@ The sensor shares the codec's I²C bus, so `setup-board.sh`'s audio section alre
 provisions the bus itself; the ToF step only adds the stable `/dev/i2c-pihat`
 name. Both sensor generations are supported — a VL53L5CX and a VL53L8CX are
 interchangeable on the board, and the daemon picks the driver from an ID read.
+
+#### The head IMU (`head_imu.stream`)
+
+`tofd` also serves the head module's BMI088 — gyro, acceleration and a Madgwick
+orientation — and it is **off by default**: `[head_imu] enabled` in `robotd.toml`,
+set with `robotctl configure`, which offers the `tofd` restart. Reading it costs
+~4% of a core at 100 Hz and nothing subscribes yet, so a duck that is not mapping
+was paying that from boot. A subscriber while it is off gets a reason naming the
+key, not the silence an unfitted sensor gives. `tofd --imu` reads it for one
+session without touching the file, and `--imu-hz` trades rate for cost linearly.
+
+None of this touches depth: the ToF ranges either way, so the grid above works on
+a duck whose IMU has never been switched on.
+
+### The camera (`mediad`)
+
+A frame from the head camera, in the terminal. `robotctl monitor`, then **`c`**:
+
+```
+camera 1280×720 · mount 90° · answered in 41 ms                    0.5 s ago
+```
+
+The picture is drawn two pixels per character cell, the right way up whatever the mount angle is.
+It is small — after this robot's quarter turn the picture is portrait, about 16 pixels across —
+and that is enough for what a number cannot say: where the head is really pointing, whether the
+room is lit well enough to detect anything in, whether the lens is smeared or a thumb is over it.
+
+**Nothing is fetched while the block is shut.** A frame is 1.84 MiB that `mediad` copies off the
+capture branch only because somebody asked for it, so a monitor left running with the block closed
+costs the camera nothing. Open, it asks twice a second, and `answered in 41 ms` is the camera's own
+liveness: the request waits for the *next* capture, so a healthy 30 fps camera answers in about a
+frame period and a stopped one takes the timeout and fails. Closing the block forgets the picture,
+so reopening shows a fresh frame rather than the room as it was ten minutes ago.
+
+| the block says | what it means |
+| --- | --- |
+| `asking mediad for a frame…` | the first request is still in flight |
+| `no picture: connection refused` | `mediad` is not running |
+| `no picture: no frame arrived within the capture timeout` | `mediad` is up; the camera is not producing |
+
+For a full-size picture rather than a thumbnail:
+
+```
+robotctl frame --output /tmp/frame.uyvy
+```
+
+One raw UYVY frame, with the geometry and the mount angle printed to stderr. The console `mediad`
+serves on `:8080` has the same frame as a PNG at `GET /frame`, already turned upright.
 
 ### Wifi (`configd`)
 
@@ -1088,9 +1163,11 @@ sudo cat /var/lib/robot/updater/runs/000042.jsonl
 
 ### Tab completion
 
-`install.sh` sets this up in `/etc/bash_completion.d/`, as a loader that asks the binary for its own
-completions — so they follow the installed release instead of going stale when an update adds a
-command. For a shell it did not cover, or for a build you are running straight out of `target/`:
+`install.sh` sets this up in `/usr/share/bash-completion/completions/`, as a loader that asks the
+binary for its own completions — so they follow the installed release instead of going stale when
+an update adds a command. It sits there rather than in `/etc/bash_completion.d/` so that it is read
+the first time you type `robotctl<TAB>` rather than at every login; an update moves the older
+copy. For a shell it did not cover, or for a build you are running straight out of `target/`:
 
 ```
 eval "$(robotctl completions bash)"

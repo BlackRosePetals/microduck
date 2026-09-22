@@ -399,6 +399,7 @@ mod tests {
                         serial: Some("3fa1c51b".to_owned()),
                         release: "0.10.0".to_owned(),
                         api_version: proto::API_VERSION,
+                        simulated: false,
                     },
                     90,
                     dir.path().join("hf-token"),

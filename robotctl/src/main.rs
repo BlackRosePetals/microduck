@@ -40,8 +40,11 @@ use clap::{Args, CommandFactory, Parser, Subcommand};
 use duck_ipc_proto as proto;
 use robotd_params::Slot;
 
+mod camera;
+mod cells;
 mod configure;
 mod duck;
+mod frame;
 mod imu_view;
 mod monitor;
 mod path_map;
@@ -107,6 +110,10 @@ struct Cli {
     #[arg(long, global = true, default_value = proto::socket::TOF)]
     tof_socket: PathBuf,
 
+    /// Local camera snapshot socket.
+    #[arg(long, global = true, default_value = proto::socket::MEDIA)]
+    media_socket: PathBuf,
+
     #[command(subcommand)]
     namespace: Namespace,
 }
@@ -115,6 +122,11 @@ struct Cli {
 /// `robotctl motors` later is additive rather than a restructure.
 #[derive(Subcommand, Debug)]
 enum Namespace {
+    /// Save one fresh raw UYVY frame; geometry is printed to stderr.
+    Frame {
+        #[arg(long, default_value = "frame.uyvy")]
+        output: PathBuf,
+    },
     /// Wifi. Served by `configd`, which drives NetworkManager.
     #[command(subcommand_required = true, arg_required_else_help = true)]
     Net {
@@ -266,6 +278,19 @@ enum Namespace {
         file: PathBuf,
     },
 
+    /// The duck detector — which model `mediad` looks for other ducks with.
+    ///
+    /// The model is trained in `pollen-robotics/duck_detector` and published on the Hub as
+    /// `pollen-robotics/microduck-duck-detector`; a robot installs it from there the way it
+    /// installs the official policy set, into `/opt/robot/detector/current`, so a retrain is a
+    /// tag rather than a daemon release. `[duck_detector]` in the config says whether the detector runs
+    /// at all (`robotctl configure`); this is about which model it runs.
+    #[command(subcommand_required = true, arg_required_else_help = true)]
+    DuckDetector {
+        #[command(subcommand)]
+        command: DuckDetectorCommand,
+    },
+
     /// Watch what the robot is doing, live.
     ///
     /// This is the one window into the control loop. It shows what a client asked for
@@ -328,7 +353,7 @@ enum Namespace {
     /// loader that sources this at shell start rather than a snapshot of it: the snapshot
     /// would go stale the first time an update adds a subcommand.
     ///
-    ///   robotctl completions bash > /etc/bash_completion.d/robotctl
+    ///   robotctl completions bash > /usr/share/bash-completion/completions/robotctl
     Completions {
         /// bash, zsh, fish, elvish or powershell.
         shell: clap_complete::Shell,
@@ -891,6 +916,33 @@ enum AccountCommand {
     },
     /// Forget the account. The robot stops being reachable from outside the LAN.
     Logout {
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+/// `robotctl duck-detector …`
+#[derive(Subcommand, Debug)]
+enum DuckDetectorCommand {
+    /// Is there a newer duck detector than the one installed?
+    ///
+    /// Asks the Hub what revisions the detector's own repo offers, against the one on the
+    /// board. Changes nothing, and an unreachable Hub is reported rather than treated as a
+    /// failure.
+    Check {
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Install a duck detector from the Hub and run it.
+    ///
+    /// The newest revision unless `--version` names one, which is also how to go back. `mediad`
+    /// is restarted onto it — the model is loaded once, at its start — which drops the console's
+    /// video for a moment; `[duck_detector] enabled` decides whether the detector then runs at all.
+    Update {
+        /// A revision in the detector repo — a tag like `v2`. Omit for the newest.
+        #[arg(long)]
+        version: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -1624,8 +1676,30 @@ fn render_health(report: &HealthReport) -> String {
             // Its own line, next to the motors rather than merged with them: hot servos and a
             // hot board are different faults with different fixes, and a reader scanning for
             // "what is too hot here" needs to see which.
-            if let Some(cpu) = health.cpu_temp_c {
-                let _ = writeln!(out, "  {:<9} {cpu:.0} °C", "cpu");
+            //
+            // The clock joins the temperature on that line rather than taking one of its own,
+            // because it is the *consequence* of it: 95 °C on its own reads as a warm robot,
+            // and "95 °C, held at 408 of 1800 MHz" is why the duck is walking badly. Silent
+            // while nothing is holding the clock down — an unthrottled board is every healthy
+            // robot, and a clause it always wore is a clause nobody would read on the one that
+            // is not.
+            let temp = health.cpu_temp_c.map(|c| format!("{c:.0} °C"));
+            let clock = health
+                .cpu_throttle
+                .filter(proto::CpuThrottle::throttled)
+                .map(|t| {
+                    format!(
+                        "throttled to {} of {} MHz (level {} of {})",
+                        t.khz / 1000,
+                        t.max_khz / 1000,
+                        t.level,
+                        t.max_level
+                    )
+                });
+            // Either half on its own, because either can be the one the kernel does not offer.
+            let cpu: Vec<String> = [temp, clock].into_iter().flatten().collect();
+            if !cpu.is_empty() {
+                let _ = writeln!(out, "  {:<9} {}", "cpu", cpu.join(" · "));
             }
         }
         (None, Some(why)) => {
@@ -2581,6 +2655,12 @@ fn run_system(socket: &Path, command: SystemCommand) -> Result<(), Failure> {
         SystemCommand::Info { .. } => {
             let info: proto::SystemInfoResult = decode(&result)?;
             println!("name    {}", info.name);
+            // First, and only when true. Everything below this line reads the same for a duck in
+            // MuJoCo as for one on the desk — which is the point of the simulator, and is also how
+            // somebody ends up debugging the wrong robot.
+            if info.simulated {
+                println!("body    MuJoCo (this is a simulated duck)");
+            }
             println!(
                 "serial  {}",
                 // A board with no readable SoC serial, not a board nobody provisioned: the
@@ -3037,9 +3117,11 @@ fn run_policy(
     // `check` and `update` are `updaterd`'s: they need a network stack, which this binary
     // deliberately does not link and `robotd` deliberately does not have.
     match &command {
-        PolicyCommand::Check { json } => return run_policy_check(updater_socket, *json),
+        PolicyCommand::Check { json } => {
+            return run_set_check(updater_socket, Set::Policies, *json);
+        }
         PolicyCommand::Update { version, json } => {
-            return run_policy_update(updater_socket, version.as_deref(), *json);
+            return run_set_update(updater_socket, Set::Policies, version.as_deref(), *json);
         }
         PolicyCommand::Search { query, json } => {
             return run_policy_search(updater_socket, query, *json);
@@ -3475,6 +3557,24 @@ fn skill_encoding_refusal(name: &str, encoding: Option<&str>) -> Option<String> 
     }
 }
 
+/// Ask `robotd` to re-read `[policy]`, and say whether it took it.
+///
+/// `false` is a running daemon that declined — policies are off on this robot, which is the one
+/// thing in that section a reload cannot change — and an `Err` is one that could not be reached
+/// at all. Neither is a failure worth an exit code: the config is written either way, and the
+/// next start picks it up. Shared with `configure`, which offers this instead of a restart for
+/// the same keys.
+pub(crate) fn reload_policies(robot_socket: &Path) -> Result<bool, String> {
+    (|| -> Result<bool, Failure> {
+        let mut client = Client::connect_to("robotd", robot_socket)?;
+        client.hello()?;
+        let result: proto::IntentResult =
+            decode(&result_of(client.call(&proto::Call::RobotReloadPolicies)?)?)?;
+        Ok(result.accepted)
+    })()
+    .map_err(|e| e.message)
+}
+
 /// Tell `robotd` to re-read its skills, and say whether it did.
 ///
 /// A skill written into config is not one the robot has until the loop resolves it again, and
@@ -3482,14 +3582,7 @@ fn skill_encoding_refusal(name: &str, encoding: Option<&str>) -> Option<String> 
 /// the whole point of the command is that trying one is cheap. An unreachable robot is not a
 /// failure here: the config is written either way, and the next start picks it up.
 fn report_reload(robot_socket: &Path) {
-    let reloaded = (|| -> Result<bool, Failure> {
-        let mut client = Client::connect_to("robotd", robot_socket)?;
-        client.hello()?;
-        let result: proto::IntentResult =
-            decode(&result_of(client.call(&proto::Call::RobotReloadPolicies)?)?)?;
-        Ok(result.accepted)
-    })();
-    match reloaded {
+    match reload_policies(robot_socket) {
         Ok(true) => println!("  the robot is re-reading its skills"),
         Ok(false) | Err(_) => {
             println!("  robotd did not pick it up — it will at the next start");
@@ -3553,23 +3646,85 @@ fn run_policy_search(updater_socket: &Path, query: &str, json: bool) -> Result<(
         return Ok(());
     }
 
+    // The id column is still padded, because the origin and the like count line up under each
+    // other and a reader compares them down the column. The description does not join that table:
+    // it is a sentence of whatever length somebody wrote, and padding it would either truncate the
+    // one useful thing on the line or push the counts off the terminal.
     let width = found.models.iter().map(|m| m.id.len()).max().unwrap_or(20);
     for hit in &found.models {
         let likes = hit.likes.unwrap_or(0);
         println!("{:width$}  {:9}  {likes} likes", hit.id, hit.origin);
+        // `details`, so this and `duckctl` print a hit the same way. See `PolicySearchHit`.
+        for line in hit.details() {
+            println!("{line}");
+        }
     }
     println!(
         "\n`sudo robotctl policy load <slot> <repo>` tries one. Anything not marked official is \
-         somebody else's."
+         somebody else's. A repo with nothing written under it published no manifest, which says \
+         nothing about the policy in it — `policy fetch` reads the same field and refuses the \
+         shapes this robot cannot run."
     );
     Ok(())
 }
 
 /// `robotctl policy check` — what is installed against what the repo offers.
-fn run_policy_check(updater_socket: &Path, json: bool) -> Result<(), Failure> {
+/// The two Hub-installed sets `updaterd` manages the same way: the official policy set and the
+/// duck detector. Same layout on disk, same provenance record, same two questions — what differs
+/// is which daemon runs the result and what to tell a person when it did not pick it up.
+#[derive(Clone, Copy)]
+enum Set {
+    Policies,
+    Detector,
+}
+
+impl Set {
+    fn check_call(self) -> proto::Call {
+        match self {
+            Set::Policies => proto::Call::PolicyCheck,
+            Set::Detector => proto::Call::DetectorCheck,
+        }
+    }
+
+    fn install_call(self, version: Option<&str>) -> proto::Call {
+        let params = proto::PolicyInstallParams {
+            version: version.map(str::to_owned),
+        };
+        match self {
+            Set::Policies => proto::Call::PolicyInstall(params),
+            Set::Detector => proto::Call::DetectorInstall(params),
+        }
+    }
+
+    /// The `robotctl` namespace, for the hint that names the install command.
+    fn namespace(self) -> &'static str {
+        match self {
+            Set::Policies => "policy",
+            Set::Detector => "duck-detector",
+        }
+    }
+
+    fn what(self) -> &'static str {
+        match self {
+            Set::Policies => "the official set",
+            Set::Detector => "the duck detector",
+        }
+    }
+
+    /// What tells a person whether the thing that runs it is running it.
+    fn where_it_shows(self) -> &'static str {
+        match self {
+            Set::Policies => "`robotctl health` says if a slot could not be loaded.",
+            Set::Detector => "`journalctl -u mediad` says if it could not be loaded.",
+        }
+    }
+}
+
+/// `robotctl policy check` and `robotctl duck-detector check` — what is installed, against the Hub.
+fn run_set_check(updater_socket: &Path, set: Set, json: bool) -> Result<(), Failure> {
     let mut client = Client::connect_to("updaterd", updater_socket)?;
     client.hello()?;
-    let result = result_of(client.call(&proto::Call::PolicyCheck)?)?;
+    let result = result_of(client.call(&set.check_call())?)?;
     if json {
         println!("{}", compact(&result));
         return Ok(());
@@ -3581,8 +3736,11 @@ fn run_policy_check(updater_socket: &Path, json: bool) -> Result<(), Failure> {
         // ask about, and the fix is the same — the daemon's post-install hook installs the set,
         // so the interesting question is why it did not.
         println!("installed  nothing this daemon can identify");
-        println!("           the release's postinstall hook installs the official set;");
-        println!("           `robotctl health` says if a slot could not be loaded.");
+        println!(
+            "           the release's postinstall hook installs {};",
+            set.what()
+        );
+        println!("           {}", set.where_it_shows());
         return Ok(());
     };
     println!("installed  {installed}  (from {repo})");
@@ -3597,7 +3755,7 @@ fn run_policy_check(updater_socket: &Path, json: bool) -> Result<(), Failure> {
         }
         (Some(available), _) => {
             println!("newest     {available}");
-            println!("\n`sudo robotctl policy update` installs it.");
+            println!("\n`sudo robotctl {} update` installs it.", set.namespace());
         }
         (None, _) => println!("newest     the repo has no tagged revisions"),
     }
@@ -3607,19 +3765,16 @@ fn run_policy_check(updater_socket: &Path, json: bool) -> Result<(), Failure> {
     Ok(())
 }
 
-/// `robotctl policy update` — fetch a set and run it.
-fn run_policy_update(
+/// `robotctl policy update` and `robotctl duck-detector update` — fetch a set and run it.
+fn run_set_update(
     updater_socket: &Path,
+    set: Set,
     version: Option<&str>,
     json: bool,
 ) -> Result<(), Failure> {
     let mut client = Client::connect_to("updaterd", updater_socket)?;
     client.hello()?;
-    let result = result_of(client.call(&proto::Call::PolicyInstall(
-        proto::PolicyInstallParams {
-            version: version.map(str::to_owned),
-        },
-    ))?)?;
+    let result = result_of(client.call(&set.install_call(version))?)?;
     if json {
         println!("{}", compact(&result));
         return Ok(());
@@ -3632,13 +3787,19 @@ fn run_policy_update(
             println!("installed {} (was {previous})", installed.installed);
             // Worth its own line rather than silence: the files are right and the robot is not
             // running them, which looks from the outside exactly like an update that did nothing.
-            if installed.reloaded {
-                println!("the robot is running it now");
-            } else {
-                println!(
+            match (set, installed.reloaded) {
+                (Set::Policies, true) => println!("the robot is running it now"),
+                (Set::Policies, false) => println!(
                     "the robot did not pick it up — it is still running the old set. \n\
                      `sudo systemctl restart robotd`, or check `robotctl health`."
-                );
+                ),
+                (Set::Detector, true) => println!(
+                    "mediad restarted onto it — if [duck_detector] enabled is on, it is looking with it now"
+                ),
+                (Set::Detector, false) => println!(
+                    "mediad did not restart — it is still running the old model. \n\
+                     `sudo systemctl restart mediad`, or check `journalctl -u mediad`."
+                ),
             }
         }
     }
@@ -4402,6 +4563,7 @@ fn resolve_from_dir(dir: &std::path::Path) -> Result<String, Failure> {
 
 fn run(cli: Cli) -> Result<(), Failure> {
     let command = match cli.namespace {
+        Namespace::Frame { output } => return frame::run(&cli.media_socket, &output),
         Namespace::Health { json } => {
             return run_health(&cli.socket, &cli.robot_socket, &cli.config_socket, json);
         }
@@ -4413,6 +4575,7 @@ fn run(cli: Cli) -> Result<(), Failure> {
                 &cli.robot_socket,
                 &cli.pad_socket,
                 &cli.tof_socket,
+                &cli.media_socket,
                 hz,
                 json,
             );
@@ -4450,6 +4613,16 @@ fn run(cli: Cli) -> Result<(), Failure> {
         Namespace::Policy { command, file } => {
             return run_policy(&cli.robot_socket, &cli.socket, &file, command);
         }
+        Namespace::DuckDetector { command } => {
+            return match command {
+                DuckDetectorCommand::Check { json } => {
+                    run_set_check(&cli.socket, Set::Detector, json)
+                }
+                DuckDetectorCommand::Update { version, json } => {
+                    run_set_update(&cli.socket, Set::Detector, version.as_deref(), json)
+                }
+            };
+        }
         Namespace::Robot { command } => {
             return run_robot(&cli.robot_socket, command);
         }
@@ -4466,7 +4639,7 @@ fn run(cli: Cli) -> Result<(), Failure> {
             let result = if list {
                 configure::list(&file, json)
             } else {
-                configure::run(&file)
+                configure::run(&file, &cli.robot_socket)
             };
             return result.map_err(|e| Failure::new(exit::FAILED, e));
         }
@@ -4556,6 +4729,28 @@ fn watch(client: &mut Client) -> Result<(), Failure> {
 
 /// Human-readable rendering. `status --json` and anything unrecognised print raw
 /// JSON, so scripts always have a machine-readable path.
+/// The health verdict on one `robotctl update status` line.
+///
+/// Pure, because the case that matters is the one a robot on a desk produces and a working robot
+/// never does. A board with its servo supply off answers `healthy: Some(false)` with `degraded`
+/// set, and this line used to print `UNHEALTHY` for it -- which reads as "the release is broken"
+/// about a release the health gate had just deliberately committed. `robotctl health` has drawn
+/// the distinction since it existed (see `render_health`); this listing did not, and that is how
+/// a rollback got attributed to the wrong cause.
+///
+/// `UNHEALTHY` stays shouted, because now it only prints when something really is.
+fn component_verdict(status: &proto::ComponentStatus) -> String {
+    let reason = status.reason.as_deref().unwrap_or("no reason given");
+    match (status.healthy, status.degraded) {
+        (None, _) => "no probe".to_owned(),
+        (Some(true), _) => "healthy".to_owned(),
+        // Same word and same shape as `robotctl health`, for the same reason: this release is
+        // fine, this board cannot move.
+        (Some(false), true) => format!("degraded: {reason}"),
+        (Some(false), false) => format!("UNHEALTHY: {reason}"),
+    }
+}
+
 fn print_result(command: &UpdateCommand, result: serde_json::Value) {
     let json = |value: &serde_json::Value| {
         println!(
@@ -4578,12 +4773,11 @@ fn print_result(command: &UpdateCommand, result: serde_json::Value) {
                             Some(version) => version.to_string(),
                             None => "none".to_owned(),
                         };
-                        let healthy = match status.healthy {
-                            Some(true) => "healthy",
-                            Some(false) => "UNHEALTHY",
-                            None => "no probe",
-                        };
-                        println!("{}: {installed} ({healthy})", status.component);
+                        println!(
+                            "{}: {installed} ({})",
+                            status.component,
+                            component_verdict(&status)
+                        );
                         if let Some(pinned) = &status.pinned {
                             println!("  pinned to {pinned}");
                         }
@@ -4717,13 +4911,18 @@ mod tests {
         }
     }
 
+    /// The three fields these tests are about, and `..Default::default()` for the rest.
+    ///
+    /// **Spelling every field is what broke the build.** This helper cares about the slots and
+    /// whether the policy is driving; it listed the others because they existed, so adding
+    /// `homed` and `sitting` to the wire — a change no part of `robotctl` reads — failed to
+    /// compile a `robotctl` test. A helper that names only what it asserts on does not.
     fn policies_of(slots: Vec<proto::PolicySlot>) -> proto::PoliciesResult {
         proto::PoliciesResult {
             mode: "walk".into(),
             enabled: true,
             slots,
-            skills: Vec::new(),
-            change_error: None,
+            ..Default::default()
         }
     }
 
@@ -5664,12 +5863,84 @@ mod tests {
         assert!(out.contains("48 °C max (left_knee)"), "{out}");
         // Board and servos on separate lines: they fail differently.
         assert!(out.contains("cpu       52 °C"), "{out}");
+        // Nothing holding the clock down, so the line says nothing about the clock.
+        assert!(!out.contains("throttled"), "{out}");
         assert!(out.contains("bus       ok"), "{out}");
         assert!(out.contains("imu       ready"), "{out}");
         // And the software half, in the same answer — the whole point of one command.
         assert!(out.contains("software"), "{out}");
         assert!(out.contains("robotd    0.2.0"), "{out}");
         assert!(out.contains("daemon    0.2.0 installed"), "{out}");
+    }
+
+    /// The case the clock reading exists for: the temperature alone reads as a warm robot,
+    /// and the board is in fact running at under a quarter of its clock. Taken from a real
+    /// Radxa Zero 3 — 95.5 °C, `cpufreq-cpu0` at the bottom of its table.
+    #[test]
+    fn health_says_what_a_hot_board_is_costing() {
+        let out = render_health(&health_report(
+            Some(proto::HealthResult {
+                healthy: true,
+                cpu_temp_c: Some(95.5),
+                cpu_throttle: Some(proto::CpuThrottle {
+                    level: 6,
+                    max_level: 6,
+                    khz: 408_000,
+                    max_khz: 1_800_000,
+                }),
+                ..Default::default()
+            }),
+            None,
+        ));
+
+        assert!(
+            out.contains("cpu       96 °C · throttled to 408 of 1800 MHz (level 6 of 6)"),
+            "{out}"
+        );
+        // Reported, never judged: the verdict is `robotd`'s and a hot board does not change it.
+        assert!(out.contains("robot     healthy"), "{out}");
+    }
+
+    /// A ceiling lowered with the governor still at zero is somebody's `cpufreq` policy, not
+    /// heat. Worth printing — a robot mysteriously short of CPU is the same symptom — and the
+    /// level is what says the thermal governor had nothing to do with it.
+    #[test]
+    fn health_reports_a_ceiling_nothing_thermal_lowered() {
+        let out = render_health(&health_report(
+            Some(proto::HealthResult {
+                healthy: true,
+                cpu_temp_c: Some(41.0),
+                cpu_throttle: Some(proto::CpuThrottle {
+                    level: 0,
+                    max_level: 6,
+                    khz: 1_104_000,
+                    max_khz: 1_800_000,
+                }),
+                ..Default::default()
+            }),
+            None,
+        ));
+
+        assert!(
+            out.contains("cpu       41 °C · throttled to 1104 of 1800 MHz (level 0 of 6)"),
+            "{out}"
+        );
+    }
+
+    /// An older `robotd` sends no clock reading at all. The line must be exactly what it was
+    /// before the field existed, rather than gaining an empty clause or a zeroed one.
+    #[test]
+    fn health_from_a_robotd_without_the_clock_reading_is_unchanged() {
+        let out = render_health(&health_report(
+            Some(proto::HealthResult {
+                healthy: true,
+                cpu_temp_c: Some(52.0),
+                ..Default::default()
+            }),
+            None,
+        ));
+
+        assert!(out.contains("cpu       52 °C\n"), "{out}");
     }
 
     /// A stopped `robotd` must still produce the software half.
@@ -5876,6 +6147,76 @@ mod tests {
             out.contains("waiting for a robot to answer, 4 attempts"),
             "{out}"
         );
+    }
+
+    fn component(
+        healthy: Option<bool>,
+        degraded: bool,
+        reason: Option<&str>,
+    ) -> proto::ComponentStatus {
+        proto::ComponentStatus {
+            component: proto::ComponentId::new("daemon"),
+            installed: Some(semver::Version::new(0, 14, 1)),
+            phase: proto::Phase::Idle,
+            healthy,
+            degraded,
+            reason: reason.map(str::to_owned),
+            pinned: None,
+            last_attempt: None,
+        }
+    }
+
+    /// The case this was written for. A bench board with its servo supply off is the
+    /// configuration the update system is tested on, the gate commits releases onto it on
+    /// purpose, and reading `UNHEALTHY` there is what sent a rollback investigation at the
+    /// policy set for an afternoon.
+    #[test]
+    fn status_does_not_shout_unhealthy_at_a_degraded_board() {
+        let out = component_verdict(&component(
+            Some(false),
+            true,
+            Some("no robot on the motor bus after 4 attempts"),
+        ));
+
+        assert_eq!(out, "degraded: no robot on the motor bus after 4 attempts");
+    }
+
+    /// And the word still gets shouted where it belongs, with what the robot actually said --
+    /// which in this case is the line that should have been read in the first place.
+    #[test]
+    fn status_shouts_unhealthy_with_the_robots_own_reason() {
+        let out = component_verdict(&component(
+            Some(false),
+            false,
+            Some("policy unavailable: reading /opt/robot/policies/current/velstand.onnx"),
+        ));
+
+        assert!(out.starts_with("UNHEALTHY: policy unavailable"), "{out}");
+    }
+
+    /// A component with no probe configured is not a component that failed one.
+    #[test]
+    fn status_says_no_probe_rather_than_guessing() {
+        assert_eq!(component_verdict(&component(None, false, None)), "no probe");
+    }
+
+    /// An older `updaterd` sends neither field. It meant the strict verdict and nothing about a
+    /// reason, and that is what it must still read as -- serde's defaults, with nothing invented
+    /// to fill the gap.
+    #[test]
+    fn a_status_from_an_older_updaterd_still_reads_as_unhealthy() {
+        let status: proto::ComponentStatus = serde_json::from_value(serde_json::json!({
+            "component": "daemon",
+            "installed": "0.14.1",
+            "phase": "idle",
+            "healthy": false,
+            "pinned": null,
+            "last_attempt": null,
+        }))
+        .expect("the two new fields must not be required");
+
+        assert!(!status.degraded);
+        assert_eq!(component_verdict(&status), "UNHEALTHY: no reason given");
     }
 
     /// A pinned component and a rollback are both things nobody thinks to ask about, and both

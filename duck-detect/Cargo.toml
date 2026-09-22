@@ -7,6 +7,9 @@ license.workspace = true
 
 [dependencies]
 anyhow = "1"
+# The camera's pixels — the mount turn and the UYVY sampler — shared with `mediad` and
+# `robotctl monitor`. No dependencies of its own; see its manifest for why it is not in here.
+uyvy = { path = "../uyvy" }
 # `dlopen` rather than link: the NPU runtime is a vendor blob that is not on a laptop, not in any
 # Debian suite and not needed to *build* — cross-compiling a daemon must not require it. Same
 # decision, and the same crate, as ort makes for ONNX Runtime.

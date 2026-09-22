@@ -68,13 +68,18 @@ git clone --depth 1 "https://huggingface.co/spaces/$SPACE" "$CLONE"
 find "$SOURCE" -maxdepth 1 \( -type f -o -type l \) -exec cp -L {} "$CLONE/" \;
 
 cd "$CLONE"
-if git diff --quiet; then
+
+# **Staged first, then compared.** `git diff --quiet` ignores untracked files, so a publish whose
+# only change is a *new* file reported "the Space already serves this" and pushed nothing — the
+# worst answer available, because it is indistinguishable from success. Staging first and then
+# diffing the index sees additions, deletions and modifications alike.
+git add -A
+if git diff --cached --quiet; then
     echo "the Space already serves this"
     exit 0
 fi
 
 REVISION=$(cd "$REPO_ROOT" && git rev-parse --short HEAD)
-git add -A
 git commit -q -m "$NAME from microduck $REVISION"
 git push
 echo "pushed. The Space rebuilds in a minute or two — Gradio Spaces install their requirements."
