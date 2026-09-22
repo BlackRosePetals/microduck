@@ -1719,7 +1719,10 @@ async fn starting_up_records_a_rescue_and_releases_its_guard() {
         .next()
         .expect("an entry in the update log");
     assert_eq!(entry.component.0, "daemon", "matched by install_dir");
-    assert_eq!(entry.from, Some(semver::Version::new(1, 1, 0)));
+    // No `from`: it names the release the board was on *before* the failed one, which the
+    // crumb does not carry. Repeating the failed version here rendered `1.1.0 → 1.1.0` in
+    // `update log`, which reads as though nothing moved.
+    assert_eq!(entry.from, None);
     // A RolledBack entry's `to` names the version that *failed* — the one the rescue moved
     // off of — never the golden it landed on. Naming golden here blacklists the release the
     // board is successfully running, via `known_bad`.

@@ -1945,9 +1945,15 @@ impl Engine {
             // put the *reverted-to* version in `to` for a `RolledBack`, which `known_bad`
             // reads as "the version that failed" — it blacklisted the release now running
             // and never the one that actually failed. See `journal_outcome`.
+            //
+            // `from` is the release the board came from *before* the attempt, not the one
+            // that failed — that is `to`'s job, and `pending.previous` is what `apply` would
+            // have passed had the reboot not cut it short. Passing the failed version for
+            // both made `update log` render `1.1.0 → 1.1.0`, which reads as though nothing
+            // moved.
             self.record(
                 &pending.component,
-                Some(pending.version.clone()),
+                pending.previous.clone(),
                 &Ok(outcome.clone()),
                 rec.run(),
             );
@@ -2058,7 +2064,12 @@ impl Engine {
                 let entry = crate::proto::LogEntry {
                     at: crate::journal::now_unix(),
                     component: crate::proto::ComponentId(name.clone()),
-                    from: crumb.from.as_deref().and_then(|v| v.parse().ok()),
+                    // No `from`: the crumb knows the release the rescue moved off of and the
+                    // golden it landed on, and neither is what `from` means — the release the
+                    // board was on *before* the failed one was installed is not recorded
+                    // anywhere the rescue can reach. Naming the failed version here as well
+                    // rendered `1.1.0 → 1.1.0` in `update log`.
+                    from: None,
                     // A `RolledBack` entry's `to` names the version that *failed* — the one
                     // the rescue moved off of — never the golden it landed on. `known_bad`
                     // reads this field; naming golden here would blacklist the release the
