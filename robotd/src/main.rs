@@ -2308,41 +2308,52 @@ async fn control_loop<T: RobotIo>(
         // vanish: it used to arm `mode_change` and do nothing else on a blind tick, and nothing
         // looked at `mode_change` again until the robot next homed for some other reason, with
         // every later request refused as "already in flight".
+        //
+        // Waiting is what makes "the robot went down while a switch was pending" a state of its
+        // own, and the gate for it belongs here rather than in the arms below: every state the
+        // robot can reach while waiting gets the same answer, and none of them can be written
+        // without one. The request site refuses a switch on a robot that is shutting down; a
+        // switch that was already waiting when the shutdown began is that same request arriving
+        // late, and `robot.init` is turned away on this path for the same reason.
         if let Some(target) = mode_change {
-            match bringup {
-                // Ramping. The end of the ramp does the swap, with the robot still at home.
-                Bringup::Homing { .. } => {}
-                // Nothing is moving, so there is no gait to protect and no home to ramp to.
-                // Swap now and stay limp: `Ready` means torque on and at home, and a ramp written
-                // to servos nobody powered is neither. Going through `Homing` from here used to
-                // leave the robot `Ready` with no torque write, so the next Start found no
-                // bring-up to do and the policy drove a robot that could not move.
-                Bringup::Limp => {
-                    mode_change = None;
-                    load_mode(
-                        target,
-                        &mut policy_params,
-                        &mut policy_cfg,
-                        &mut controller,
-                        params.safety.limp_fall,
-                        &state,
-                        &slot_errors,
-                    );
-                }
-                // Home the robot with the machinery `init` and a fall recovery already use: it
-                // ramps per tick, and `driving` is false until it reaches Ready. From a sample,
-                // which is where the ramp starts, so a blind tick waits for the next one. And
-                // not once the robot is on its way down, for the request site's reason: a switch
-                // that was waiting when the sit began must not stand the robot up out of it.
-                Bringup::Ready => {
-                    if shutdown_sit.is_none()
-                        && !powered_off
-                        && let Some(sensors) = sensors.as_ref()
-                    {
-                        bringup = Bringup::Homing {
-                            from: sensors.positions,
-                            since: tick_start,
-                        };
+            if shutdown_sit.is_some() || powered_off {
+                mode_change = None;
+                tracing::warn!(
+                    mode = target.as_str(),
+                    "mode switch dropped: the robot is shutting down"
+                );
+            } else {
+                match bringup {
+                    // Ramping. The end of the ramp does the swap, with the robot still at home.
+                    Bringup::Homing { .. } => {}
+                    // Nothing is moving, so there is no gait to protect and no home to ramp to.
+                    // Swap now and stay limp: `Ready` means torque on and at home, and a ramp
+                    // written to servos nobody powered is neither. Going through `Homing` from
+                    // here used to leave the robot `Ready` with no torque write, so the next
+                    // Start found no bring-up to do and the policy drove a robot that could
+                    // not move.
+                    Bringup::Limp => {
+                        mode_change = None;
+                        load_mode(
+                            target,
+                            &mut policy_params,
+                            &mut policy_cfg,
+                            &mut controller,
+                            params.safety.limp_fall,
+                            &state,
+                            &slot_errors,
+                        );
+                    }
+                    // Home the robot with the machinery `init` and a fall recovery already use: it
+                    // ramps per tick, and `driving` is false until it reaches Ready. From a sample,
+                    // which is where the ramp starts, so a blind tick waits for the next one.
+                    Bringup::Ready => {
+                        if let Some(sensors) = sensors.as_ref() {
+                            bringup = Bringup::Homing {
+                                from: sensors.positions,
+                                since: tick_start,
+                            };
+                        }
                     }
                 }
             }
@@ -8565,6 +8576,65 @@ mod tests {
             mode_of(s.mode.load(Ordering::Relaxed)),
             Mode::Walk,
             "a mode switch went through on a robot that was powering off"
+        );
+
+        s.shutdown.store(true, Ordering::Relaxed);
+        handle.await.unwrap();
+    }
+
+    /// A switch that was *already waiting* when the robot went down is dropped too.
+    ///
+    /// The request site only sees the requests that arrive after the shutdown. This one arrives
+    /// before it: the switch arms and starts its ramp, and the `robot.shutdown` that follows
+    /// cannot sit — `can_sit` wants `Bringup::Ready` and the robot is mid-ramp — so it cuts
+    /// torque and powers off, leaving `Limp` with `powered_off` set. The `Limp` arm then took
+    /// that as "nothing is moving, swap now" and ran the blocking policy load on a robot on its
+    /// way out.
+    #[tokio::test]
+    async fn a_mode_switch_waiting_when_the_robot_goes_down_is_dropped() {
+        let io = FakeIo::at(DEFAULT_POSITION).frozen();
+        let s = Arc::new(state());
+        let intents = Arc::new(Intents::new());
+        let handle = tokio::spawn({
+            let s = Arc::clone(&s);
+            let intents = Arc::clone(&intents);
+            async move {
+                let mut io = io;
+                control_loop_probe_with(&mut io, s, intents, Duration::from_millis(2)).await;
+            }
+        });
+        until(
+            || s.ticks.load(Ordering::Relaxed) >= 5,
+            Duration::from_secs(2),
+            "no ticks",
+        )
+        .await;
+        intents.request_init();
+        until(
+            || s.homed.load(Ordering::Relaxed),
+            HOME_RAMP + Duration::from_secs(2),
+            "init never reached home",
+        )
+        .await;
+
+        // The switch goes first, and is still ramping a few ticks later: `HOME_RAMP` is seconds
+        // and the tick is milliseconds.
+        intents.request_mode_switch(mode_code(Mode::Roller));
+        let at = s.ticks.load(Ordering::Relaxed);
+        until(
+            || s.ticks.load(Ordering::Relaxed) >= at + 3,
+            Duration::from_secs(2),
+            "stalled",
+        )
+        .await;
+
+        // Mid-ramp, so this powers off rather than sitting.
+        intents.request_shutdown();
+        tokio::time::sleep(HOME_RAMP + Duration::from_millis(500)).await;
+        assert_eq!(
+            mode_of(s.mode.load(Ordering::Relaxed)),
+            Mode::Walk,
+            "a mode switch that was waiting when the robot powered off went through anyway"
         );
 
         s.shutdown.store(true, Ordering::Relaxed);
