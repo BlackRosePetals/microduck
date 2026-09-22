@@ -1142,6 +1142,9 @@ impl Engine {
         hook?;
 
         rec.phase(Phase::Applying, None);
+        if self.faults.fail_apply_action {
+            return Err(Error::Internal("injected apply-action failure".into()));
+        }
         self.run_apply_action(&cfg.on_apply, release_dir, rec)
             .await?;
 
@@ -1551,20 +1554,28 @@ impl Engine {
             rec.finish(&failed);
             return failed;
         }
+        // The swap has already happened, so a failed apply action means what a failed gate
+        // means: the board is on the new release with its daemons not demonstrably running.
+        // Take the same revert-and-journal path as the gate, as `apply` does for everything
+        // past the swap. Returning early here disarmed the trial and left no log entry, so
+        // the board stayed on an unverified release with no boot-counter protection and no
+        // record of it.
         rec.phase(Phase::Applying, None);
-        if let Err(e) = self
-            .run_apply_action(&cfg.on_apply, &store.release_dir(to), rec)
-            .await
-        {
-            let _ = self.boot_counter.confirm(component);
-            let failed = Err(e);
-            rec.finish(&failed);
-            return failed;
-        }
-
-        rec.phase(Phase::HealthGate, None);
-        let gate = self.health_gate(cfg).await;
-        record_gate(rec, &gate);
+        let apply_action = if self.faults.fail_apply_action {
+            Err(Error::Internal("injected apply-action failure".into()))
+        } else {
+            self.run_apply_action(&cfg.on_apply, &store.release_dir(to), rec)
+                .await
+        };
+        let gate = match apply_action {
+            Ok(()) => {
+                rec.phase(Phase::HealthGate, None);
+                let gate = self.health_gate(cfg).await;
+                record_gate(rec, &gate);
+                gate.map(|_| ())
+            }
+            Err(e) => Err(e),
+        };
 
         let outcome = match gate {
             Ok(_) => {
@@ -1939,27 +1950,22 @@ impl Engine {
 
             rec.finish(&Ok(outcome.clone()));
 
-            let logged = LogEntry {
-                at: now_unix(),
-                component: ComponentId::new(pending.component.clone()),
-                from: Some(pending.version.clone()),
-                to: match &outcome {
-                    ApplyResult::RolledBack { reverted_to, .. } => reverted_to.clone(),
-                    _ => None,
-                },
-                outcome: match &outcome {
-                    ApplyResult::Stuck { reason, .. } => Outcome::Aborted {
-                        reason: reason.clone(),
-                    },
-                    _ => Outcome::RolledBack {
-                        reason: reason.clone(),
-                    },
-                },
-                run: rec.run(),
-            };
-            if let Err(e) = self.journal.append(&logged) {
-                tracing::error!(error = %e, "could not write the update log");
-            }
+            // Through `record`, like every other outcome: the hand-built entry this replaces
+            // put the *reverted-to* version in `to` for a `RolledBack`, which `known_bad`
+            // reads as "the version that failed" — it blacklisted the release now running
+            // and never the one that actually failed. See `journal_outcome`.
+            //
+            // `from` is the release the board came from *before* the attempt, not the one
+            // that failed — that is `to`'s job, and `pending.previous` is what `apply` would
+            // have passed had the reboot not cut it short. Passing the failed version for
+            // both made `update log` render `1.1.0 → 1.1.0`, which reads as though nothing
+            // moved.
+            self.record(
+                &pending.component,
+                pending.previous.clone(),
+                &Ok(outcome.clone()),
+                rec.run(),
+            );
 
             outcomes.push(outcome);
         }
@@ -2067,8 +2073,17 @@ impl Engine {
                 let entry = crate::proto::LogEntry {
                     at: crate::journal::now_unix(),
                     component: crate::proto::ComponentId(name.clone()),
-                    from: crumb.from.as_deref().and_then(|v| v.parse().ok()),
-                    to: crumb.to.as_deref().and_then(|v| v.parse().ok()),
+                    // No `from`: the crumb knows the release the rescue moved off of and the
+                    // golden it landed on, and neither is what `from` means — the release the
+                    // board was on *before* the failed one was installed is not recorded
+                    // anywhere the rescue can reach. Naming the failed version here as well
+                    // rendered `1.1.0 → 1.1.0` in `update log`.
+                    from: None,
+                    // A `RolledBack` entry's `to` names the version that *failed* — the one
+                    // the rescue moved off of — never the golden it landed on. `known_bad`
+                    // reads this field; naming golden here would blacklist the release the
+                    // board is successfully running. See `Engine::record`.
+                    to: crumb.from.as_deref().and_then(|v| v.parse().ok()),
                     outcome: crate::proto::Outcome::RolledBack { reason: because },
                     run: rec.run(),
                 };
