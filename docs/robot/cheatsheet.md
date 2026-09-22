@@ -458,6 +458,9 @@ corrupt each other's replies:
 sudo systemctl stop robotd && sudo /opt/robot/daemon/current/bin/robotd init && sudo systemctl start robotd
 ```
 
+`reboot-motors` is also reachable over Bluetooth, as `duckctl reboot-motors`
+([`duckctl.md`](duckctl.md)) — `relax` is not.
+
 **Replacing a motor** needs no configuration tool. Fit the new servo straight from the box (ID 1,
 57 600 baud), power the servos, and `robotd` — or `robotd init` — finds the one joint that no longer
 answers, flashes the new servo as that joint, sets its registers and reboots it. The journal says

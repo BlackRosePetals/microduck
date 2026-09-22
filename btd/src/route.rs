@@ -426,15 +426,36 @@ fn permits(call: &proto::Call) -> bool {
         // have to guess.
         RobotInit => true,
 
+        // **The way back from a latched servo error, which is where a phone is the only tool.**
+        //
+        // It was refused beside `relax`, on the reading that cycling the servo bus while the
+        // robot is standing is the same fall by another route. That is true of the instruction
+        // and wrong about the situation: a servo that has latched overload, overheating or
+        // electrical shock is holding nothing already, and nothing else clears it but pulling
+        // the battery. So the call an owner needs is refused exactly when the robot is on the
+        // floor with a dead joint and there is nothing to fall.
+        //
+        // What made it worth changing is that no other way back reaches a phone. Standing up is
+        // `init`, routed above — and `init` on a robot with a latched servo does nothing but
+        // fail again, which is the state the app can now see (`robot.health` names the joint)
+        // and could not leave. The rest of the path is already here: torque goes off on every
+        // joint first, the servos come back limp with their gains restored on the next write,
+        // and `init` brings it up from there.
+        //
+        // The hazard is real for the robot that *is* standing, and it is the one the app is
+        // asked to state: this drops the joints, so have the robot down or hold it. That is the
+        // same claim `robot.do` and `robot.loadPolicy` are routed on — ten metres of radio range
+        // means whoever tapped it is looking at the robot.
+        RobotRebootMotors(_) => true,
+
         // **`relax` stays refused, and the asymmetry is the point.** Standing up is controlled:
         // the joints go where they are told. Relaxing is a robot that was holding itself up and
-        // now is not, which on a phone is a button whose failure mode is the floor. `init` has
-        // no such mode, and a refusal that covered both was treating "moves the joints" as the
-        // hazard when the hazard is "stops holding them".
-        //
-        // `robot.rebootMotors` keeps it company: a servo bus cycled while the robot is standing
-        // is the same fall by another route.
-        RobotRelax | RobotRebootMotors(_) => false,
+        // now is not, which on a phone is a button whose failure mode is the floor, and its
+        // whole purpose is to produce that fall — unlike the reboot above, which exists to
+        // recover a robot that has already stopped holding itself. `init` has no such mode, and
+        // a refusal that covered all three was treating "moves the joints" as the hazard when
+        // the hazard is "stops holding them for nothing in return".
+        RobotRelax => false,
 
         // `robot.stop` deserves its own line, because refusing it looks wrong. An emergency stop
         // in the app is exactly what someone reaches for, and §6 does say local should preempt
@@ -732,6 +753,29 @@ mod tests {
                 call.method()
             );
         }
+    }
+
+    /// **A phone can get a robot back on its feet, and cannot put it on the floor.**
+    ///
+    /// The asymmetry in one test, because the two arms only make sense read together: `init`
+    /// stands it up, `rebootMotors` clears a latched servo error so that `init` can — and
+    /// `relax` stays refused, since its only outcome is a robot that was holding itself up and
+    /// now is not. Making that one reachable should have to delete a line here and say why.
+    #[test]
+    fn a_phone_can_recover_a_robot_but_not_drop_it() {
+        for call in [
+            proto::Call::RobotInit,
+            proto::Call::RobotRebootMotors(proto::RebootMotorsParams { ids: vec![] }),
+            proto::Call::RobotRebootMotors(proto::RebootMotorsParams { ids: vec![3, 11] }),
+        ] {
+            assert_eq!(
+                upstream_for(&call),
+                Some(Upstream::Robot),
+                "{}",
+                call.method()
+            );
+        }
+        assert_eq!(upstream_for(&proto::Call::RobotRelax), None);
     }
 
     /// **The Hub, from a phone.** What is out there, whether the official set has moved, and

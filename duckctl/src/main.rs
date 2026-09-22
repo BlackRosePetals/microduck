@@ -1035,6 +1035,21 @@ enum Command {
         #[arg(value_name = "SKILL")]
         skill: String,
     },
+    /// Reboot the servos: every one, or only the ids given.
+    ///
+    /// The way back from a servo in hardware error — overload, overheating, electrical shock —
+    /// which otherwise holds torque off until the battery is pulled. That is the state this is
+    /// worth reaching over a radio for: `duckctl health` names the joint, and before this the
+    /// only fix was ssh, or the battery, or a person on the robot's side of the room.
+    ///
+    /// **Torque goes off on every joint first**, so hold the robot or have it lying down. The
+    /// servos come back limp with their gains restored on the next write; `duckctl do` needs the
+    /// robot driving again, so press Start on the pad, or `duckctl call robot.init`.
+    RebootMotors {
+        /// Servo ids, space separated. None means all of them.
+        #[arg(value_name = "ID")]
+        ids: Vec<u8>,
+    },
     /// The Hugging Face account this robot belongs to.
     ///
     /// Signing in over Bluetooth is what a robot fresh out of a box needs: it has no network, so
@@ -1774,6 +1789,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 if let Some(note) = restart_note(&cli.command, &value) {
                     eprintln!("{note}");
                 }
+                if let Some(note) = limp_note(&cli.command, &value) {
+                    eprintln!("{note}");
+                }
                 if let Some(note) = account_note(&cli.command, &value) {
                     eprintln!("{note}");
                 }
@@ -2131,6 +2149,13 @@ fn request_line(command: &Command) -> Result<(String, Duration), Box<dyn std::er
             serde_json::json!({ "skill": skill }),
             REPLY_TIMEOUT,
         ),
+        // `robotd` writes the REBOOT instruction to each servo and answers; the bus work is a
+        // handful of milliseconds per joint, so this is an ordinary reply rather than a slow one.
+        Command::RebootMotors { ids } => (
+            proto::method::ROBOT_REBOOT_MOTORS,
+            serde_json::json!({ "ids": ids }),
+            REPLY_TIMEOUT,
+        ),
         // The robot asks Hugging Face for a device code before it answers, so this is one
         // outbound HTTP round trip rather than a local read — the same budget `policy load` gets
         // for the same reason. What it does *not* wait for is the approval: that is the whole
@@ -2477,6 +2502,23 @@ fn account_note(command: &Command, reply: &serde_json::Value) -> Option<String> 
         )),
     }
     Some(note)
+}
+
+/// What a rebooted servo leaves behind: a limp robot, and nothing that says so.
+///
+/// The reply is `{"accepted": true}` — the intent was taken, not the servos are back — so a
+/// client reading only the JSON would think the robot is where it left it. It is not: torque is
+/// off on every joint, which is the one thing whoever pressed this has to know before letting go
+/// of the robot. `robotctl robot reboot-motors` prints the same sentence on the robot, and this
+/// is the same event over a radio.
+fn limp_note(command: &Command, reply: &serde_json::Value) -> Option<&'static str> {
+    if !matches!(command, Command::RebootMotors { .. }) {
+        return None;
+    }
+    // Only when `robotd` took it. A refusal prints as JSON above and leaves the robot as it was.
+    reply["result"]["accepted"].as_bool()?.then_some(
+        "note: torque is off on every joint while the servos come back — hold the robot, or have          it down. It stays limp until something stands it up: press Start on the pad, or          `duckctl call robot.init`.",
+    )
 }
 
 fn restart_note(command: &Command, reply: &serde_json::Value) -> Option<&'static str> {
@@ -3299,6 +3341,43 @@ mod tests {
         let run = wire(&["do", "polite-bow"]);
         assert!(run.contains(duck_ipc_proto::method::ROBOT_DO), "{run}");
         assert!(run.contains(r#""skill":"polite-bow""#), "{run}");
+    }
+
+    /// No ids is every servo, and that is the request `robotd` reads — an absent `ids` would be
+    /// a different call (`INVALID_PARAMS`), and a wrong one to send with "all of them" meant.
+    #[test]
+    fn rebooting_the_servos_sends_the_ids_asked_for_or_none() {
+        let wire = |args: &[&str]| {
+            let cli = Cli::try_parse_from([&["duckctl"], args].concat()).expect("parses");
+            request_line(&cli.command).expect("a request").0
+        };
+
+        let all = wire(&["reboot-motors"]);
+        assert!(
+            all.contains(duck_ipc_proto::method::ROBOT_REBOOT_MOTORS),
+            "{all}"
+        );
+        assert!(all.contains(r#""ids":[]"#), "{all}");
+
+        let some = wire(&["reboot-motors", "3", "11"]);
+        assert!(some.contains(r#""ids":[3,11]"#), "{some}");
+    }
+
+    /// The reply says the intent was accepted, not that the robot is where it was left: it is
+    /// limp. Whoever is holding it has to be told, and a refusal must not say the same thing.
+    #[test]
+    fn a_servo_reboot_says_the_robot_is_limp() {
+        let cli = Cli::try_parse_from(["duckctl", "reboot-motors"]).expect("parses");
+        let accepted = serde_json::json!({ "result": { "accepted": true } });
+        let note = limp_note(&cli.command, &accepted).expect("a note");
+        assert!(note.contains("torque is off"), "{note}");
+        assert!(note.contains("robot.init"), "{note}");
+
+        let refused = serde_json::json!({ "error": { "code": 14, "message": "no" } });
+        assert_eq!(limp_note(&cli.command, &refused), None);
+
+        let health = Cli::try_parse_from(["duckctl", "health"]).expect("parses");
+        assert_eq!(limp_note(&health.command, &accepted), None);
     }
 
     /// **A load homes the robot before it answers**, so it gets the budget a slow call gets.
