@@ -53,6 +53,12 @@ pub struct Producer {
     /// The release this process was installed as, or the build it was compiled from.
     pub release: String,
     pub api_version: u32,
+    /// This robot is a duck in MuJoCo. `configd` owns the fact; this only carries it.
+    ///
+    /// Worth carrying rather than re-deriving from `--sim-camera`: a duck in the twin is simulated
+    /// all the way down — servos, ToF and camera are all a simulator — and what a client sees
+    /// should say *that*, not "this daemon happens to be reading frames off a socket".
+    pub simulated: bool,
 }
 
 impl Producer {
@@ -74,6 +80,7 @@ impl Producer {
         Self {
             name: None,
             serial: None,
+            simulated: false,
             release,
             api_version: proto::API_VERSION,
         }
@@ -87,6 +94,7 @@ impl Producer {
             Ok(info) => {
                 producer.name = Some(info.name);
                 producer.serial = info.serial;
+                producer.simulated = info.simulated;
             }
             // At `warn` rather than `error`: the pipeline still starts and still streams, and the
             // only cost is a producer a client cannot name. The reason is in the message because
@@ -111,6 +119,12 @@ impl Producer {
         }
         if let Some(serial) = &self.serial {
             fields.push(("serial", serial.clone()));
+        }
+        if self.simulated {
+            // Only when true, for the reason the fields above are only present when known: a
+            // client reading `simulated: "false"` off every real robot learns nothing, and the key
+            // is worth noticing exactly where it appears.
+            fields.push(("simulated", "true".to_owned()));
         }
         fields.push(("release", self.release.clone()));
         fields.push(("api_version", self.api_version.to_string()));
@@ -196,6 +210,32 @@ mod tests {
             ["name", "serial", "release", "api_version"]
         );
         assert_eq!(fields[0].1, "duck-c51b");
+    }
+
+    /// The console is told too, not only the rendezvous — a page open on a simulated duck reads
+    /// this same structure and should be able to say so.
+    #[test]
+    fn a_simulated_duck_publishes_the_key_and_a_real_one_does_not() {
+        let producer = Producer {
+            name: Some("duck-a".to_owned()),
+            serial: Some("sim-duck-a".to_owned()),
+            simulated: true,
+            ..Producer::local(build())
+        };
+        assert_eq!(
+            producer
+                .fields()
+                .iter()
+                .map(|(k, _)| *k)
+                .collect::<Vec<_>>(),
+            ["name", "serial", "simulated", "release", "api_version"]
+        );
+        assert!(
+            !Producer::local(build())
+                .fields()
+                .iter()
+                .any(|(k, _)| *k == "simulated")
+        );
     }
 
     /// `configd` not answering costs the name and nothing else. This is the boot case: `mediad` is

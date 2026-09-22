@@ -227,9 +227,11 @@ is worth having on a bench; it is also the one input with no provenance, which i
 a first-class origin in §2 rather than an accident.
 
 There is no separate `fetch`: `load` downloads when it has to, and the library accumulates, so
-loading A, then B, then A again costs one download each. `search` is thin — `api/models?search=`
-against the query — and until a `microduck` tag exists on the Hub, searching for the word is
-what there is.
+loading A, then B, then A again costs one download each. `search` is `api/models?search=` against
+the query, and until a `microduck` tag exists on the Hub, searching for the word is what there is.
+It asks for the file list with the hits, which is what names each repo's preview clip for free, and
+then reads one `manifest.json` per repo that has one for the description —
+[`policy-manifest.md`](../policy-manifest.md) owns both and the bounds they run under.
 
 ## 8. Wire, and what it costs
 
@@ -273,16 +275,24 @@ updater design).
 
 Fetching rather than copying is the point: it is the arrangement `setup-board.sh` already uses
 for ONNX Runtime and `setup-gstreamer.sh` for the plugins, which are the other two things a board
-needs and a release has no business carrying. The pin lives in `[workspace.metadata.policies]`
+needs and a release has no business carrying. The duck detector followed the same road out of the
+release — `scripts/seed-detector.sh`, `/opt/robot/detector/current`, `robotctl duck-detector
+check/update`, a pin in `[workspace.metadata.detector]` — with a fixed file list in place of the
+manifest, since its two files have fixed names (`docs/project/npu-bringup.md`). The pin lives in `[workspace.metadata.policies]`
 and as literals in the script, with a test asserting they agree — `setup-gstreamer.sh`'s trap,
 because a script that runs from inside a release cannot read the manifest.
 
-**The pin is a floor, not a ceiling**, and that distinction is load-bearing. It ships inside the
-daemon release, so bumping it *does* need a daemon release — an earlier draft of this section
-claimed otherwise and was simply wrong. What the pin decides is what a *freshly provisioned* board
-installs. Moving past it is `robotctl policy update` (§9.1), which is the thing that makes a
-retrained gait reach a robot without a daemon release, and therefore the thing that makes this
-whole channel worth having.
+**The pin is a minimum, not a ceiling**, and that distinction is load-bearing. It ships inside
+the daemon release, so bumping it *does* need a daemon release — an earlier draft of this section
+claimed otherwise and was simply wrong. The pin decides two things: what a *freshly provisioned*
+board installs, and the oldest official set this daemon runs with. A board whose set is from our
+repo and below the pin is moved up to it by the post-install hook — the daemon's slot defaults
+name files, and a default that names a file only a newer set carries (v5's `velstand.onnx`) would
+otherwise leave a board that updated the daemon alone unable to load its gait, unhealthy, and
+rolled back. A set past the pin, from another repo, or without a `.source` record is left alone.
+Moving past it is `robotctl policy update` (§9.1), which is the thing that makes a retrained gait
+reach a robot without a daemon release, and therefore the thing that makes this whole channel
+worth having.
 
 Three things it does not do. It does not re-download a set it already has, so an update whose pin
 is unchanged touches no network — which matters because the post-install hook runs under a
@@ -444,9 +454,14 @@ stand, and `will_stand` hands the robot to the standing network whenever command
 zero, which is exactly the state that policy is in when it is standing on two feet. Without a way
 to say `stand none`, running it meant editing the file this whole command exists to stop editing.
 
-`robotctl policy search microduck` lists what is out there, marking each hit's origin. No tag
+`robotctl policy search microduck` lists what is out there, marking each hit's origin, with the
+publisher's one-line description under it and a link to the clip when the repo carries one. No tag
 filter: a shared name is what the published policies have in common, and a tag is worth adding
 once there is something to tag.
+
+The description is the reason the listing is worth reading: every hit is somebody's
+`microduck-<something>`, and a name is not enough to choose between a flamingo cycle and a rough
+walk. Without it the only way to find out what a policy did was to install it.
 
 ### 9.3 The set describes itself
 
@@ -657,7 +672,8 @@ dereferencing the symlinks that repository uses to give stable names to particul
 
 | in the set | upstream | role |
 | --- | --- | --- |
-| `alpha_walking.onnx` | `BEST_alpha_walking_rough.onnx` | walking / velstand |
+| `alpha_walking.onnx` | `BEST_alpha_walking_rough.onnx` | walking / velstand (default `walk` until set v5) |
+| `velstand.onnx` | `pollen-robotics/microduck_rl` `velstand_best.onnx` (2026-09-14) | walking + standing at zero command; default `walk` from set v5, `stand` unset |
 | `alpha_stand.onnx` | `BEST_alpha_stand_body_control.onnx` | standing + body-pose |
 | `alpha_sitstand.onnx` | `BEST_alpha_sitstand.onnx` | sit ↔ stand (posture flag) |
 | `alpha_ground_pick.onnx` | `alpha_ground_pick.onnx` | ground pick (phase command) |
@@ -703,7 +719,7 @@ its meaning for the things that genuinely are models and not control policies, s
 | Seeding never overwrites a set it did not install | The handover needs no flag: the first real install ends it (§9) |
 | The set is downloaded, not shipped | Same as ONNX Runtime and the plugins; bumping the pin ships a gait (§9) |
 | A failed fetch keeps the set already installed | A half-published revision must not downgrade a working gait (§9) |
-| The pin is a floor; `policy update` moves past it | Otherwise a gait still needs a daemon release, which is the thing this channel is for (§9.1) |
+| The pin is a minimum; `policy update` moves past it | A default that names a newer set's file must not roll the daemon back on boards behind it; a gait still needs no daemon release (§9.1) |
 | A set records the repo it came from | One writer, one copy, nothing to configure twice or drift (§9.1) |
 | Reload is a third thing, not reset-all | They look identical from outside and conflating them discards every override (§9.1) |
 | One-shot skills are config, not code | Kicks and roulade were the same arm with different numbers; a community one is a fifth set (§10) |

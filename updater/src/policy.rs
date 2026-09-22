@@ -7,7 +7,7 @@
 //! an HTTP client because it is the tool that has to work when everything else is broken.
 //!
 //! **Why it exists.** A board installs its set from a pin that ships inside the daemon release
-//! (`scripts/seed-policies.sh`), which makes the pin a *floor* rather than a ceiling: without
+//! (`scripts/seed-policies.sh`), which makes the pin a *minimum* rather than a ceiling: without
 //! something to move past it, a retrained gait would still need a daemon release to reach a
 //! robot, which is the thing the whole channel was meant to stop. This is that something.
 //!
@@ -24,12 +24,58 @@ use crate::source::http;
 /// Where the sets live. Matches `robotd_params::POLICY_DIR`'s parent and the seeder's default.
 pub const POLICY_ROOT: &str = "/opt/robot/policies";
 
+/// Where the duck detector lives. Matches `robotd_params::DETECTOR_DIR`'s parent and
+/// `scripts/seed-detector.sh`'s default — the same layout as the policies, one directory over,
+/// so [`check`], [`install_set`] and the seeder's rules apply unchanged.
+pub const DETECTOR_ROOT: &str = "/opt/robot/detector";
+
+/// What a detector set holds, NPU first. The detector's repo carries no manifest — its file
+/// names are fixed — so this list is the download list, and `scripts/seed-detector.sh` and
+/// `robotd_params::DETECTOR_FILES` carry the same one; an xtask test holds the three together.
+///
+/// The model repo shares its name with the dataset repo. Everything here addresses the model
+/// (`resolve/` without a `datasets/` prefix, `api/models/`), so the shared name cannot cross.
+pub const DETECTOR_FILES: [&str; 2] = ["duck_detect.rknn", "duck_detect.onnx"];
+
+/// Where a set's file list comes from.
+#[derive(Debug, Clone, Copy)]
+pub enum Contents {
+    /// The revision's `manifest.json`, falling back to what the installed set holds — the
+    /// official policy set, whose list can grow with a tag.
+    Manifest,
+    /// A fixed list — the detector, whose two files have fixed names and no manifest.
+    Fixed(&'static [&'static str]),
+}
+
 /// The provenance record the seeder writes beside a set.
 const SOURCE_FILE: &str = ".source";
 
 /// What a set says about itself, installed beside the policies it describes. `robotd` reads it
 /// from `<current>/` to know which of them are skills.
 const MANIFEST_FILE: &str = "manifest.json";
+
+/// How many `manifest.json` requests a search has in flight at once.
+///
+/// Six is a compromise with a shared address: Hugging Face rate-limits by IP, and the IP belongs
+/// to whoever else is on that network — a 429 earned by a search is paid for by somebody's browser
+/// and somebody's `git push`. Sequential would be politer and would spend a reply budget on
+/// latency; twenty-five at once would be the fan-out that earns the 429.
+const MANIFESTS_AT_ONCE: usize = 6;
+
+/// How long a search waits for descriptions before answering with what it has.
+///
+/// The hits are the answer and the descriptions are what makes them readable, so this is chosen
+/// against the *reply* budget rather than against the Hub: a client gives `policy.search` 60
+/// seconds, the search itself has already spent one request, and a list that arrives late is worse
+/// than a list where the last few lines say nothing. Whatever has landed by then is kept.
+const DESCRIBE_BUDGET: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// How much of a publisher's description a listing carries.
+///
+/// Long enough for the ones published so far — the longest is a little over a hundred characters —
+/// and short enough that a line stays a line. What is cut is visible as an ellipsis rather than
+/// silent, so a reader knows to go and look at the repo.
+const DESCRIPTION_LIMIT: usize = 200;
 
 /// Sets installed from here are named for their revision, and the prefix marks them as *ours* —
 /// the seeder uses the same one, and both refuse to disturb a `current` that has neither.
@@ -221,14 +267,23 @@ fn files_in_manifest(bytes: &[u8]) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Download one revision of the official policy set into `root`, and point `current` at it.
+pub async fn install(
+    root: &Path,
+    version: Option<&str>,
+) -> Result<(String, Option<String>), Error> {
+    install_set(root, version, Contents::Manifest).await
+}
+
 /// Download one revision of a repo into `root`, and point `current` at it.
 ///
 /// Nothing partial goes live: the files land in a staging directory and the symlink moves only
 /// once every one of them has arrived. Same rule the seeder follows, and for the same reason —
-/// a half-written set is one a restarting `robotd` could read.
-pub async fn install(
+/// a half-written set is one a restarting `robotd` (or `mediad`) could read.
+pub async fn install_set(
     root: &Path,
     version: Option<&str>,
+    contents: Contents,
 ) -> Result<(String, Option<String>), Error> {
     let source = installed(root).ok_or_else(|| {
         Error::Network("no policy set is installed, so there is no repo to install from".into())
@@ -257,10 +312,15 @@ pub async fn install(
         return Ok((version, None));
     }
 
-    let (files, manifest) = set_files(&client, &source.repo, &version).await;
-    let files = match files.is_empty() {
-        false => files,
-        true => installed_files(root),
+    let (files, manifest) = match contents {
+        Contents::Manifest => {
+            let (files, manifest) = set_files(&client, &source.repo, &version).await;
+            match files.is_empty() {
+                false => (files, manifest),
+                true => (installed_files(root), None),
+            }
+        }
+        Contents::Fixed(names) => (names.iter().map(|n| (*n).to_owned()).collect(), None),
     };
     if files.is_empty() {
         return Err(Error::Network(format!(
@@ -649,6 +709,122 @@ mod tests {
 
     fn manifest(json: serde_json::Value) -> PolicyManifest {
         serde_json::from_value(json).expect("a manifest")
+    }
+
+    fn files(paths: &[&str]) -> Vec<String> {
+        paths.iter().map(|p| (*p).to_owned()).collect()
+    }
+
+    /// **The convention, on the repos that actually publish one.** `media/preview.mp4` is what
+    /// `RemiFabre/microduck-flamingo-cycle` and most others carry, and `preview.mp4` at the root is
+    /// what `Nupr-Haokun/microduck-step-up-head-brake` carries. Both have to win over anything else
+    /// in the repo, which is the whole reason the order is written down rather than sorted.
+    #[test]
+    fn the_agreed_paths_win() {
+        let listing = files(&[
+            "policy.onnx",
+            "manifest.json",
+            "media/training.mp4",
+            "media/preview.mp4",
+        ]);
+        assert_eq!(
+            preview_in(&listing).map(String::as_str),
+            Some("media/preview.mp4")
+        );
+
+        let at_root = files(&["preview.mp4", "media/other.mp4"]);
+        assert_eq!(
+            preview_in(&at_root).map(String::as_str),
+            Some("preview.mp4")
+        );
+    }
+
+    /// A repo with one clip per variant — `HannesVonEssen/microduck-stilts` carries `10cm/` and
+    /// `100cm/` — has no agreed path, and the answer still has to be the same on every run. The
+    /// Hub lists siblings in its own order, so "whichever came first" is not an answer.
+    #[test]
+    fn a_tie_is_broken_the_same_way_every_time() {
+        let listing = files(&["100cm/preview.mp4", "10cm/preview.mp4"]);
+        let mut reversed = listing.clone();
+        reversed.reverse();
+        assert_eq!(
+            preview_in(&listing).map(String::as_str),
+            Some("10cm/preview.mp4")
+        );
+        assert_eq!(preview_in(&reversed), preview_in(&listing));
+    }
+
+    /// Deeper than an agreed path but still called `preview`, which beats a video that is not.
+    /// `HannesVonEssen/microduck-running` keeps both, under `legacy/` and `lineage/`.
+    #[test]
+    fn a_named_preview_beats_any_other_video() {
+        let listing = files(&[
+            "media/onnx_viewer_example.mp4",
+            "lineage/iteration-11748/preview.mp4",
+        ]);
+        assert_eq!(
+            preview_in(&listing).map(String::as_str),
+            Some("lineage/iteration-11748/preview.mp4")
+        );
+    }
+
+    /// A repo with a video that was never meant as a preview still shows it —
+    /// `Teethyfish/microduck-collision-flamingo-ii` has only `media/onnx_viewer_example.mp4`. That
+    /// is the playground's behaviour and the point is parity with it: a clip of the policy is
+    /// better than no clip, and the publisher is the one who chose to ship it.
+    #[test]
+    fn any_video_is_better_than_none_and_a_gif_is_last() {
+        let only_a_clip = files(&["policy.onnx", "media/onnx_viewer_example.mp4"]);
+        assert_eq!(
+            preview_in(&only_a_clip).map(String::as_str),
+            Some("media/onnx_viewer_example.mp4")
+        );
+
+        let gif = files(&["policy.onnx", "media/demo.gif"]);
+        assert_eq!(preview_in(&gif).map(String::as_str), Some("media/demo.gif"));
+
+        let both = files(&["media/demo.gif", "clip.webm"]);
+        assert_eq!(preview_in(&both).map(String::as_str), Some("clip.webm"));
+    }
+
+    /// Most repos on the Hub matching `microduck` are not policies at all, and the ones that are
+    /// need not carry a clip. No video is `None`, not a guess at an `.onnx`.
+    #[test]
+    fn a_repo_with_no_video_has_no_preview() {
+        assert_eq!(preview_in(&files(&["policy.onnx", "manifest.json"])), None);
+        assert_eq!(preview_in(&[]), None);
+    }
+
+    /// A description is the publisher's, so it is cut to a line rather than trusted to be one.
+    #[test]
+    fn a_description_is_one_bounded_line() {
+        assert_eq!(one_line("  Bows from a stand.  "), "Bows from a stand.");
+        assert_eq!(
+            one_line("Bows from a stand.\n\nThen a long note nobody asked for."),
+            "Bows from a stand."
+        );
+        assert_eq!(one_line(""), "");
+
+        let essay = "é".repeat(DESCRIPTION_LIMIT + 50);
+        let cut = one_line(&essay);
+        assert_eq!(cut.chars().count(), DESCRIPTION_LIMIT + 1, "{cut}");
+        assert!(cut.ends_with('…'));
+    }
+
+    /// The file list `full=true` puts on a search hit, which is what names the video without a
+    /// tree listing per repo.
+    #[test]
+    fn siblings_come_off_a_search_hit() {
+        let hit = serde_json::json!({
+            "modelId": "someone/microduck-thing",
+            "siblings": [{ "rfilename": "manifest.json" }, { "rfilename": "media/preview.mp4" }]
+        });
+        assert_eq!(
+            siblings_of(&hit),
+            files(&["manifest.json", "media/preview.mp4"])
+        );
+        // A hit from a reply that was not asked for `full=true`, which is not a failure.
+        assert!(siblings_of(&serde_json::json!({ "modelId": "a/b" })).is_empty());
     }
 
     /// **The real convention, taken from a policy actually published to the Hub.** These are the
@@ -1287,10 +1463,16 @@ fn prune_library(repo_dir: &Path, keep: &str, in_use: Option<&[String]>) {
     }
 }
 
-/// Hub models matching a query.
+/// Hub models matching a query, with what each one says about itself.
 ///
 /// No tag filter yet: `microduck` in the name is what the published policies have in common, and
 /// a tag is something to add once there is something to tag. Every field is the publisher's.
+///
+/// **`full=true`, because the file list is what names the video.** It costs a larger reply — 25
+/// hits with their siblings is tens of kilobytes, well inside the metadata cap — and it saves a
+/// tree listing per repo, which is the request nobody should be making 25 of. The description is
+/// not in that reply and cannot be: it lives in each repo's `manifest.json`, so it is one small
+/// GET per repo that has one, which [`describe`] bounds.
 pub async fn search(query: &str) -> Result<crate::proto::PolicySearchResult, Error> {
     let client = http::client()?;
     let encoded: String = query
@@ -1298,28 +1480,183 @@ pub async fn search(query: &str) -> Result<crate::proto::PolicySearchResult, Err
         .filter(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | ' '))
         .map(|c| if c == ' ' { '+' } else { c })
         .collect();
-    let url = format!("https://huggingface.co/api/models?search={encoded}&limit=25");
+    let url = format!("https://huggingface.co/api/models?search={encoded}&limit=25&full=true");
     let bytes = http::get_bytes(&client, &url, None).await?;
     let hits: serde_json::Value = serde_json::from_slice(&bytes)
         .map_err(|e| Error::Network(format!("searching for {query}: {e}")))?;
 
-    let models = hits
-        .as_array()
-        .map(|models| {
-            models
+    let mut models: Vec<crate::proto::PolicySearchHit> = Vec::new();
+    // The repos worth one GET each, gathered here rather than re-derived: whether a manifest
+    // exists is in the file list and nowhere on the wire, so this is the only place that knows.
+    let mut with_manifest: Vec<String> = Vec::new();
+    for model in hits.as_array().unwrap_or(&Vec::new()) {
+        let Some(id) = model.get("modelId").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let id = id.to_owned();
+        let files = siblings_of(model);
+        if files.iter().any(|f| f == MANIFEST_FILE) {
+            with_manifest.push(id.clone());
+        }
+        models.push(crate::proto::PolicySearchHit {
+            preview: preview_in(&files)
+                .map(|path| format!("https://huggingface.co/{id}/resolve/main/{path}")),
+            origin: origin_of_repo(&id).to_owned(),
+            id,
+            likes: model.get("likes").and_then(|v| v.as_u64()),
+            downloads: model.get("downloads").and_then(|v| v.as_u64()),
+            description: None,
+        });
+    }
+
+    describe(&client, &mut models, with_manifest).await;
+    Ok(crate::proto::PolicySearchResult { models })
+}
+
+/// The file names one search hit carries, as `full=true` lists them.
+fn siblings_of(model: &serde_json::Value) -> Vec<String> {
+    model
+        .get("siblings")
+        .and_then(|s| s.as_array())
+        .map(|files| {
+            files
                 .iter()
-                .filter_map(|m| {
-                    let id = m.get("modelId")?.as_str()?.to_owned();
-                    let origin = origin_of_repo(&id).to_owned();
-                    Some(crate::proto::PolicySearchHit {
-                        id,
-                        origin,
-                        likes: m.get("likes").and_then(|v| v.as_u64()),
-                        downloads: m.get("downloads").and_then(|v| v.as_u64()),
-                    })
-                })
+                .filter_map(|f| f.get("rfilename")?.as_str().map(str::to_owned))
                 .collect()
         })
-        .unwrap_or_default();
-    Ok(crate::proto::PolicySearchResult { models })
+        .unwrap_or_default()
+}
+
+/// Fill in each hit's description from its `manifest.json`, for as long as that is worth waiting.
+///
+/// **Bounded three ways, because this is the one place a search fans out.** Only repos whose file
+/// list actually holds a manifest are asked, so a search matching 25 unrelated models makes no
+/// requests at all; [`MANIFESTS_AT_ONCE`] are in flight at a time; and the whole thing gives up at
+/// [`DESCRIBE_BUDGET`], keeping whatever arrived. Hugging Face rate-limits by address, and the
+/// address is shared with whoever is using the Hub from the same network — a search is not worth
+/// spending somebody's browser session on.
+///
+/// Nothing here fails the search. A description is a nicety on a line that was useful without it,
+/// so an unreadable manifest, a slow mirror and a repo that never had one all read as `None`.
+async fn describe(
+    client: &reqwest::Client,
+    models: &mut [crate::proto::PolicySearchHit],
+    wanted: Vec<String>,
+) {
+    use futures_util::StreamExt;
+
+    if wanted.is_empty() {
+        return;
+    }
+
+    let deadline = tokio::time::Instant::now() + DESCRIBE_BUDGET;
+    let mut described: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut pending = futures_util::stream::iter(wanted.into_iter().map(|id| {
+        let client = client.clone();
+        async move {
+            let description = description_of(&client, &id).await;
+            (id, description)
+        }
+    }))
+    .buffer_unordered(MANIFESTS_AT_ONCE);
+
+    // `timeout_at` on each arrival rather than around the whole stream: a budget that drops the
+    // stream would throw away the descriptions that did arrive, and a partial list is the point —
+    // the first hits are the ones a reader looks at.
+    while let Ok(Some((id, description))) = tokio::time::timeout_at(deadline, pending.next()).await
+    {
+        if let Some(description) = description {
+            described.insert(id, description);
+        }
+    }
+    drop(pending);
+
+    for model in models.iter_mut() {
+        model.description = described.remove(&model.id);
+    }
+}
+
+/// One repo's `description`, or `None` for every way there might not be one.
+///
+/// **One line, and a bounded one.** The manifest calls this field one line and the published ones
+/// are, but it is a stranger's string and this one ends up on a line in a list of twenty-five —
+/// a publisher who pastes an essay, or a newline, would otherwise reformat somebody else's
+/// listing. Cut rather than refused: the first sentence of an over-long description is still the
+/// most useful thing on the line.
+async fn description_of(client: &reqwest::Client, repo: &str) -> Option<String> {
+    let url = format!("https://huggingface.co/{repo}/resolve/main/{MANIFEST_FILE}");
+    let bytes = http::get_bytes(client, &url, None).await.ok()?;
+    let manifest: PolicyManifest = serde_json::from_slice(&bytes).ok()?;
+    let description = manifest.description?;
+    Some(one_line(&description)).filter(|d| !d.is_empty())
+}
+
+/// The first line of an untrusted description, cut to [`DESCRIPTION_LIMIT`] characters.
+///
+/// Characters rather than bytes, because the cut has to land on a boundary and a description is as
+/// likely to be French as English.
+fn one_line(description: &str) -> String {
+    let line = description.lines().next().unwrap_or_default().trim();
+    match line.char_indices().nth(DESCRIPTION_LIMIT) {
+        None => line.to_owned(),
+        Some((cut, _)) => format!("{}…", line[..cut].trim_end()),
+    }
+}
+
+/// The video to show beside a policy, out of everything the repo carries.
+///
+/// **A convention rather than a declared field**, and deliberately the same one the policy
+/// playground reads: publishers are already putting a clip at `media/preview.mp4`, and a manifest
+/// field would ask every one of them to say again what the path already says. If the convention
+/// ever turns out to be ambiguous in a way this order cannot settle, a `preview` field in the
+/// manifest is the way out and this function is where it would be preferred.
+///
+/// The order is most-deliberate first: the agreed path, then the same file at the root, then
+/// anything called `preview` in a directory, then any video at all, then a GIF. Ties break on the
+/// shallowest path and then the shortest name, so a repo carrying one clip per variant
+/// (`10cm/preview.mp4`, `100cm/preview.mp4`) gets a stable answer instead of whichever the Hub
+/// happened to list first.
+fn preview_in(files: &[String]) -> Option<&String> {
+    const VIDEO: [&str; 3] = [".mp4", ".webm", ".mov"];
+
+    fn ends_with_any(file: &str, endings: &[&str]) -> bool {
+        let lower = file.to_lowercase();
+        endings.iter().any(|ending| lower.ends_with(ending))
+    }
+    /// Shallowest, then shortest, then alphabetical — a total order, so two runs agree.
+    fn best(mut candidates: Vec<&String>) -> Option<&String> {
+        candidates.sort_by(|a, b| {
+            (a.matches('/').count(), a.len(), a.as_str()).cmp(&(
+                b.matches('/').count(),
+                b.len(),
+                b.as_str(),
+            ))
+        });
+        candidates.into_iter().next()
+    }
+    fn named_preview(file: &str) -> bool {
+        file.rsplit('/')
+            .next()
+            .is_some_and(|name| name.to_lowercase().starts_with("preview"))
+    }
+
+    if let Some(exact) = files.iter().find(|f| f.as_str() == "media/preview.mp4") {
+        return Some(exact);
+    }
+    if let Some(exact) = files.iter().find(|f| f.as_str() == "preview.mp4") {
+        return Some(exact);
+    }
+    let videos = || files.iter().filter(|f| ends_with_any(f, &VIDEO));
+    if let Some(found) = best(videos().filter(|f| named_preview(f)).collect()) {
+        return Some(found);
+    }
+    if let Some(found) = best(videos().collect()) {
+        return Some(found);
+    }
+    best(
+        files
+            .iter()
+            .filter(|f| ends_with_any(f, &[".gif"]))
+            .collect(),
+    )
 }

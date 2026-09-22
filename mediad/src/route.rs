@@ -82,7 +82,7 @@ fn permits(call: &proto::Call) -> bool {
         // camera: it is looking at the robot, which is precisely what a phone in the room over
         // Bluetooth was not. Permitted for that reason, and it would be worth revisiting if a
         // control-only session without video ever becomes a normal thing.
-        RobotEnable(_) | RobotInit | RobotRelax => true,
+        RobotEnable(_) | RobotInit | RobotRelax | RobotRebootMotors(_) => true,
 
         // `robot.stop` is permitted here and refused over BLE, and the difference is honesty
         // rather than authority. BLE's objection was that a stop button over "an unbonded,
@@ -141,6 +141,9 @@ fn permits(call: &proto::Call) -> bool {
         // reads below, and a remote client watching a gait misbehave has an obvious use for it.
         RobotPolicies => true,
 
+        // The robot's static geometry, for a mapper on the other end of the video: a read.
+        RobotModel => true,
+
         // Re-reading the slots goes with loading one: a client that can change what drives the
         // robot wants the case where something else changed it too.
         RobotReloadPolicies => true,
@@ -158,6 +161,10 @@ fn permits(call: &proto::Call) -> bool {
         // surface, and a robot whose gait a neighbour can replace is a robot whose gait a
         // neighbour can already replace with `robot.loadPolicy`.
         PolicyFetch(_) | PolicyInstall(_) => true,
+
+        // The detector's set, the same way. Installing one restarts *this* daemon, which ends the
+        // session that asked — the answer is sent before the restart, and the peer reconnects.
+        DetectorCheck | DetectorInstall(_) => true,
 
         // ── the account, permitted, and this one is worth reading ────────────
         //
@@ -204,6 +211,8 @@ fn permits(call: &proto::Call) -> bool {
         // "it will be through `mediad`'s video path, where depth belongs next to the frame it
         // annotates".
         TofStream => true,
+        // The head IMU rides the same video path, for the same reason: it annotates the frames.
+        HeadImuStream => true,
 
         // ── reading the robot's software ─────────────────────────────────────
         //
@@ -214,6 +223,11 @@ fn permits(call: &proto::Call) -> bool {
 
         // ── identity and status ─────────────────────────────────────────────
         SystemInfo | SystemServices | SystemSetName(_) => true,
+        // A daemon's journal tail. Read-only, and the question that follows a unit reported as
+        // `failed` — which `SystemServices` above can now say and could not explain. Permitted
+        // here for the reason `Show` is: a datachannel has room for a reply BLE has to trim,
+        // so the console is the transport where a whole screenful is cheap.
+        SystemLogs(_) => true,
         // Drops this session, and unlike an update leaves nothing mid-transition: the robot comes
         // back and the client reconnects. It is what you offer a confused robot.
         SystemReboot => true,
@@ -379,6 +393,9 @@ mod tests {
                 // a decision.
                 proto::method::POLICY_INSTALL,
                 proto::method::POLICY_FETCH,
+                // Replacing the detector, which restarts this daemon. Permitted for the policy
+                // set's reason; the session ends and the peer reconnects.
+                proto::method::DETECTOR_INSTALL,
                 // Binding this robot to a Hugging Face account, and unbinding it. The argument
                 // is in the table above — briefly: the console is where somebody would sign a
                 // robot in, a robot that already belongs to somebody refuses without `force`,
@@ -432,6 +449,7 @@ mod tests {
                     | proto::Call::RobotStop
                     | proto::Call::RobotSubscribe(_)
                     | proto::Call::TofStream
+                    | proto::Call::HeadImuStream
                     | proto::Call::PadInput
             );
             if wanted {
@@ -497,6 +515,8 @@ mod tests {
                 query: "microduck".to_owned(),
             }),
             proto::Call::PolicyInstall(proto::PolicyInstallParams::default()),
+            proto::Call::DetectorCheck,
+            proto::Call::DetectorInstall(proto::PolicyInstallParams::default()),
         ] {
             assert!(
                 matches!(route_for(&call), Route::To(..)),
