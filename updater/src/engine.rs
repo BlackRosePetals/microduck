@@ -1824,6 +1824,12 @@ impl Engine {
                 // For as long as the gate would have, and for the gate's reason: at boot this
                 // question lands while `robotd` may still be loading its policies, and the two
                 // units are not ordered. See `robot_verdict`.
+                //
+                // Recovery runs before the socket is served, so a `robotd` that never answers at
+                // all now holds `updaterd` off `/run/updaterd.sock` for this timeout rather than
+                // for `ROBOT_QUERY_TIMEOUT`. Only on the boot that reverts, and it buys the case
+                // above: a release the robot was about to be fine on, replaced under whoever is
+                // holding it.
                 match self.robot_verdict(*timeout).await {
                     Some(crate::robot::Health::Healthy) => {
                         tracing::warn!(

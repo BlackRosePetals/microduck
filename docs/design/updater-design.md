@@ -671,6 +671,17 @@ and the next update that ships the unit reinstalls it.
 
     What still reverts is what this net is for: `robotd` unhealthy, unreachable, or answering in a
     shape this `updaterd` cannot read.
+
+    **And it asks the way the gate asks: polling, for the component's `health.timeout`.** Not one
+    question. `robotd` answers "control loop has not completed a cycle yet" from the moment its
+    socket opens until its first tick, and nothing orders `robotd.service` against
+    `updaterd.service` — so a single question at boot lands in that window often enough, and a
+    robot that is merely late reads as a release that failed. "Unreachable" is the same answer for
+    the same reason: at boot, a socket that is not there yet and a `robotd` that is never coming
+    back look identical, and only waiting tells them apart. The cost is paid on the boot that
+    reverts: recovery runs before the socket is served (§4 of `restart-order.md`), so a `robotd`
+    that never answers holds `updaterd` off `/run/updaterd.sock` for the whole timeout — 30s with
+    the shipped config — instead of the two seconds a single question took.
 - `keep_previous` (default 1) retained release dirs bound disk usage while
   always leaving a known-good target to roll back to.
 
