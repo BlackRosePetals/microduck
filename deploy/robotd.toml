@@ -2,8 +2,8 @@
 #
 # Installed to /etc/robot/robotd.toml. Mostly read once at startup and not watched, so
 # mostly a change needs a restart — of the daemon that reads the section, which is not
-# always robotd: [media] and [detect] are mediad's and [head_imu] is tofd's. The two
-# exceptions: padd re-reads [imu_head] a second after the file changes, and robotd
+# always robotd: [media] and [duck_detector] are mediad's and [head_imu] is tofd's. The two
+# exceptions: padd re-reads [pad_imu_head_control] a second after the file changes, and robotd
 # re-reads [policy] when asked. `robotctl configure` knows which is which and offers it
 # (docs/design/robotd-design.md §4.2).
 #
@@ -20,6 +20,17 @@
 # Zero 3W's wiring; a board wired differently can also be overridden per-invocation with
 # `robotd --port`, which is the dev escape hatch rather than the thing to edit here.
 port = "/dev/ttyS2"
+
+# Read the bus with fast sync read (protocol 2.0 instruction 0x8A) instead of a plain sync
+# read. The 16 devices append their answers to one status packet rather than each sending
+# its own, so the bus turns around once per tick instead of 16 times.
+#
+# Turn it OFF for a board whose firmware predates the instruction: XL330 needs v46 or newer,
+# and the imu_to_dxl board has to implement it too. There is no half-working version of
+# getting this wrong — a device that does not implement 0x8A does not answer, so every read
+# fails and the journal fills with `bus read failed`. That is the symptom to match against
+# this line. Needs a robotd restart.
+# fast_sync_read = true
 
 # Every value below that is commented out shows the built-in default. LEAVE IT COMMENTED
 # unless this robot genuinely needs a different value: install.sh copies this file to
@@ -115,8 +126,9 @@ mode = "walk"
 # "observation width is 51, expected 61".)
 #
 # Walk-mode defaults, spelled out, all under /opt/robot/policies/current/:
-# walk        = "alpha_walking.onnx"     the velstand gait
-# stand       = "alpha_stand.onnx"       standing + body pose
+# walk        = "velstand.onnx"          walks on a twist, stands still at zero command
+# stand       = "none"                   velstand stands on its own; "alpha_stand.onnx" is
+#                                        the old standing + body-pose network, still in the set
 # sitstand    = "alpha_sitstand.onnx"    sit <-> stand, posture flag
 # ground_pick = "alpha_ground_pick.onnx" A-button pick
 # kick_left   = "ball_kick_left.onnx"
@@ -169,8 +181,8 @@ mode = "walk"
 
 # Scale actions with battery voltage: effective scale = action_scale * (nominal / measured
 # EMA, clamped 6.0..9.5 V). The servos' effective kP tracks their supply, so this holds the
-# robot's response steady as the pack sags. Off by default, as in the prototype.
-# voltage_adapt = false
+# robot's response steady as the pack sags. On by default.
+# voltage_adapt = true
 # nominal_voltage = 7.4
 
 [safety]
@@ -210,11 +222,11 @@ mode = "walk"
 # selects the standing network, and that is the stand-up.
 #
 # The only thing the daemon does about a fall. With it off, a fall changes nothing: the
-# policy keeps driving and the humans stay in charge, which is the prototype's behaviour
-# and the default here. ON by default since it was validated on a robot: the whole point is
-# that the fleet lands soft, and a mode every board has to opt into individually is a mode
-# most boards do not have. Set it to false on a robot that needs the old behaviour.
-# limp_fall = true
+# policy keeps driving and the humans stay in charge, which is the prototype's behaviour.
+# OFF by default: the hand-back at the end is to the standing network, and the default
+# configuration (velstand as `walk`, `stand` unset) loads none. Set it to true on a robot
+# that runs a standing policy.
+# limp_fall = false
 
 # When a fall counts as started. This is the whole feature, and both ways of getting it
 # wrong are real: too early and the robot limps out of leans it would have walked off —
@@ -335,20 +347,26 @@ mode = "walk"
 # withdrew keeps sounding.
 # hold_ms = 250
 
-[detect]
+[duck_detector]
 # Finding other Microducks in the head camera. Read by `mediad`, not `robotd` — the frames are on
 # `mediad`'s pipeline and perception belongs next to the sensor — but the switch lives here because
 # this is the file `robotctl configure` edits and a robot has one place for its settings.
 #
-# **Off by default.** The model ships in the release (models/duck_detect.rknn for the NPU,
-# models/duck_detect.onnx for the CPU), and a robot nobody has asked to look for ducks should not
-# pay ~60 ms of work every half second for it.
+# **Off by default.** A robot nobody has asked to look for ducks should not pay ~60 ms of work
+# every half second for it.
 # enabled = true
 
 # Which model, and therefore which processor: a `.rknn` runs on the NPU, an `.onnx` on the CPU.
-# Unset tries the release's own, NPU first — and falls through to the CPU on a board whose NPU is
+# Unset means the installed set — /opt/robot/detector/current/duck_detect.rknn for the NPU,
+# duck_detect.onnx for the CPU — NPU first, falling through to the CPU on a board whose NPU is
 # switched off in its device tree, which is how Armbian ships the Radxa Zero 3. `sudo sh
 # /opt/robot/daemon/current/scripts/setup-npu.sh` turns it on, and needs a reboot.
+#
+# That set comes from the Hub (pollen-robotics/microduck-duck-detector, trained in
+# pollen-robotics/duck_detector), the way the official policy set does: the release's postinstall
+# hook seeds it once, `robotctl duck-detector check` asks whether a newer one exists, and
+# `sudo robotctl duck-detector update` installs it and restarts mediad onto it. A retrain is a tag
+# there, not a daemon release. This key is for a model of your own.
 # model = "/home/microduck/my_detector.rknn"
 
 # Looks per second. **2 is a thermal limit, not a preference**: flat out this reaches 95 °C on a
@@ -401,10 +419,16 @@ mode = "walk"
 # only supported way to change one was a systemd drop-in, and nobody reaches for a drop-in to
 # answer "why is the video soft?".
 
-# Stream the head camera. Off streams a test pattern instead, which is what a board with no
-# camera wants — the pipeline still starts, so the WebRTC *control* channel still exists. It is
-# bundled with the video track, so a pipeline that will not start costs both.
-# camera = true
+# Where the video comes from: "camera" or "test".
+#
+# "test" streams a test pattern, which is what a board with no camera wants — the pipeline still
+# starts, so the WebRTC *control* channel still exists. It is bundled with the video track, so a
+# pipeline that will not start costs both. A name rather than a boolean because "camera = false"
+# does not mean "no video", it means "synthetic video", and nothing in the old key said so.
+#
+# The pattern ignores `quality` and runs at 256x144@5: it exists to make the session reachable,
+# and drawing a 720p30 one in software cost five times what the camera it stands in for does.
+# source = "camera"
 
 # Frame size and rate, as one name: 1080p30, 720p30, 720p15 or 360p30.
 #
@@ -453,7 +477,10 @@ mode = "walk"
 # driving. A third press hands the head back to the pad from where the pad is *now* — its yaw is
 # a gyro's word alone and drifts, and re-centring on every re-entry is how you beat that without
 # a magnetometer. Off, or on a pad with no IMU, Y is what it always was.
-# [imu_head]
+#
+# Not [head_imu], which is the IMU in the robot's head. This section was [imu_head] once; a file
+# still saying that loads, and `robotctl configure` renames it on its next save.
+# [pad_imu_head_control]
 # enabled = false
 
 # Head radians per pad radian. 1 follows the pad exactly; more turns a small wrist movement into

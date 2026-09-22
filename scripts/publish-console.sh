@@ -15,6 +15,10 @@
 #                       which is exactly true here and is what selects the rendezvous transport.
 #                       Substituting it would make the page try to open a WebSocket to the Space.
 #
+# The OAuth client id is not on that list and no longer a token in the page: the Space's
+# `entrypoint.sh` writes the whole `window.huggingface.variables` object into `<head>` as it
+# serves, which is how it also carries the scopes its app was provisioned with.
+#
 # Usage: scripts/publish-console.sh [--space <org/name>] [--dry-run]
 #
 # Pushing needs a Hugging Face token with write access to the Space. `hf auth login` stores one,
@@ -65,12 +69,21 @@ cp "$CARD" "$STAGE/README.md"
 # The Space is a Docker Space: it serves the page and substitutes its own OAuth client id into it.
 cp "$SPACE_DIR/Dockerfile" "$SPACE_DIR/entrypoint.sh" "$STAGE/"
 
-# The client id is substituted by the container at start, not here, so the token must survive
-# this staging — and the secret that comes with it must never appear in the page at all.
-grep -q '{{OAUTH_CLIENT_ID}}' "$STAGE/index.html" || {
-    echo "the OAuth token is gone from the page; the Space could not fill in its client id" >&2
+# The sign-in arrives by injection at request time, and `<head>` is where it is injected. The
+# page's own comment calls that skeleton load-bearing; this is the check that says so out loud,
+# because a page that loses it still renders and simply cannot sign anybody in.
+grep -q '<head>' "$STAGE/index.html" || {
+    echo "the page has no <head>; the Space could not inject its OAuth client id" >&2
     exit 1
 }
+
+# And the secret must never appear in the page at all. An `if` rather than `grep && exit`,
+# because under `set -e` a non-matching grep at the head of an `&&` list aborts the script — the
+# one outcome this check is supposed to wave through.
+if grep -q 'OAUTH_CLIENT_SECRET' "$STAGE/index.html"; then
+    echo "the page names OAUTH_CLIENT_SECRET; the browser flow is PKCE and needs no secret" >&2
+    exit 1
+fi
 
 grep -q '{{SIGNALLING_PORT}}' "$STAGE/index.html" || {
     echo "the port token is gone from the page; the Space copy would try to open a WebSocket" >&2

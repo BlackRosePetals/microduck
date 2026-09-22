@@ -136,6 +136,24 @@ impl Server {
 
     /// As [`Self::new`], with uids/gids permitted to mutate beyond the owning uid.
     pub fn with_policy(engine: Engine, allow_uids: Vec<u32>, allow_gids: Vec<u32>) -> Self {
+        Self::with_policy_at(
+            engine,
+            allow_uids,
+            allow_gids,
+            PathBuf::from(crate::account::DEFAULT_PATH),
+        )
+    }
+
+    /// [`Self::with_policy`], with the account credential somewhere other than a robot's.
+    ///
+    /// The simulator, where the daemons run as a person and `/etc/robot` is not writable. See
+    /// [`crate::account::account_at`].
+    pub fn with_policy_at(
+        engine: Engine,
+        allow_uids: Vec<u32>,
+        allow_gids: Vec<u32>,
+        token_path: PathBuf,
+    ) -> Self {
         let (progress_tx, _) = broadcast::channel(PROGRESS_BUFFER);
         Self {
             engine: Arc::new(Mutex::new(engine)),
@@ -146,7 +164,7 @@ impl Server {
             allow_uids,
             allow_gids,
             forced_owner_uid: None,
-            account: Arc::new(crate::account::account()),
+            account: Arc::new(crate::account::account_at(token_path)),
         }
     }
 
@@ -626,6 +644,32 @@ impl Server {
                     }
                 };
                 match engine.install_policies(params.version.as_deref()).await {
+                    Ok(result) => Response::ok(Some(id), &result),
+                    Err(e) => Response::err(Some(id), e.to_rpc_error()),
+                }
+            }
+            // The detector's set: the same two questions against the other root, and the same
+            // locking — a read that takes no lock, an install that must not run beside a release
+            // install because both would be restarting daemons at once.
+            Call::DetectorCheck => {
+                Response::ok(Some(id), &crate::policy::check(
+                    std::path::Path::new(crate::policy::DETECTOR_ROOT),
+                ).await)
+            }
+            Call::DetectorInstall(params) => {
+                let engine = match self.engine.try_lock() {
+                    Ok(engine) => engine,
+                    Err(_) => {
+                        return Response::err(
+                            Some(id),
+                            proto::Error::new(
+                                proto::code::BUSY,
+                                "an update is in progress; retry shortly",
+                            ),
+                        );
+                    }
+                };
+                match engine.install_detector(params.version.as_deref()).await {
                     Ok(result) => Response::ok(Some(id), &result),
                     Err(e) => Response::err(Some(id), e.to_rpc_error()),
                 }

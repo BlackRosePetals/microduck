@@ -553,6 +553,12 @@ struct RobotState {
     /// Hottest board thermal zone, as `f64::to_bits`. Zero means no reading — off Linux, or a
     /// kernel with no thermal sysfs ([`soc`]).
     cpu_temp_c: AtomicU64,
+    /// What the board's clock is capped at, and how far the thermal governor wound it down.
+    ///
+    /// A swap rather than four atomics, because the four numbers are one reading: a level
+    /// paired with the ceiling from a different sample would describe a board that never
+    /// existed. `None` until the first sample, and forever on a board with no `cpufreq` sysfs.
+    cpu_throttle: ArcSwapOption<proto::CpuThrottle>,
     /// Mirrors of the bus's own IMU diagnostics, refreshed with the thermal sample. Held here
     /// so the IPC side can report them without touching the loop's IO.
     imu_stale_blocks: AtomicU64,
@@ -654,6 +660,18 @@ struct RobotState {
     /// distinguishes them.
     homed: AtomicBool,
 
+    /// The duck is parked in its seat, latched there by `sit_toggle`.
+    ///
+    /// **Published because "stand up" means two different calls.** A duck on its feet stands with
+    /// `robot.init`; a duck in the seat is *held* there by a latch this daemon drives, and `init`
+    /// argues with it rather than winning. What ends a sit is `robot.do sit_toggle`, and a client
+    /// cannot know which of the two to send without this — the playground sent `init` at a seated
+    /// duck and watched the two fight.
+    ///
+    /// Not `busy`: a seated duck is parked, not travelling, which is the distinction
+    /// [`control::Controller::busy`] already draws.
+    sitting: AtomicBool,
+
     period_us: u64,
     min_achieved_hz: f64,
     stall_periods: u32,
@@ -682,6 +700,7 @@ impl RobotState {
             motor_mean_c: AtomicU64::new(0),
             motor_hottest: AtomicU32::new(0),
             cpu_temp_c: AtomicU64::new(0),
+            cpu_throttle: ArcSwapOption::empty(),
             imu_stale_blocks: AtomicU64::new(0),
             imu_stale_run: AtomicU64::new(0),
             imu_ready: AtomicBool::new(false),
@@ -706,6 +725,7 @@ impl RobotState {
             fallen: AtomicBool::new(false),
             moving: AtomicBool::new(false),
             homed: AtomicBool::new(false),
+            sitting: AtomicBool::new(false),
             period_us: params.period().as_micros() as u64,
             min_achieved_hz: params.update_gate.min_achieved_hz,
             stall_periods: params.update_gate.stall_periods,
@@ -736,6 +756,7 @@ impl RobotState {
                     let c = f64::from_bits(self.cpu_temp_c.load(Ordering::Relaxed));
                     (c > 0.0).then_some(c)
                 },
+                cpu_throttle: self.cpu_throttle.load_full().map(|t| *t),
                 control_loop: Some(self.loop_health()),
                 bus: proto::BusHealth {
                     consecutive_errors: self.consecutive_errors.load(Ordering::Relaxed),
@@ -1030,7 +1051,7 @@ fn run_init(params: &Params, duration: Duration) -> ExitCode {
     // The same open as the daemon's, replacement adoption included: `init` is what someone
     // reaches for right after a motor swap, and it must not be the one path that refuses the
     // new servo.
-    let Some(mut io) = open_bus(&params.bus.port, 0) else {
+    let Some(mut io) = open_bus(&params.bus, 0) else {
         return ExitCode::FAILURE;
     };
     if let Err(e) = io.set_torque(true) {
@@ -1080,7 +1101,7 @@ fn spawn_control_thread(
     let period = params.period();
     let fake = args.fake;
     let sim = args.sim.clone();
-    let port = params.bus.port.clone();
+    let bus = params.bus.clone();
     let params = params.clone();
     // So a reload can re-read `[policy]` without a restart. The path rather than the loaded
     // params, because the point is to pick up what has been written since.
@@ -1142,7 +1163,7 @@ fn spawn_control_thread(
             // loop has not completed a cycle yet", forever, whatever happened to the robot
             // afterwards. Retrying the read alone was not enough: execution never got there.
             runtime.block_on(async move {
-                if let Some(io) = open_bus_waiting(&port, &state).await {
+                if let Some(io) = open_bus_waiting(&bus, &state).await {
                     control_loop(io, state, intents, params, params_path, period, poweroff).await;
                 }
             });
@@ -1162,13 +1183,13 @@ type BusIo = FakeIo;
 /// one to abandon the control loop over.
 ///
 /// Returns `None` only if shutdown is requested while waiting.
-async fn open_bus_waiting(port: &str, state: &RobotState) -> Option<BusIo> {
+async fn open_bus_waiting(bus: &params::Bus, state: &RobotState) -> Option<BusIo> {
     let mut attempt = 0u32;
 
     while !state.shutdown.load(Ordering::Relaxed) {
         // Logging lives in `open_bus`, which is chatty by design on the first attempt and
         // quiet thereafter — a board waiting overnight must not fill the journal.
-        if let Some(io) = open_bus(port, attempt) {
+        if let Some(io) = open_bus(bus, attempt) {
             state.startup_bus_failures.store(0, Ordering::Relaxed);
             return Some(io);
         }
@@ -1188,11 +1209,12 @@ async fn open_bus_waiting(port: &str, state: &RobotState) -> Option<BusIo> {
 
 /// Open and verify the bus, or explain why not.
 #[cfg(target_os = "linux")]
-fn open_bus(port: &str, attempt: u32) -> Option<BusIo> {
+fn open_bus(bus: &params::Bus, attempt: u32) -> Option<BusIo> {
     // First attempt and every thirtieth — about one line per 30 s while waiting.
     let loud = attempt == 0 || attempt.is_multiple_of(STARTUP_READ_LOG_EVERY);
+    let port = bus.port.as_str();
 
-    let mut io = match duck_control::bus::DynamixelIo::open(port) {
+    let mut io = match duck_control::bus::DynamixelIo::open(port, bus.fast_sync_read) {
         Ok(io) => io,
         Err(e) => {
             if loud {
@@ -1201,6 +1223,12 @@ fn open_bus(port: &str, attempt: u32) -> Option<BusIo> {
             return None;
         }
     };
+    // Under the same `loud` rule as everything else here — a board waiting on servo power
+    // retries this forever. Worth saying at all because the whole tick budget hangs off it,
+    // and "turned off in robotd.toml" is otherwise indistinguishable from "this board is slow".
+    if !bus.fast_sync_read && loud {
+        tracing::warn!("bus.fast_sync_read is off; every sync read is a plain one");
+    }
     if !adopt_missing_servo(&mut io, loud) {
         return None;
     }
@@ -1283,7 +1311,7 @@ fn adopt_missing_servo(io: &mut BusIo, loud: bool) -> bool {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn open_bus(_port: &str, _attempt: u32) -> Option<BusIo> {
+fn open_bus(_bus: &params::Bus, _attempt: u32) -> Option<BusIo> {
     tracing::error!("no bus on this platform; use --fake");
     None
 }
@@ -1674,6 +1702,39 @@ fn cut_torque_before_poweroff<T: RobotIo>(safety: &mut Safety<T>) {
     tracing::error!(
         attempts = POWEROFF_TORQUE_ATTEMPTS,
         "torque may still be on; powering off anyway"
+    );
+}
+
+/// Load the other mode's bundle, and only then say the mode changed.
+///
+/// `Policy::load` validates and warms up each network, so this blocks the loop for a moment.
+/// Both callers are places where that costs nothing: a robot holding the home pose, or one with
+/// no torque at all.
+fn load_mode(
+    target: Mode,
+    policy_params: &mut params::PolicyParams,
+    policy_cfg: &mut params::ResolvedPolicy,
+    controller: &mut Option<Controller>,
+    limp_fall: bool,
+    state: &RobotState,
+    slot_errors: &SlotErrors,
+) {
+    policy_params.mode = target;
+    let cfg = policy_params.resolved();
+    state.policy_error.store(None);
+    *controller = build_controller(&cfg, limp_fall, state);
+    // Published together with the mode, and only after the load: a client that reads
+    // `robot.mode` and gets the new one must not then be told the old mode's networks.
+    state.policies.store(Arc::new(PolicyNames::of(&cfg)));
+    state.mode.store(mode_code(target), Ordering::Relaxed);
+    state
+        .policy_slots
+        .store(Arc::new(slot_report(policy_params, &cfg, slot_errors)));
+    *policy_cfg = cfg;
+    tracing::warn!(
+        mode = target.as_str(),
+        loaded = controller.is_some(),
+        "mode switch complete"
     );
 }
 
@@ -2214,12 +2275,31 @@ async fn control_loop<T: RobotIo>(
                     mode = target.as_str(),
                     "mode switch refused: a policy change is still loading; ask again when it lands"
                 );
-            } else {
+            } else if shutdown_sit.is_some() || powered_off {
+                // The robot is on its way down. Homing from inside the sit would stand it back
+                // up at gain, and the sit would then cut the torque out from under it: the shape
+                // of #159, by a third door after `robot.init` and the enable-driven bring-up.
                 tracing::warn!(
-                    from = policy_params.mode.as_str(),
-                    to = target.as_str(),
-                    "mode switch: going home before loading the other policies"
+                    mode = target.as_str(),
+                    "mode switch refused: the robot is shutting down"
                 );
+            } else {
+                // What happens next depends on where the robot is, so the line a human reads off
+                // it should too: a limp robot swaps where it stands and does not move, and saying
+                // "going home" about that describes a ramp nobody is going to see.
+                if bringup == Bringup::Limp {
+                    tracing::warn!(
+                        from = policy_params.mode.as_str(),
+                        to = target.as_str(),
+                        "mode switch: swapping the policies now; the robot is limp and stays limp"
+                    );
+                } else {
+                    tracing::warn!(
+                        from = policy_params.mode.as_str(),
+                        to = target.as_str(),
+                        "mode switch: going home before loading the other policies"
+                    );
+                }
                 // The prototype's cue, and worth keeping: one quack for walking, two for roller,
                 // so the robot says which mode it is going to without anybody reading a log.
                 if let Some(voice) = voice.as_mut() {
@@ -2229,13 +2309,51 @@ async fn control_loop<T: RobotIo>(
                     }
                 }
                 mode_change = Some(target);
+            }
+        }
+
+        // A switch in flight, taken from whatever state the robot is in. Every tick rather than
+        // only on the tick the request landed, because the two things it needs are not always
+        // there on that tick, and a request that could not be acted on must wait rather than
+        // vanish: it used to arm `mode_change` and do nothing else on a blind tick, and nothing
+        // looked at `mode_change` again until the robot next homed for some other reason, with
+        // every later request refused as "already in flight".
+        if let Some(target) = mode_change {
+            match bringup {
+                // Ramping. The end of the ramp does the swap, with the robot still at home.
+                Bringup::Homing { .. } => {}
+                // Nothing is moving, so there is no gait to protect and no home to ramp to.
+                // Swap now and stay limp: `Ready` means torque on and at home, and a ramp written
+                // to servos nobody powered is neither. Going through `Homing` from here used to
+                // leave the robot `Ready` with no torque write, so the next Start found no
+                // bring-up to do and the policy drove a robot that could not move.
+                Bringup::Limp => {
+                    mode_change = None;
+                    load_mode(
+                        target,
+                        &mut policy_params,
+                        &mut policy_cfg,
+                        &mut controller,
+                        params.safety.limp_fall,
+                        &state,
+                        &slot_errors,
+                    );
+                }
                 // Home the robot with the machinery `init` and a fall recovery already use: it
-                // ramps per tick, and `driving` is false until it reaches Ready.
-                if let Some(sensors) = sensors.as_ref() {
-                    bringup = Bringup::Homing {
-                        from: sensors.positions,
-                        since: tick_start,
-                    };
+                // ramps per tick, and `driving` is false until it reaches Ready. From a sample,
+                // which is where the ramp starts, so a blind tick waits for the next one. And
+                // not once the robot is on its way down, for the request site's reason: a switch
+                // that was waiting when the sit began must not stand the robot up out of it.
+                Bringup::Ready => {
+                    if shutdown_sit.is_none()
+                        && !powered_off
+                        && let Some(sensors) = sensors.as_ref()
+                    {
+                        bringup = Bringup::Homing {
+                            from: sensors.positions,
+                            since: tick_start,
+                        };
+                    }
                 }
             }
         }
@@ -2623,22 +2741,14 @@ async fn control_loop<T: RobotIo>(
             // place where a stalled command stream costs nothing, because the robot is holding a
             // pose rather than mid-stride. Missed ticks in that window are expected.
             if let Some(target) = mode_change.take() {
-                policy_params.mode = target;
-                let cfg = policy_params.resolved();
-                state.policy_error.store(None);
-                controller = build_controller(&cfg, params.safety.limp_fall, &state);
-                // Published together with the mode, and only after the load: a client that reads
-                // `robot.mode` and gets the new one must not then be told the old mode's networks.
-                state.policies.store(Arc::new(PolicyNames::of(&cfg)));
-                state.mode.store(mode_code(target), Ordering::Relaxed);
-                state
-                    .policy_slots
-                    .store(Arc::new(slot_report(&policy_params, &cfg, &slot_errors)));
-                policy_cfg = cfg;
-                tracing::warn!(
-                    mode = target.as_str(),
-                    loaded = controller.is_some(),
-                    "mode switch complete"
+                load_mode(
+                    target,
+                    &mut policy_params,
+                    &mut policy_cfg,
+                    &mut controller,
+                    params.safety.limp_fall,
+                    &state,
+                    &slot_errors,
                 );
             }
 
@@ -2741,6 +2851,12 @@ async fn control_loop<T: RobotIo>(
         state
             .homed
             .store(bringup == Bringup::Ready, Ordering::Relaxed);
+        // Beside `homed` and for the same reason: a client deciding what to press needs the
+        // robot's answer, not its own guess. No controller means no seat to be in.
+        state.sitting.store(
+            controller.as_ref().is_some_and(|c| c.is_sitting()),
+            Ordering::Relaxed,
+        );
 
         // The policy must not start on an unconverged orientation filter — the first
         // seconds of projected gravity are whatever the filter is mid-way through deciding,
@@ -3278,6 +3394,14 @@ fn publish_slow_sensors<T: RobotIo>(io: &mut Safety<T>, state: &RobotState) {
     if let Some(celsius) = soc::hottest_zone_c() {
         state.cpu_temp_c.store(celsius.to_bits(), Ordering::Relaxed);
     }
+    // Same read, same reason, and kept as the last good one on a miss rather than cleared:
+    // `None` from here means the board has no `cpufreq` sysfs at all, which does not become
+    // true halfway through an uptime.
+    if let Some(throttle) = soc::cpu_throttle() {
+        state
+            .cpu_throttle
+            .store(Some(std::sync::Arc::new(throttle)));
+    }
 
     match io.slow_sensors() {
         Ok(slow) => {
@@ -3353,18 +3477,28 @@ async fn claim_socket(socket_path: &Path) -> std::io::Result<(std::fs::File, Uni
     use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 
     let lock = claim_lock(socket_path)?;
+    // Before bind, not after it. A regular file or a symlink at the path is a typo, and it is
+    // refused here on every platform rather than left to the kernel: Linux fails to bind over
+    // either, which is what made this look enforced, but macOS follows a dangling symlink and
+    // creates the socket at its target, so a daemon there came up serving through a path nobody
+    // asked for. That is the one platform `cargo test --workspace` is promised on.
+    match std::fs::symlink_metadata(socket_path) {
+        Ok(existing) if !existing.file_type().is_socket() => {
+            return Err(std::io::Error::new(
+                ErrorKind::AddrInUse,
+                "the socket path exists and is not a socket; refusing to bind over it",
+            ));
+        }
+        Ok(_) => (),
+        Err(e) if e.kind() == ErrorKind::NotFound => (),
+        Err(e) => return Err(e),
+    }
     let listener = match UnixListener::bind(socket_path) {
         Ok(listener) => listener,
         Err(e) if e.kind() == ErrorKind::AddrInUse => {
             // An older daemon may own the socket without holding our new lock. Only a
-            // real socket that refuses connections is stale; a timeout, permission error,
-            // regular file or symlink is not permission to remove somebody else's path.
-            if !std::fs::symlink_metadata(socket_path)?
-                .file_type()
-                .is_socket()
-            {
-                return Err(e);
-            }
+            // real socket that refuses connections is stale; a timeout or a permission error
+            // is not permission to remove somebody else's path.
             match tokio::time::timeout(Duration::from_secs(1), UnixStream::connect(socket_path))
                 .await
             {
@@ -4322,6 +4456,10 @@ fn dispatch(
                 enabled: state.policy_enabled,
                 slots: state.policy_slots.load().as_ref().clone(),
                 skills: state.policies.load().skills.clone(),
+                // The same flag `robot.do` refuses on, so a client can wait for it rather than
+                // be told no and guess whether asking again would help.
+                homed: Some(state.homed.load(Ordering::Relaxed)),
+                sitting: Some(state.sitting.load(Ordering::Relaxed)),
                 change_error: state
                     .policy_change_error
                     .load_full()
@@ -5159,15 +5297,19 @@ mod tests {
         );
     }
 
-    /// Limp-fall ships ON, and it must refuse a fallen robot nothing.
+    /// Limp-fall ships OFF (the default gait has no standing network to hand back to), and
+    /// switched on it must refuse a fallen robot nothing.
     ///
     /// This is the contract that answers "I booted it face-down and pressed Start": enable
-    /// and init are never refused for gravity, whatever the mode is set to. It matters more
-    /// now the mode is a default than it did when it was opt-in — every robot has it.
+    /// and init are never refused for gravity, whatever the mode is set to.
     #[test]
-    fn limp_fall_ships_on_and_refuses_nothing() {
-        let params = Params::default();
-        assert!(params.safety.limp_fall, "on by default, fleet-wide");
+    fn limp_fall_ships_off_and_refuses_nothing() {
+        let mut params = Params::default();
+        assert!(
+            !params.safety.limp_fall,
+            "off by default: velstand loads no standing policy"
+        );
+        params.safety.limp_fall = true;
 
         let s = RobotState::new(
             &params,
@@ -5377,8 +5519,10 @@ mod tests {
     /// crouch that roller mode does have.
     #[test]
     fn the_published_policy_names_are_one_modes_answer() {
-        let walk = PolicyNames::of(&Params::default().policy.resolved());
-        assert!(walk.stand.is_some(), "walking has a standing network");
+        let mut walking = Params::default();
+        walking.policy.stand = Some(PathBuf::from("/srv/alpha_stand.onnx"));
+        let walk = PolicyNames::of(&walking.policy.resolved());
+        assert!(walk.stand.is_some(), "walking can carry a standing network");
 
         let mut rolling = Params::default();
         rolling.policy.mode = Mode::Roller;
@@ -6709,6 +6853,7 @@ mod tests {
         ticked(&s, 1);
         assert!(s.health().motors.is_none());
         assert!(s.health().cpu_temp_c.is_none());
+        assert!(s.health().cpu_throttle.is_none());
     }
 
     /// Board and servo temperatures are separate readings, and the case that justifies both is
@@ -6726,6 +6871,30 @@ mod tests {
         assert_eq!(health.cpu_temp_c, Some(84.0));
         assert_eq!(health.motors.expect("thermals").max_c, 31.0);
         // And neither touches the verdict — a warm afternoon is not a bad release.
+        assert!(health.healthy);
+    }
+
+    /// A board wound down to a fraction of its clock is still healthy. The rule the battery
+    /// and the servos already follow, and it matters most here: a duck throttled to 408 MHz
+    /// walks badly, and rolling the release back would judge its replacement on the same hot
+    /// board — so a robot that got warm once could never be updated again.
+    #[test]
+    fn a_throttled_board_is_reported_and_still_healthy() {
+        let s = state();
+        ticked(&s, 100);
+        s.cpu_temp_c.store(95.0f64.to_bits(), Ordering::Relaxed);
+        s.cpu_throttle
+            .store(Some(std::sync::Arc::new(proto::CpuThrottle {
+                level: 6,
+                max_level: 6,
+                khz: 408_000,
+                max_khz: 1_800_000,
+            })));
+
+        let health = s.health();
+        let throttle = health.cpu_throttle.expect("the reading was published");
+        assert!(throttle.throttled());
+        assert_eq!(throttle.khz, 408_000);
         assert!(health.healthy);
     }
 
@@ -6766,11 +6935,12 @@ mod tests {
             false,
         ));
         let waiter_state = Arc::clone(&s);
-        let handle = tokio::spawn(async move {
-            open_bus_waiting("/dev/definitely-not-a-bus", &waiter_state)
-                .await
-                .is_none()
-        });
+        let nowhere = params::Bus {
+            port: "/dev/definitely-not-a-bus".into(),
+            ..Default::default()
+        };
+        let handle =
+            tokio::spawn(async move { open_bus_waiting(&nowhere, &waiter_state).await.is_none() });
 
         // Bounded, so a regression fails rather than hanging CI.
         for _ in 0..10_000 {
@@ -6870,7 +7040,7 @@ mod tests {
         assert!(policy.slot(Slot::Walk).is_none(), "the override is dropped");
         assert_eq!(
             policy.resolved().walk,
-            PathBuf::from(params::POLICY_DIR).join("alpha_walking.onnx"),
+            PathBuf::from(params::POLICY_DIR).join("velstand.onnx"),
             "and the slot resolves to this robot's own policy"
         );
         let reason = errors.get(Slot::Walk).expect("the reason is kept");
@@ -7609,6 +7779,54 @@ mod tests {
         assert!(intents.take_policy_change().is_some());
     }
 
+    /// `homed` rides the read a client already makes, and it has to *move* — a field that is
+    /// always false is as useless as no field, because the thing a caller wants to know is when it
+    /// stopped being false. A client that installs a policy triggers a reload, the reload sends
+    /// the robot home, and the `robot.do` that follows is refused by its own previous call; this
+    /// is what it waits on instead.
+    #[test]
+    fn robot_policies_publishes_the_flag_robot_do_refuses_on() {
+        let s = RobotState::new(
+            &Params::default(),
+            std::path::Path::new("/test/robotd.toml"),
+            false,
+            false,
+        );
+        let intents = Arc::new(Intents::new());
+
+        let read = |s: &RobotState| -> proto::PoliciesResult {
+            dispatch(
+                s,
+                &intents,
+                proto::Id::Number(1),
+                &proto::Call::RobotPolicies,
+            )
+            .result_as()
+            .unwrap()
+        };
+
+        s.homed.store(false, Ordering::Relaxed);
+        assert_eq!(
+            read(&s).homed,
+            Some(false),
+            "a robot on its way home says so, rather than saying nothing"
+        );
+
+        s.homed.store(true, Ordering::Relaxed);
+        assert_eq!(read(&s).homed, Some(true), "and says when it has arrived");
+
+        // The seat, for the same reason and with the same shape: a client choosing between
+        // `robot.init` and `robot.do sit_toggle` has no other way to know which one stands a duck
+        // up, and guessing sits a standing one down every other press.
+        assert_eq!(read(&s).sitting, Some(false), "a duck on its feet says so");
+        s.sitting.store(true, Ordering::Relaxed);
+        assert_eq!(
+            read(&s).sitting,
+            Some(true),
+            "and a duck in its seat says so"
+        );
+    }
+
     /// `robot.policies` answers for every slot, including the empty ones, and says where each
     /// file came from. A client rendering a table needs the empty rows too — "this robot has no
     /// standing network" is an answer, not a gap.
@@ -7635,9 +7853,12 @@ mod tests {
         assert!(result.enabled);
         assert_eq!(result.slots.len(), Slot::ALL.len());
         for slot in &result.slots {
+            // `stand` is the empty row by default — velstand stands on its own — and an
+            // empty slot has no file to have come from anywhere.
+            let expected = (slot.slot != "stand").then_some("official");
             assert_eq!(
                 slot.origin.as_deref(),
-                Some("official"),
+                expected,
                 "a default robot runs the release's own set: {slot:?}"
             );
             assert!(!slot.overridden, "{slot:?}");
@@ -8148,7 +8369,42 @@ mod tests {
         assert!(Bringup::Ready.homing_target(since).is_none());
     }
 
-    async fn wait_until(what: impl Fn() -> bool, deadline: Duration, or: &str) {
+    /// A bus a test can take down and bring back, for a request that has to arrive on a blind tick.
+    struct Flaky {
+        inner: FakeIo,
+        down: Arc<AtomicBool>,
+    }
+    impl RobotIo for Flaky {
+        fn read(&mut self) -> duck_control::io::Result<duck_control::Sensors> {
+            if self.down.load(Ordering::Relaxed) {
+                return Err(duck_control::io::IoError::Simulated);
+            }
+            self.inner.read()
+        }
+        fn write(&mut self, t: &duck_control::JointTargets) -> duck_control::io::Result<()> {
+            self.inner.write(t)
+        }
+        fn set_gain(&mut self, kp: u16) -> duck_control::io::Result<()> {
+            self.inner.set_gain(kp)
+        }
+        fn set_torque(&mut self, on: bool) -> duck_control::io::Result<()> {
+            self.inner.set_torque(on)
+        }
+        fn reboot(&mut self, id: u8) -> duck_control::io::Result<()> {
+            self.inner.reboot(id)
+        }
+        fn slow_sensors(&mut self) -> duck_control::io::Result<duck_control::SlowSensors> {
+            self.inner.slow_sensors()
+        }
+        fn imu_stale(&self) -> duck_control::io::ImuStale {
+            self.inner.imu_stale()
+        }
+        fn imu_ready(&self) -> bool {
+            self.inner.imu_ready()
+        }
+    }
+
+    async fn until(what: impl Fn() -> bool, deadline: Duration, or: &str) {
         let started = Instant::now();
         while !what() {
             assert!(started.elapsed() < deadline, "{or}");
@@ -8190,14 +8446,14 @@ mod tests {
             noop_poweroff(),
         ));
 
-        wait_until(
+        until(
             || s.ticks.load(Ordering::Relaxed) >= 5,
             Duration::from_secs(2),
             "no ticks",
         )
         .await;
         intents.request_init();
-        wait_until(
+        until(
             || s.homed.load(Ordering::Relaxed),
             HOME_RAMP + Duration::from_secs(2),
             "init never reached home",
@@ -8226,7 +8482,7 @@ mod tests {
             });
             // Taken on the next tick, which starts its load. The switch lands on the tick after.
             let at = s.ticks.load(Ordering::Relaxed);
-            wait_until(
+            until(
                 || s.ticks.load(Ordering::Relaxed) > at,
                 Duration::from_secs(2),
                 "stalled",
@@ -8236,7 +8492,7 @@ mod tests {
 
             // A switch that was accepted starts a ramp; give it and the load time to finish.
             let at = s.ticks.load(Ordering::Relaxed);
-            wait_until(
+            until(
                 || s.ticks.load(Ordering::Relaxed) >= at + 10,
                 Duration::from_secs(2),
                 "stalled",
@@ -8254,6 +8510,184 @@ mod tests {
                 "attempt {attempt}: robot.mode says {mode:?} and the walk slot is {walk}"
             );
         }
+
+        s.shutdown.store(true, Ordering::Relaxed);
+        handle.await.unwrap();
+    }
+
+    /// A switch that lands on a tick with no sample must wait for one, not vanish.
+    ///
+    /// It used to arm `mode_change` and do nothing else, because homing needs a pose to ramp
+    /// from. Nothing ever looked at `mode_change` again until the robot next homed for some
+    /// other reason, and every later `robot.setMode` was refused as "already in flight". One
+    /// dropped read during a held D-pad, and the mode could not be changed again without
+    /// `robot.init` or a restart.
+    #[tokio::test]
+    async fn a_mode_switch_that_arrives_on_a_blind_tick_is_not_lost() {
+        let down = Arc::new(AtomicBool::new(false));
+        let io = Flaky {
+            inner: FakeIo::at(DEFAULT_POSITION),
+            down: Arc::clone(&down),
+        };
+        let s = Arc::new(state());
+        let intents = Arc::new(Intents::new());
+        let handle = tokio::spawn({
+            let s = Arc::clone(&s);
+            let intents = Arc::clone(&intents);
+            async move {
+                let mut io = io;
+                control_loop_probe_with(&mut io, s, intents, Duration::from_millis(2)).await;
+            }
+        });
+
+        // Up and at home, which is the state a switch ramps from.
+        until(
+            || s.ticks.load(Ordering::Relaxed) >= 5,
+            Duration::from_secs(2),
+            "no ticks",
+        )
+        .await;
+        intents.request_init();
+        until(
+            || s.homed.load(Ordering::Relaxed),
+            HOME_RAMP + Duration::from_secs(2),
+            "init never reached home",
+        )
+        .await;
+
+        // The bus goes away for longer than the coast, so the loop is blind.
+        down.store(true, Ordering::Relaxed);
+        until(
+            || s.consecutive_errors.load(Ordering::Relaxed) > COAST_TICKS + 1,
+            Duration::from_secs(2),
+            "the loop never went blind",
+        )
+        .await;
+
+        // The switch arrives now, and sits through a few blind ticks.
+        intents.request_mode_switch(mode_code(Mode::Roller));
+        let at = s.ticks.load(Ordering::Relaxed);
+        until(
+            || s.ticks.load(Ordering::Relaxed) >= at + 3,
+            Duration::from_secs(2),
+            "stalled",
+        )
+        .await;
+
+        // The bus comes back. The switch must complete from here.
+        down.store(false, Ordering::Relaxed);
+        until(
+            || mode_of(s.mode.load(Ordering::Relaxed)) == Mode::Roller,
+            HOME_RAMP + Duration::from_secs(2),
+            "a switch that arrived on a blind tick was lost, and the mode never changed",
+        )
+        .await;
+
+        s.shutdown.store(true, Ordering::Relaxed);
+        handle.await.unwrap();
+    }
+
+    /// A limp robot has no gait to protect and no home to ramp to, so the swap is immediate and
+    /// the robot stays limp.
+    ///
+    /// It used to go `Homing` from `Limp`, which is a ramp written to servos nobody powered, and
+    /// then `Ready` — the state that means "torque on, at home" — without a torque write. The
+    /// next Start then found `Ready` rather than `Limp`, so the bring-up that turns torque on
+    /// never ran, and the policy drove a robot that could not move.
+    #[tokio::test]
+    async fn a_mode_switch_on_a_limp_robot_swaps_the_policies_and_leaves_it_limp() {
+        let io = FakeIo::at(DEFAULT_POSITION).frozen();
+        let s = Arc::new(state());
+        let intents = Arc::new(Intents::new());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handle = tokio::spawn({
+            let s = Arc::clone(&s);
+            let intents = Arc::clone(&intents);
+            async move {
+                let mut io = io;
+                control_loop_probe_with(&mut io, s, intents, Duration::from_millis(2)).await;
+                tx.send(io.torque).unwrap();
+            }
+        });
+        until(
+            || s.ticks.load(Ordering::Relaxed) >= 5,
+            Duration::from_secs(2),
+            "no ticks",
+        )
+        .await;
+
+        intents.request_mode_switch(mode_code(Mode::Roller));
+        until(
+            || mode_of(s.mode.load(Ordering::Relaxed)) == Mode::Roller,
+            HOME_RAMP + Duration::from_secs(2),
+            "the mode never changed",
+        )
+        .await;
+        // Long enough that a ramp, if one was started, has finished and promoted the state.
+        tokio::time::sleep(HOME_RAMP + Duration::from_millis(200)).await;
+        assert!(
+            !s.homed.load(Ordering::Relaxed),
+            "a limp robot was promoted to Ready by a mode switch, with no torque written"
+        );
+
+        s.shutdown.store(true, Ordering::Relaxed);
+        handle.await.unwrap();
+        assert_eq!(
+            rx.recv().unwrap(),
+            None,
+            "a mode switch must not touch torque"
+        );
+    }
+
+    /// A robot on its way down is not switched. Homing from inside the sit would stand it back
+    /// up at gain, and then the sit would cut the torque out from under it — #159 by a third door,
+    /// after `robot.init` and the enable-driven bring-up.
+    ///
+    /// The sit itself needs the sitstand network, so this drives the sibling path CI can reach:
+    /// no policy, so `robot.shutdown` powers off at once. The gate is the same one.
+    #[tokio::test]
+    async fn a_mode_switch_after_power_off_is_refused() {
+        let io = FakeIo::at(DEFAULT_POSITION).frozen();
+        let s = Arc::new(state());
+        let intents = Arc::new(Intents::new());
+        let handle = tokio::spawn({
+            let s = Arc::clone(&s);
+            let intents = Arc::clone(&intents);
+            async move {
+                let mut io = io;
+                control_loop_probe_with(&mut io, s, intents, Duration::from_millis(2)).await;
+            }
+        });
+        until(
+            || s.ticks.load(Ordering::Relaxed) >= 5,
+            Duration::from_secs(2),
+            "no ticks",
+        )
+        .await;
+        intents.request_init();
+        until(
+            || s.homed.load(Ordering::Relaxed),
+            HOME_RAMP + Duration::from_secs(2),
+            "init never reached home",
+        )
+        .await;
+
+        intents.request_shutdown();
+        let at = s.ticks.load(Ordering::Relaxed);
+        until(
+            || s.ticks.load(Ordering::Relaxed) >= at + 3,
+            Duration::from_secs(2),
+            "stalled",
+        )
+        .await;
+
+        intents.request_mode_switch(mode_code(Mode::Roller));
+        tokio::time::sleep(HOME_RAMP + Duration::from_millis(500)).await;
+        assert_eq!(
+            mode_of(s.mode.load(Ordering::Relaxed)),
+            Mode::Walk,
+            "a mode switch went through on a robot that was powering off"
+        );
 
         s.shutdown.store(true, Ordering::Relaxed);
         handle.await.unwrap();

@@ -15,6 +15,8 @@ process, and the policy's targets go back out. Everything above that seam — th
 policy, safety, fall detection, kinematics, odometry, the whole IPC surface — is the code a robot
 runs, unchanged and unable to tell. `tofd --sim` gets its 8×8 depth frames from the same simulator;
 `mediad --sim-camera` gets a rendered head-camera image, mounted a quarter turn off like the real one.
+`configd` and `updaterd` run too, unchanged, which is what gives a simulated duck a serial, a name
+and a Hugging Face account it can be reached through from off this network.
 
 The MuJoCo half lives in [`microduck_rl`](https://github.com/pollen-robotics/microduck_rl) as
 `duck-body`: one process, one window, N duck bodies in one scene, with the BAM actuator models the
@@ -28,8 +30,13 @@ encoder are absent, not modelled; a bug in one of those is only visible on a rob
 ## What you need
 
 - This repo, built for your machine (`cargo build` happens on its own).
-- A checkout of `microduck_rl` with its venv, at `~/Pollen/microduck_rl` or wherever `DUCK_SIM_RL`
-  points. It provides `duck-body`, the scenes, and the `libonnxruntime` a laptop otherwise lacks.
+- A checkout of `microduck_rl` with its venv — beside this repo, or wherever `DUCK_SIM_RL` points.
+  It provides `duck-body`, the scenes, and the `libonnxruntime` a laptop otherwise lacks. The
+  camera lives on its `develop` branch.
+- For a duck with a camera off Linux: `brew install gstreamer libnice-gstreamer`. The first is one
+  merged formula carrying `webrtcsink`, srtp and x264. The second is the ICE agent `webrtcbin`
+  needs, and the first does not depend on it — without it the duck comes up and streams to nothing,
+  failing only when a browser asks for the video. `scripts/duck-sim` checks for both.
 - For the container form only: `sudo`, `systemd-nspawn` (package `systemd-container`) and
   `mmdebstrap`. The script says which one is missing and prints the line to install it.
 
@@ -114,6 +121,37 @@ Cameras are opt-in per duck (`a`, `a,c`, or `all`) because a rendered frame cost
 with a camera gets its own `mediad`, and its console is served at `http://127.0.0.1:8080`, `8081`,
 ... by index, exactly the page a robot serves.
 
+## Reaching it from anywhere
+
+A simulated duck signs in to a Hugging Face account and appears in that account's robot list, the
+same as a robot on a desk. The console, an app or a Space then reaches it over WebRTC without being
+on this network.
+
+```bash
+DUCK_SIM_CAMERAS=a scripts/duck-sim
+```
+
+```bash
+scripts/duck-sim ctl account login
+```
+
+Open `hf.co/oauth/device`, type the code it prints, and the duck is listed within a few seconds.
+`scripts/duck-sim ctl account status` says which account it belongs to, and
+`scripts/duck-sim ctl system info` prints the serial and the line `body MuJoCo`.
+
+In the listing it carries a `simulated` flag and a name derived from its serial (`duck-eb55`), so it
+does not read as the robot on the shelf. It is a duck like any other otherwise: same control lane,
+same H.264, same policies.
+
+Two rules follow from the rendezvous keying a peer by token:
+
+- **One duck per account at a time.** A second `login` on the same account supersedes the first and
+  neither looks broken — they take turns being listed. A second duck wants a second account.
+- **A Space consuming this duck needs its own token**, not the duck's; a published Space uses the
+  visitor's own login.
+
+`scripts/duck-sim ctl account logout` takes it back off the listing.
+
 ## Knobs
 
 Environment variables, all optional:
@@ -163,11 +201,24 @@ duck-body --ducks 1 --port 7801 --keyframe SIT
 target/debug/tofd --sim 127.0.0.1:7801 --socket /tmp/d/duck-a-tof.sock
 DUCK_RUNTIME_DIR=/tmp/d ORT_DYLIB_PATH=<libonnxruntime.so> \
     target/debug/robotd --sim 127.0.0.1:7801 --params <params.toml> --socket /tmp/d/duck-a.sock
+# who it is, and which account it belongs to
+target/debug/configd --socket /tmp/d/duck-a-config.sock --state-dir /tmp/d/duck-a \
+    --simulated sim-duck-a --fake-net --fake-pads
+target/debug/updaterd --config /tmp/d/updater.toml --socket /tmp/d/duck-a-updater.sock \
+    --token /tmp/d/duck-a/hf-token
 # a camera, if duck-body was started with --cameras a
 printf '[media]\nquality = "360p30"\n' > /tmp/d/mediad.toml
 target/debug/mediad --sim-camera 127.0.0.1:7901 --config /tmp/d/mediad.toml \
-    --robot-socket /tmp/d/duck-a.sock --tof-socket /tmp/d/duck-a-tof.sock
+    --robot-socket /tmp/d/duck-a.sock --tof-socket /tmp/d/duck-a-tof.sock \
+    --config-socket /tmp/d/duck-a-config.sock --updater-socket /tmp/d/duck-a-updater.sock \
+    --token /tmp/d/duck-a/hf-token
 ```
+
+Off Linux, `mediad` wants building with its pipeline: `cargo build -p mediad --features gstreamer`.
+Without the feature it starts, says so, and exits.
+
+`--token` names the same file on both daemons — `updaterd` writes the credential there and `mediad`
+reads it. Point them at different files and the duck signs in and never registers.
 
 The camera's geometry has to match on both sides — `mediad` streams the `[media] quality` rung
 (`360p30` is 640×360), and the body must render at the same size, because frames arrive raw with no

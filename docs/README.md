@@ -3,6 +3,10 @@
 The [README](../README.md) is the front door — what a microduck is, and where to go. If you have
 one in front of you and want to drive it, start at the [cheat sheet](robot/cheatsheet.md).
 
+[`faq.md`](faq.md) is the other front door: task-shaped questions from somebody building
+*against* a duck rather than changing it — running a model too heavy for the board, getting the
+camera into their own program, why a Space cannot connect.
+
 It is also where a **publisher** starts: [`policy-manifest.md`](policy-manifest.md) is the
 contract for a `manifest.json` beside a microduck `.onnx`, and it owns every field. The design
 docs give the reasoning and point at it.
@@ -41,6 +45,7 @@ own the mechanism is the bug.
 | [`policy-channel-design.md`](design/policy-channel-design.md) | Where the ONNX policies come from: the `policies` component, trying someone else's, and what `reset` puts back. |
 | [`restart-order.md`](design/restart-order.md) | Which unit restarts, at which step, on every path that moves `current` — and at boot. |
 | [`app-path-design.md`](design/app-path-design.md) | `btd` and `configd` — how a phone configures a robot over BLE. |
+| [`mobile-app.md`](design/mobile-app.md) | The phone app — what it is built from, and what the robot still owes it. The code is in [`microduck-app`](https://github.com/pollen-robotics/microduck-app). |
 | [`remote-webrtc.md`](design/remote-webrtc.md) | WebRTC sessions, signalling, and the control channel — how a peer drives and observes the robot. |
 | [`webrtc-console.md`](design/webrtc-console.md) | The WebRTC client: serving it from the robot, finding the robot, and what the page should be. |
 | [`remote-access-design.md`](design/remote-access-design.md) | Reaching a duck from outside the LAN: the Hugging Face account, the device flow, and the bridge to a rendezvous service. |

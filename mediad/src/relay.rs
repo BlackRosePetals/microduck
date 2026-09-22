@@ -21,10 +21,10 @@
 //!
 //! The bridge above carries a *negotiation*: SDP and ICE, so that a consumer and the robot can
 //! find a path between them and speak WebRTC over it. When they cannot find one, everything built
-//! on it is gone — and right now they frequently cannot, because a relay candidate needs
-//! `turn.fastrtc.org`, which has no A record and whose zone has no NS records (§6). Signalling
-//! crosses, media does not, and the control channel goes with it because SCTP rides the same
-//! candidate pair.
+//! on it is gone. A relay candidate is what keeps that from happening (§6) — and it is a
+//! dependency rather than a guarantee: it is somebody else's service, metered per account, and
+//! the control channel is SCTP over whatever pair ICE settled on, so a relay that stops being
+//! available takes a JSON-RPC call of a few hundred bytes down with the video.
 //!
 //! So the JSON-RPC a consumer wants to send does not have to go through WebRTC at all, and the
 //! rendezvous turns out to already carry it: `handle_peer_message` in their `app.py` relays
@@ -216,6 +216,17 @@ pub struct Meta {
     /// The release this robot is running, for the reason the local `meta` carries it.
     pub release: String,
     pub api_version: u32,
+    /// This robot is a duck in MuJoCo, and whoever is reading the listing should be told.
+    ///
+    /// **The listing is the one place this genuinely matters.** On a LAN you know what you
+    /// started; in an account's robot list a simulated duck sits next to real ones, and a client
+    /// that cannot tell them apart ends with somebody driving a simulation and wondering why the
+    /// robot on the shelf is still. `meta` is free-form to the service, so this costs nothing
+    /// there — §3.7 names the keys it does read, and this is not one of them.
+    ///
+    /// Absent rather than `false` on a real robot: the key is worth noticing where it appears.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub simulated: bool,
 }
 
 impl Meta {
@@ -226,6 +237,12 @@ impl Meta {
     /// install rather than per robot, which is weaker and still correct for the purpose: it keeps
     /// one machine from being listed twice, and it keeps the producer sweepable. `sounds` makes
     /// exactly this substitution for exactly this reason.
+    ///
+    /// **A simulated duck never reaches that fallback**, and that is why `configd --simulated`
+    /// takes a serial rather than one being invented here. The fallback is per *install*: four
+    /// ducks in one MuJoCo scene share one `/etc/machine-id`, so they would evict each other from
+    /// the listing one at a time — and on macOS there is no such file at all, so none of them
+    /// would register. A serial per duck makes every one of them a robot by the same rules.
     pub fn of(producer: &crate::producer::Producer, machine_id: Option<String>) -> Option<Self> {
         let hardware_id = producer
             .serial
@@ -238,6 +255,7 @@ impl Meta {
             kind: "microduck",
             release: producer.release.clone(),
             api_version: producer.api_version,
+            simulated: producer.simulated,
         })
     }
 }
@@ -407,18 +425,28 @@ pub struct Relay {
     /// lane reads whatever is current when it opens. Empty means `media.video` is refused rather
     /// than answered with zeros.
     video: Option<tokio::sync::watch::Receiver<Option<crate::session::Media>>>,
-    /// Where each service listens, for the control lane's pool. Overridable for the same reason
-    /// `--rendezvous-url` is: the whole of this module is meant to be exercisable on a laptop,
-    /// and a lane whose sockets were hardcoded to `/run/robot` could only be tested on a board.
+    /// Where each service listens, for the control lane's pool. Given rather than defaulted for
+    /// the same reason `--rendezvous-url` is: the whole of this module is meant to be exercisable
+    /// on a laptop, and a lane whose sockets were hardcoded to `/run/robot` could only be tested
+    /// on a board.
     sockets: crate::upstream::Sockets,
 }
 
 impl Relay {
     /// Build one. Fails only if the HTTP client will not build, which means no TLS stack.
+    ///
+    /// **`sockets` is an argument and not a builder, which is the whole of the fix this carries.**
+    /// It used to default to `/run/*.sock` and be overridable with `with_sockets`, and `main` was
+    /// the one caller that never called it — so every control-lane call from the rendezvous
+    /// dialled `/run/robotd.sock` no matter what `--robot-socket` said. On a board that is
+    /// invisible, because there the default is right; on the twin it is `os error 2` for every
+    /// method except `media.video`, which `session::run` answers without an upstream at all.
+    /// A caller cannot forget an argument, and this lane has no default worth having.
     pub fn new(
         base: impl Into<String>,
         token_path: impl Into<PathBuf>,
         meta: Meta,
+        sockets: crate::upstream::Sockets,
     ) -> Option<Self> {
         let client = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(10))
@@ -439,14 +467,8 @@ impl Relay {
             timings: Timings::default(),
             local_signalling: DEFAULT_LOCAL_SIGNALLING.to_owned(),
             video: None,
-            sockets: Default::default(),
+            sockets,
         })
-    }
-
-    /// Where the services this lane routes to are listening.
-    pub fn with_sockets(mut self, sockets: crate::upstream::Sockets) -> Self {
-        self.sockets = sockets;
-        self
     }
 
     /// Where to read the video's geometry when a control lane opens.
@@ -1337,6 +1359,7 @@ mod tests {
             kind: "microduck",
             release: "0.10.0".to_owned(),
             api_version: duck_ipc_proto::API_VERSION,
+            simulated: false,
         }
     }
 
@@ -1464,6 +1487,7 @@ mod tests {
             serial: None,
             release: "0.10.0".to_owned(),
             api_version: duck_ipc_proto::API_VERSION,
+            simulated: false,
         };
 
         let meta = Meta::of(&producer, Some("machine-1".to_owned())).expect("a stable id");
@@ -1479,6 +1503,37 @@ mod tests {
                 .hardware_id,
             "3fa1c51b",
             "the serial wins: it survives a reinstall, and the machine id does not"
+        );
+    }
+
+    /// The flag reaches the wire when it is true, and is absent when it is not.
+    ///
+    /// Both halves matter. A simulated duck that registered without it is indistinguishable from
+    /// hardware in its owner's list, which is the whole reason the key exists; and a real robot
+    /// sending `simulated: false` would put a key on every registration on the fleet for the sake
+    /// of the handful of ducks that are not real.
+    #[test]
+    fn a_simulated_duck_says_so_and_a_real_one_says_nothing() {
+        let producer = crate::producer::Producer {
+            name: Some("duck-a".to_owned()),
+            serial: Some("sim-duck-a".to_owned()),
+            release: "0.10.0".to_owned(),
+            api_version: duck_ipc_proto::API_VERSION,
+            simulated: true,
+        };
+
+        let meta = Meta::of(&producer, None).expect("the simulated serial is a stable id");
+        assert_eq!(meta.hardware_id, "sim-duck-a");
+        assert_eq!(serde_json::to_value(&meta).unwrap()["simulated"], true);
+
+        let real = crate::producer::Producer {
+            simulated: false,
+            ..producer
+        };
+        let json = serde_json::to_value(Meta::of(&real, None).unwrap()).unwrap();
+        assert!(
+            json.get("simulated").is_none(),
+            "a real robot sends no such key: {json}"
         );
     }
 
@@ -1498,7 +1553,7 @@ mod tests {
     fn the_credential_is_read_for_the_one_field_that_matters() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("hf-token");
-        let relay = Relay::new("http://127.0.0.1:1", &path, meta()).unwrap();
+        let relay = Relay::new("http://127.0.0.1:1", &path, meta(), Default::default()).unwrap();
 
         assert_eq!(
             relay.token(),
@@ -1752,7 +1807,7 @@ mod tests {
         let service = fake_service().await;
         *service.state.heartbeat_seconds.lock().unwrap() = Some(0.05);
 
-        let relay = Relay::new(&service.base, signed_in(&dir), meta())
+        let relay = Relay::new(&service.base, signed_in(&dir), meta(), Default::default())
             .unwrap()
             .with_timings(brisk());
         let task = tokio::spawn(relay.run());
@@ -1794,7 +1849,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let service = fake_service().await;
 
-        let relay = Relay::new(&service.base, signed_in(&dir), meta())
+        let relay = Relay::new(&service.base, signed_in(&dir), meta(), Default::default())
             .unwrap()
             .with_timings(brisk());
         let task = tokio::spawn(relay.run());
@@ -1834,7 +1889,7 @@ mod tests {
         let path = dir.path().join("hf-token");
         let service = fake_service().await;
 
-        let relay = Relay::new(&service.base, &path, meta())
+        let relay = Relay::new(&service.base, &path, meta(), Default::default())
             .unwrap()
             .with_timings(brisk());
         let task = tokio::spawn(relay.run());
@@ -1875,7 +1930,7 @@ mod tests {
         let service = fake_service().await;
         *service.state.heartbeat_seconds.lock().unwrap() = Some(0.05);
 
-        let relay = Relay::new(&service.base, &path, meta())
+        let relay = Relay::new(&service.base, &path, meta(), Default::default())
             .unwrap()
             .with_timings(brisk());
         let task = tokio::spawn(relay.run());
@@ -1915,7 +1970,7 @@ mod tests {
         let service = fake_service().await;
         *service.state.heartbeat_seconds.lock().unwrap() = Some(0.05);
 
-        let relay = Relay::new(&service.base, &path, meta())
+        let relay = Relay::new(&service.base, &path, meta(), Default::default())
             .unwrap()
             .with_timings(brisk());
         let task = tokio::spawn(relay.run());
@@ -1953,7 +2008,7 @@ mod tests {
         let service = fake_service().await;
         *service.state.refuse_posts.lock().unwrap() = Some(401);
 
-        let relay = Relay::new(&service.base, signed_in(&dir), meta())
+        let relay = Relay::new(&service.base, signed_in(&dir), meta(), Default::default())
             .unwrap()
             .with_timings(Timings {
                 no_token_poll: Duration::from_secs(30),
@@ -2053,10 +2108,9 @@ mod tests {
         .to_string();
         let mut robotd = fake_daemon(&sockets.robot, vec![answer.clone()]);
 
-        let relay = Relay::new(&service.base, signed_in(&dir), meta())
+        let relay = Relay::new(&service.base, signed_in(&dir), meta(), sockets)
             .unwrap()
-            .with_timings(brisk())
-            .with_sockets(sockets);
+            .with_timings(brisk());
         let task = tokio::spawn(relay.run());
         until("registration", || {
             !service.state.of_type("setPeerStatus").is_empty()
@@ -2120,10 +2174,9 @@ mod tests {
         let sockets = sockets_in(dir.path());
         // Deliberately no daemon at all: a refusal must not depend on one being there.
 
-        let relay = Relay::new(&service.base, signed_in(&dir), meta())
+        let relay = Relay::new(&service.base, signed_in(&dir), meta(), sockets)
             .unwrap()
-            .with_timings(brisk())
-            .with_sockets(sockets);
+            .with_timings(brisk());
         let task = tokio::spawn(relay.run());
         until("registration", || {
             !service.state.of_type("setPeerStatus").is_empty()
@@ -2167,10 +2220,14 @@ mod tests {
     async fn a_lane_with_no_picture_says_so() {
         let dir = tempfile::tempdir().unwrap();
         let service = fake_service().await;
-        let relay = Relay::new(&service.base, signed_in(&dir), meta())
-            .unwrap()
-            .with_timings(brisk())
-            .with_sockets(sockets_in(dir.path()));
+        let relay = Relay::new(
+            &service.base,
+            signed_in(&dir),
+            meta(),
+            sockets_in(dir.path()),
+        )
+        .unwrap()
+        .with_timings(brisk());
         let task = tokio::spawn(relay.run());
         until("registration", || {
             !service.state.of_type("setPeerStatus").is_empty()
@@ -2337,7 +2394,7 @@ mod tests {
         let service = fake_service().await;
         let (local_url, local) = fake_signalling(true).await;
 
-        let relay = Relay::new(&service.base, signed_in(&dir), meta())
+        let relay = Relay::new(&service.base, signed_in(&dir), meta(), Default::default())
             .unwrap()
             .with_timings(brisk())
             .with_local_signalling(&local_url);
@@ -2416,7 +2473,7 @@ mod tests {
         let service = fake_service().await;
         let (local_url, local) = fake_signalling(true).await;
 
-        let relay = Relay::new(&service.base, signed_in(&dir), meta())
+        let relay = Relay::new(&service.base, signed_in(&dir), meta(), Default::default())
             .unwrap()
             .with_timings(brisk())
             .with_local_signalling(&local_url);
@@ -2469,7 +2526,7 @@ mod tests {
         let service = fake_service().await;
         let (local_url, _local) = fake_signalling(false).await;
 
-        let relay = Relay::new(&service.base, signed_in(&dir), meta())
+        let relay = Relay::new(&service.base, signed_in(&dir), meta(), Default::default())
             .unwrap()
             .with_timings(brisk())
             .with_local_signalling(&local_url);

@@ -316,6 +316,17 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// skew and not a handshake refusal: a new `duckctl` against a robot on an older release reports
 /// that the robot is too old rather than failing obscurely.
 ///
+/// # v28 — `detector.*`
+///
+/// The duck detector leaves the release the way the policies did at v19: `mediad` reads it from
+/// `/opt/robot/detector/current`, the release's postinstall hook seeds that from a pinned Hub
+/// revision, and `detector.check` / `detector.install` are how a board asks what exists and
+/// moves to it — `policy.check` / `policy.install` with a different root, answered by the same
+/// daemon for the same reason (it has the network stack). An install restarts `mediad`, which is
+/// where the model is loaded, and says whether that took.
+///
+/// Additive as methods; the parameters and answers are the policy set's own types.
+///
 /// # v27 — the pad's IMU, on the pad tap
 ///
 /// Three more [`PadReport`] variants: a pad's inertial unit as a second evdev node beside the one
@@ -326,7 +337,63 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// A new variant on a tagged enum is what a robotctl built before it cannot decode, which is the
 /// one reason this is a bump rather than a note: the tap is still `padd`'s own socket, and every
 /// other client is untouched.
-pub const API_VERSION: u32 = 27;
+/// # v30 — `homed`, so a client can wait instead of guessing
+///
+/// One `Option<bool>` on [`PoliciesResult`]. `robot.do` refuses a skill while the robot is on its
+/// way to its home pose, and that refusal is a second old and resolves by itself — but from the
+/// wire it is `accepted: false` and a sentence, indistinguishable from "press Start on the pad",
+/// which stays true until somebody acts. A client that installs a policy triggers a reload,
+/// the reload sends the robot home, and the `robot.do` that follows is refused by the client's own
+/// previous call. Without this the only ways out are matching on the reason string or retrying
+/// blindly through refusals that will never clear.
+///
+/// `None` is "this robot does not say", which is what an older `robotd` sends and what a client
+/// must fall back from rather than read as `false`.
+/// # v31 — `sitting`, because "stand up" is two calls
+///
+/// One more `Option<bool>` on [`PoliciesResult`], beside `homed` and for the same reason: a client
+/// choosing what to send needs the robot's answer rather than its own guess. A duck on its feet
+/// stands with `robot.init`; a duck in its seat is held there by the `sit_toggle` latch, and
+/// `init` argues with that rather than winning. Without it a client either guesses — sitting a
+/// standing duck down every other press — or asks somebody to reach for the pad, which is what the
+/// playground did.
+/// # v32 — a status that can say "degraded"
+///
+/// Two fields on [`ComponentStatus`], beside `healthy`, which was a boolean answering a
+/// three-way question. `updaterd` asks `robotd` for a verdict and gets one of five; the health
+/// gate sorts them into *commit* (healthy, degraded) and *revert* (unhealthy, unreachable,
+/// unreadable), which is the three-way question `updater-design.md` §8 states. Status collapsed
+/// all four non-healthy verdicts into `healthy: false`, so a bench board with no servo power —
+/// a release the gate had just committed, running correctly — was indistinguishable on the wire
+/// from a robot whose control loop was dead.
+///
+/// That cost real time: it is how a rolled-back release was read as having been rolled back over
+/// its policy set. §4.1 asks of this route that "the app must be able to see 'daemon unhealthy,
+/// version X, last update failed'", and the app could not.
+///
+/// Both default, so an older `updaterd` reads exactly as it did before: `degraded` false is the
+/// strict verdict, and `reason` absent is "it did not say".
+/// # v33 — what the heat is costing, beside the temperature
+///
+/// One `Option<CpuThrottle>` on [`HealthResult`], beside `cpu_temp_c`. A board reported as
+/// "96 °C" reads as a warm robot; the same board is in fact pinned to 408 MHz of 1800 by the
+/// thermal governor, which is the sentence that explains a duck walking badly. Without it the
+/// clock ceiling is only reachable by sshing to the robot and reading `sysfs` — which is not
+/// something the one command a human already runs should send them away to do.
+///
+/// `None` is "this robot does not say": an older `robotd`, or a board with no `cpufreq` sysfs.
+/// # v34 — what a policy is, on the line that lists it
+///
+/// `description` and `preview` on [`PolicySearchHit`]. A search answered with `org/name`, an
+/// origin and a like count, which is enough to install something and not enough to choose it:
+/// every hit is somebody's `microduck-<something>`, and the name was the whole of what a person
+/// had to go on. The description was already in the manifest, already read on the fetch path and
+/// already shown by the policy playground — a list of policies is where it is wanted, and a
+/// search that makes someone install a policy to find out what it does is why it is here now.
+///
+/// Both are absent from an older `updaterd` and neither needs a fallback: a client with no
+/// description shows the id, which is what it showed before.
+pub const API_VERSION: u32 = 34;
 
 /// The observation width every policy this robot family runs is built against.
 ///
@@ -384,6 +451,10 @@ pub mod socket {
     /// Under `/run/tofd/` for the same reason as the pad's: it is that unit's
     /// `RuntimeDirectory=`, so systemd removes the socket when the daemon stops.
     pub const TOF: &str = "/run/tofd/tof.sock";
+
+    /// `mediad`'s on-demand raw-frame endpoint. It is local-only: a raw camera frame is for a
+    /// recorder or perception process on the robot, not a multi-megabyte WebRTC control reply.
+    pub const MEDIA: &str = "/run/mediad/media.sock";
 }
 
 /// Where each daemon publishes what it is running: `/run/<service>/identity.json`.
@@ -440,6 +511,12 @@ pub const JOINT_NAMES: [&str; 15] = [
 /// with `update.*`. [`Call`] is the typed form.
 pub mod method {
     pub const HELLO: &str = "hello";
+
+    /// One raw camera frame. `mediad` answers the JSON-RPC header, followed immediately by the
+    /// bytes named in that header, on its local Unix socket.
+    /// Deliberately not a `Call`: its binary tail must never enter Service/Lane routing
+    /// or the WebRTC control datachannel. Local clients dial `socket::MEDIA` explicitly.
+    pub const MEDIA_FRAME: &str = "media.frame";
 
     pub const CHECK: &str = "update.check";
     pub const APPLY: &str = "update.apply";
@@ -641,6 +718,16 @@ pub mod method {
     pub const POLICY_FETCH: &str = "policy.fetch";
     /// Search the Hub for policies.
     pub const POLICY_SEARCH: &str = "policy.search";
+
+    // ── detector.* ───────────────────────────────────────────────────────────
+    //
+    // The duck detector's set, served by `updaterd` for `policy.*`'s reason. The answers are
+    // `policy.*`'s types: a set is a set, whatever is in it.
+
+    /// Is there a newer duck detector than the one installed?
+    pub const DETECTOR_CHECK: &str = "detector.check";
+    /// Install a duck detector from the Hub, and restart `mediad` onto it.
+    pub const DETECTOR_INSTALL: &str = "detector.install";
 
     // ── account.* ────────────────────────────────────────────────────────────
     //
@@ -928,6 +1015,12 @@ pub enum Call {
     /// Search the Hub; see [`method::POLICY_SEARCH`].
     PolicySearch(PolicySearchParams),
 
+    // ── detector.* ───────────────────────────────────────────────────────────
+    /// What detector is installed and what the Hub offers; see [`method::DETECTOR_CHECK`].
+    DetectorCheck,
+    /// Install a detector and restart `mediad` onto it; see [`method::DETECTOR_INSTALL`].
+    DetectorInstall(PolicyInstallParams),
+
     // ── account.* ────────────────────────────────────────────────────────────
     /// Start a device-code login; see [`method::ACCOUNT_LOGIN`].
     AccountLogin(AccountLoginParams),
@@ -1079,6 +1172,8 @@ impl Call {
             Call::PolicyInstall(_) => method::POLICY_INSTALL,
             Call::PolicyFetch(_) => method::POLICY_FETCH,
             Call::PolicySearch(_) => method::POLICY_SEARCH,
+            Call::DetectorCheck => method::DETECTOR_CHECK,
+            Call::DetectorInstall(_) => method::DETECTOR_INSTALL,
             Call::AccountLogin(_) => method::ACCOUNT_LOGIN,
             Call::AccountStatus => method::ACCOUNT_STATUS,
             Call::AccountLogout => method::ACCOUNT_LOGOUT,
@@ -1143,6 +1238,9 @@ impl Call {
                 // replacing the official set. `policy.search` and `policy.fetch`'s read-only
                 // cousins stay ungated — asking what exists changes nothing.
                 | Call::PolicyFetch(_)
+                // Replacing the detector writes to the eMMC and restarts `mediad`, which drops
+                // every video session. `detector.check` is a read and stays ungated.
+                | Call::DetectorInstall(_)
                 // Signing the robot in binds it to a Hugging Face account, and signing it out
                 // takes it away again. That is the most consequential pair here by one measure
                 // nothing else in this list shares: it decides who can reach the robot *from
@@ -1200,6 +1298,9 @@ impl Call {
             // `robotd` to reload, which is the same order of magnitude as a small update — long,
             // but bounded and not a stream.
             Call::PolicyCheck | Call::PolicyInstall(_) => (Updater, Prompt),
+            // The same two, for the detector: one round trip, or a fourteen-megabyte download
+            // and a `mediad` restart.
+            Call::DetectorCheck | Call::DetectorInstall(_) => (Updater, Prompt),
             // `fetch` downloads one file and `search` is a single query; both are bounded and
             // neither streams.
             Call::PolicyFetch(_) | Call::PolicySearch(_) => (Updater, Prompt),
@@ -1349,6 +1450,7 @@ impl Call {
             Call::RobotSetMode(p) => encode(p),
             Call::RobotLoadPolicy(p) => encode(p),
             Call::PolicyInstall(p) => encode(p),
+            Call::DetectorInstall(p) => encode(p),
             Call::PolicyFetch(p) => encode(p),
             Call::PolicySearch(p) => encode(p),
             Call::AccountLogin(p) => encode(p),
@@ -1383,6 +1485,7 @@ impl Call {
             | Call::RobotModel
             | Call::RobotReloadPolicies
             | Call::PolicyCheck
+            | Call::DetectorCheck
             | Call::AccountStatus
             | Call::AccountLogout
             | Call::RobotMode => Value::Object(serde_json::Map::new()),
@@ -1458,6 +1561,8 @@ impl Call {
             method::POLICY_INSTALL => Call::PolicyInstall(decode(params)?),
             method::POLICY_FETCH => Call::PolicyFetch(decode(params)?),
             method::POLICY_SEARCH => Call::PolicySearch(decode(params)?),
+            method::DETECTOR_CHECK => Call::DetectorCheck,
+            method::DETECTOR_INSTALL => Call::DetectorInstall(decode(params)?),
             method::ACCOUNT_LOGIN => Call::AccountLogin(decode(params)?),
             method::ACCOUNT_STATUS => Call::AccountStatus,
             method::ACCOUNT_LOGOUT => Call::AccountLogout,
@@ -1619,6 +1724,10 @@ pub mod test_support {
             }),
             Call::PolicySearch(PolicySearchParams {
                 query: "microduck".into(),
+            }),
+            Call::DetectorCheck,
+            Call::DetectorInstall(PolicyInstallParams {
+                version: Some("v2".into()),
             }),
             Call::AccountLogin(AccountLoginParams { force: false }),
             Call::AccountStatus,
@@ -2271,6 +2380,31 @@ pub struct PoliciesResult {
     /// show what is loaded.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub skills: Vec<String>,
+    /// Whether the robot has reached its home pose, or `None` from a robot too old to say.
+    ///
+    /// **A skill is refused while this is false, and the refusal expires on its own.** That makes
+    /// it unlike every other reason `robot.do` says no: "press Start on the pad" is true until a
+    /// human acts, "no skill named …" is true until the config changes, and this one is true for
+    /// about a second. A client cannot tell them apart from `accepted: false` and a sentence, and
+    /// a client that just installed a policy is the one most likely to meet it — `robot.setSkill`
+    /// triggers a reload, a reload sends the robot home, and the `robot.do` that follows is
+    /// refused because of the call before it.
+    ///
+    /// Published here rather than on the 50 Hz stream for the reason `skills` is: it answers a
+    /// question asked once, on the read a client already makes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub homed: Option<bool>,
+
+    /// Whether the duck is parked in its seat, or `None` from a robot too old to say.
+    ///
+    /// **"Stand up" is two different calls, and this is how a client tells which.** A duck on its
+    /// feet comes up with `robot.init`. A duck in its seat is held there by the `sit_toggle` latch,
+    /// which the daemon drives itself — `init` argues with that rather than winning, and what ends
+    /// a sit is `robot.do sit_toggle`. A client that guessed would sit a standing duck down every
+    /// other press.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sitting: Option<bool>,
+
     /// Why the last policy change failed, when it was not a change to one slot.
     ///
     /// **A slot's failure is reported on the slot**; this is for the two that name none — a
@@ -2306,7 +2440,7 @@ pub struct PolicySlot {
     pub error: Option<String>,
 }
 
-/// Which set to install, for [`Call::PolicyInstall`].
+/// Which set to install, for [`Call::PolicyInstall`] and [`Call::DetectorInstall`].
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct PolicyInstallParams {
@@ -2528,6 +2662,44 @@ pub struct PolicySearchHit {
     pub origin: String,
     pub likes: Option<u64>,
     pub downloads: Option<u64>,
+    /// The one line the publisher wrote about it, from the repo's `manifest.json`.
+    ///
+    /// **Untrusted, and the same field the fetch path already reports.** It is a stranger's
+    /// sentence about a stranger's file, so a client displays it and decides nothing on it. `None`
+    /// covers a repo with no manifest, a manifest with no `description`, and one the robot could
+    /// not read inside the budget a search gets — three things a reader wants the same thing from.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// A video of the policy running, as a URL, when the repo carries one.
+    ///
+    /// Picked by file convention rather than declared — `docs/policy-manifest.md` owns the order —
+    /// because that is what publishers already do and what the policy playground already reads.
+    /// A client may link it or play it; nothing on the robot fetches it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preview: Option<String>,
+}
+
+impl PolicySearchHit {
+    /// The lines that go under a hit's own line: what the publisher said, and the clip.
+    ///
+    /// Here rather than in each client because `robotctl` and `duckctl` both print this list, and
+    /// two renderings of the same answer would drift exactly where somebody is comparing one tool
+    /// against the other. What each tool keeps is its own: the id column it pads, and the next
+    /// command it suggests, which is not the same command on the robot as it is over a radio.
+    ///
+    /// **The quotes are load-bearing.** The description is a stranger's sentence about a
+    /// stranger's file, and quoting it is what says the tool is repeating rather than asserting —
+    /// the same shape `policy fetch` prints it in.
+    pub fn details(&self) -> Vec<String> {
+        let mut lines = Vec::new();
+        if let Some(description) = &self.description {
+            lines.push(format!("  \"{description}\""));
+        }
+        if let Some(preview) = &self.preview {
+            lines.push(format!("  {preview}"));
+        }
+        lines
+    }
 }
 
 /// How often a subscriber wants [`method::ROBOT_STATE`].
@@ -2844,6 +3016,40 @@ pub struct HelloResult {
     pub revision: Option<String>,
 }
 
+/// Metadata preceding the binary tail of a local `media.frame` response.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MediaFrameHeader {
+    pub width: u32,
+    pub height: u32,
+    pub format: String,
+    pub bytes: usize,
+    pub captured_at_unix_us: u128,
+    /// Degrees clockwise the camera is mounted from upright — the same number `media.video`
+    /// tells a WebRTC peer, and zero when `--flip-in-pipeline` already turned these pixels.
+    ///
+    /// **Carried rather than written down.** The geometry above describes the bytes exactly as
+    /// they are, and a consumer cannot recover the mount from them: a 180° mount is
+    /// indistinguishable from an upright one, and a quarter turn is only a guess from the aspect
+    /// ratio. A recorder building a dataset needs the angle programmatically, and a human
+    /// converting a frame should not have to find a document to learn their picture is sideways.
+    pub rotate: u32,
+}
+impl MediaFrameHeader {
+    /// Bound allocation and reject malformed geometry before decoding pixels.
+    pub fn valid_uyvy(&self) -> bool {
+        self.width > 0
+            && self.height > 0
+            && self.width.is_multiple_of(2)
+            && self.format == "UYVY"
+            && matches!(self.rotate, 0 | 90 | 180 | 270)
+            && self.bytes <= 16 * 1024 * 1024
+            && (self.width as usize)
+                .checked_mul(self.height as usize)
+                .and_then(|n| n.checked_mul(2))
+                == Some(self.bytes)
+    }
+}
+
 /// Where an in-flight update has got to. Mirrors the state machine in
 /// `docs/design/updater-design.md` §7.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -2880,7 +3086,34 @@ pub struct ComponentStatus {
     pub installed: Option<semver::Version>,
     pub phase: Phase,
     /// `None` when no health probe is configured.
+    ///
+    /// `Some(true)` only for a robot that reported healthy. Four different verdicts answer
+    /// `Some(false)` — including *degraded*, which the health gate deliberately **commits** a
+    /// release onto — so this boolean cannot be shown to anyone on its own. Read it with
+    /// [`Self::degraded`] and [`Self::reason`].
     pub healthy: Option<bool>,
+    /// Set when the fault belongs to the board rather than to the installed release.
+    ///
+    /// The same meaning as [`HealthResult::degraded`], and true in exactly the cases the health
+    /// gate would commit — so a bench board with its servo supply off is `healthy: Some(false)`
+    /// with this set, and nothing is wrong with the release it is running.
+    ///
+    /// Sent because it was needed and missing: `robotctl update status` printed `UNHEALTHY` for
+    /// such a board, which is what made a release that had rolled back for an unrelated reason
+    /// look as though the missing policy set had caused it.
+    ///
+    /// Only meaningful when `healthy` is `Some(false)`. Defaults to false, so an older
+    /// `updaterd` that does not send it still reads as the strict verdict it meant.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub degraded: bool,
+    /// The verdict in words: the reason `robotd` gave, or what went wrong in the asking.
+    /// Absent for a healthy robot and for a component with no probe.
+    ///
+    /// Also where the two verdicts the booleans cannot tell apart go — a `robotd` that did not
+    /// answer at all, and one that answered in a shape this `updaterd` cannot parse, which is a
+    /// robot that is very likely fine. Both fail the gate; only this string says which happened.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
     pub pinned: Option<semver::Version>,
     pub last_attempt: Option<LogEntry>,
 }
@@ -3168,6 +3401,16 @@ pub struct HealthResult {
     /// Absent off Linux, and on a kernel without thermal sysfs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cpu_temp_c: Option<f64>,
+    /// What the board is allowed to clock at, and how far the thermal governor has wound it
+    /// down. Reported, never judged — same rule as the battery above.
+    ///
+    /// Travels beside [`Self::cpu_temp_c`] because the temperature alone does not say what the
+    /// heat is costing: a board sitting at 95 °C has already been cut to a fraction of its
+    /// clock, and a duck walking badly at that point is short of CPU, not short of policy.
+    ///
+    /// Absent off Linux, and on a kernel with no `cpufreq` sysfs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_throttle: Option<CpuThrottle>,
     /// The control loop's own numbers — the ones `healthy` was decided from.
     ///
     /// Carried so a verdict can be *checked* rather than taken on faith. "unhealthy: control
@@ -3275,6 +3518,44 @@ impl ImuHealth {
     /// warning that fires on a healthy robot is a warning nobody reads.
     pub fn frozen(&self) -> bool {
         self.consecutive_stale_blocks >= Self::FROZEN_RUN
+    }
+}
+
+/// How hard the board is being clocked down, and what it is being clocked down to.
+///
+/// Two readings of one thing, because either alone is half an answer. The level is the thermal
+/// governor's own action — it says *heat* is the cause — but it is an index into a frequency
+/// table, so "6 of 6" tells nobody what the robot lost. The ceiling is what it lost, in the
+/// units the board is specified in, but a low ceiling can also be a userspace policy rather
+/// than heat. Together they say both, and disagreeing (`level: 0` under a lowered ceiling) is
+/// itself the useful reading.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CpuThrottle {
+    /// The cpufreq cooling device's current state: 0 is unthrottled, `max_level` is as far down
+    /// as the governor can go.
+    pub level: u32,
+    /// The deepest state that device has, so `level` means something without the reader
+    /// knowing the board. Zero when no cpufreq cooling device was found — the ceiling below is
+    /// then the whole answer.
+    pub max_level: u32,
+    /// What the CPU may currently clock to, in kHz — the kernel's `scaling_max_freq`, not the
+    /// instantaneous frequency. The instantaneous one is mostly a statement about how busy the
+    /// board is; this is a statement about what it is *allowed* to do.
+    pub khz: u32,
+    /// What it could clock to cold, in kHz — `cpuinfo_max_freq`.
+    pub max_khz: u32,
+}
+
+impl CpuThrottle {
+    /// Is anything holding the clock down?
+    ///
+    /// Either reading counts. The governor having wound the level up is the ordinary case, and
+    /// a ceiling below the hardware maximum with the level still at zero is the other one —
+    /// somebody pinned it from userspace, which is worth seeing rather than hiding because the
+    /// thermal governor was not the one who did it.
+    pub fn throttled(&self) -> bool {
+        self.level > 0 || (self.max_khz > 0 && self.khz < self.max_khz)
     }
 }
 
@@ -3698,6 +3979,19 @@ pub struct SystemInfoResult {
     /// to its hostname for a name.
     pub serial: Option<String>,
     pub uptime_seconds: u64,
+    /// This robot is a duck in MuJoCo, not a duck on a desk.
+    ///
+    /// **One fact, declared once, so nothing downstream has to infer it.** `mediad` puts it in the
+    /// `meta` it registers with, so a simulated duck is marked as such in its owner's robot list
+    /// rather than sitting there looking like hardware somebody could walk over to; `robotctl`
+    /// says it too. The alternative was every client deciding for itself from a serial that starts
+    /// with `sim-`, which is a convention three places would have to agree on and one of them
+    /// would get wrong.
+    ///
+    /// `serde(default)` for the reason every field here has it: an older daemon does not send it,
+    /// and absent means a real robot — which is right for every robot built so far.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub simulated: bool,
 }
 
 /// Answer to [`Call::SystemSetName`].
@@ -5084,7 +5378,7 @@ mod tests {
     fn every_call_covers_every_variant() {
         assert_eq!(
             every_call().len(),
-            65,
+            67,
             "a Call variant was added or removed — update every_call() and this count"
         );
     }
@@ -5298,6 +5592,9 @@ mod tests {
                 // list: asking what exists is inspection, and support has to be able to ask it
                 // on a robot it may not change.
                 method::POLICY_FETCH,
+                // Replacing the detector writes fourteen megabytes to the eMMC and restarts
+                // `mediad`. `detector.check` stays off this list, like `policy.check`.
+                method::DETECTOR_INSTALL,
                 // Binding the robot to an account, and unbinding it. On this list for a reason
                 // none of the others share: it decides who can reach the robot from outside the
                 // building, and it survives every reboot. `account.status` must stay off it —
@@ -6094,6 +6391,46 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<HelloResult>(&line).unwrap(),
             released
+        );
+    }
+
+    /// Both clients print a hit through this, so the contract is here rather than in either of
+    /// them: quoted description, bare URL, and nothing at all for what the publisher did not say.
+    #[test]
+    fn a_hit_renders_only_what_the_publisher_wrote() {
+        let bare = PolicySearchHit {
+            id: "someone/microduck-thing".into(),
+            origin: "community".into(),
+            ..Default::default()
+        };
+        assert!(bare.details().is_empty());
+
+        let described = PolicySearchHit {
+            description: Some("Bows from a stand.".into()),
+            ..bare.clone()
+        };
+        assert_eq!(described.details(), vec!["  \"Bows from a stand.\""]);
+
+        let both = PolicySearchHit {
+            preview: Some("https://huggingface.co/a/b/resolve/main/media/preview.mp4".into()),
+            ..described
+        };
+        assert_eq!(
+            both.details(),
+            vec![
+                "  \"Bows from a stand.\"",
+                "  https://huggingface.co/a/b/resolve/main/media/preview.mp4",
+            ]
+        );
+
+        // A clip and no sentence is an ordinary repo, not a shape to special-case.
+        let silent = PolicySearchHit {
+            preview: Some("https://huggingface.co/a/b/resolve/main/preview.mp4".into()),
+            ..bare
+        };
+        assert_eq!(
+            silent.details(),
+            vec!["  https://huggingface.co/a/b/resolve/main/preview.mp4"]
         );
     }
 }
