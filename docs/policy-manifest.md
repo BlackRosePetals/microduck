@@ -3,7 +3,7 @@
 What a `manifest.json` beside a microduck `.onnx` says, and what the robot does with each field.
 One vocabulary for two shapes: a **single-policy repo** (`<user>/microduck-<name>` on the Hub,
 one `policy.onnx`, the fields at the top level) and the **official set**
-(`pollen-robotics/microduck-policies`, nine files, the same fields once per entry under
+(`pollen-robotics/microduck-policies`, ten files, the same fields once per entry under
 `policies`). One reader understands both, and asking a publisher for something is "add a field",
 never "adopt our format".
 
@@ -48,7 +48,7 @@ a policy only on a claim that is present and wrong.
 | `robot.model` | str | fetch | `microduck`; refused if another robot |
 | `robot.hw_rev`, `robot.servos`, `robot.control_hz` | | display | `1`, `xl330`, `50` |
 | `name` | str | skills | what a client asks for; defaults to the file's stem |
-| `description` | str | display | one line, untrusted |
+| `description` | str | display | one line, untrusted — what `policy search` shows under each hit, and `policy fetch` on the way in |
 | `kind` | str | skills, slots | see above |
 | `duration_s` | float | skills | seconds it runs; for a phase policy `period_s × end_phase` |
 | `chain` | bool | skills | a held button starts another run when this one ends |
@@ -66,6 +66,10 @@ a policy only on a claim that is present and wrong.
 | `training` | object | display | `task_id`, `repo`, `commit`, `branch`, `dirty`, `run`, `checkpoint`, `exported` |
 | `eval` | object | display | free-form: what was checked, in what sim, how it did |
 | `policies[]` | array | set | one entry per file, with `file` plus any per-policy field above |
+
+Recurrent LSTM exports require `model_api: 2`; existing feed-forward exports remain API 1.
+See [recurrent policies](recurrent-policies.md) for the tensor contract, memory lifecycle
+and offline rehearsal.
 
 ## A single-policy repo
 
@@ -112,6 +116,37 @@ The manifest is installed **into the set**, so `/opt/robot/policies/current/mani
 what `robotd` reads for the skills. It is also the download list: adding a policy is an entry
 here and a tag, and both the first seed of a board and every `policy update` after it take the
 list from the revision they are installing.
+
+## The preview clip, which is not a field
+
+A repo may carry a **video of the policy running**, and `robotctl policy search` links it beside
+the description. It is a path rather than a manifest field, because that is what publishers were
+already doing and what the [policy
+playground](https://huggingface.co/spaces/pollen-robotics/microduck-policy-playground) already
+reads — asking for a `preview` field would be asking everyone to write down again what the path
+already says.
+
+Put it at **`media/preview.mp4`**. That is what most published policies use, and it is the first
+thing looked for. The full order, for a repo that has something else:
+
+1. `media/preview.mp4`
+2. `preview.mp4`
+3. any `.mp4`, `.webm` or `.mov` whose file name starts with `preview`, in any directory
+4. any `.mp4`, `.webm` or `.mov` at all
+5. any `.gif`
+
+Ties inside a step break on the shallowest path, then the shortest name, then alphabetically, so a
+repo with one clip per variant — `10cm/preview.mp4` beside `100cm/preview.mp4` — gets the same
+answer on every search rather than whichever the Hub happened to list first.
+
+Step 4 is why a repo whose only video is a screen recording of a viewer shows that: a clip the
+publisher chose to ship beats no clip, and nothing here can tell what is in one. A repo that would
+rather show nothing should carry no video, or keep it out of the Hub repo.
+
+The search reads it from the file list the Hub already returns, so a preview costs no extra
+request. The description does cost one `manifest.json` GET per repo that has one — bounded, and
+dropped rather than waited on past a few seconds, because a list of policies is worth less late
+than it is plain.
 
 ## Changes from schema 1
 

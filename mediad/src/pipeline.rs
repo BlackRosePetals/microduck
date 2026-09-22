@@ -69,6 +69,12 @@
 //! without the capture path existing. The camera arrives as a different source element behind the
 //! same encoder, and `media-bringup.md` records why capture cannot simply be `v4l2src`.
 //!
+//! **It runs at `robotd_params::TEST_PATTERN_GEOMETRY` rather than `[media] quality`**, and that is
+//! a CPU decision. A camera's frames come off the ISP in hardware; a test pattern's are drawn by
+//! this process, so at the configured rung an idle board with no camera burned 29.4% of a core
+//! against a real camera's 6.1% — synthesising 1.84 MB of UYVY thirty times a second for a tee
+//! whose readers had all said no. The session it exists to provide needs none of those pixels.
+//!
 //! ## What is not verified
 //!
 //! **Nothing in a signal handler here may panic.** These closures are invoked from C, so a panic
@@ -83,8 +89,13 @@
 //! naming the arity rather than as an abort.
 
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime};
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow};
+// `bail!` belongs to the sensor-mode search, so it is gated with it rather than left to warn on a
+// build with no v4l2 to talk to.
+#[cfg(target_os = "linux")]
+use anyhow::bail;
 use duck_ipc_proto as proto;
 use gstreamer as gst;
 use gstreamer::prelude::*;
@@ -193,6 +204,14 @@ pub enum Source {
     Test,
     /// The head camera, through the rkisp capture path.
     Camera(Camera),
+    /// A simulated head camera, at `host:port`: what a duck in MuJoCo sees.
+    ///
+    /// Frames arrive length-prefixed and raw rather than as JSON, unlike the rest of the simulator
+    /// links — 640x360 UYVY is 460,800 bytes, and at 15 fps that is 6.9 MB/s. There is no handshake,
+    /// because there is nothing to negotiate that both ends do not already have to agree on to be
+    /// useful: the geometry is fixed on both sides — `[media] quality` here, the body's camera
+    /// there — or nothing works.
+    Sim(String),
 }
 
 /// The head camera, and the two things it will not work without.
@@ -219,6 +238,10 @@ pub struct Frame {
     /// The GStreamer format name — [`CAPTURE_FORMAT`], carried rather than assumed so a consumer
     /// reading this cannot silently misinterpret the bytes if the capture format changes again.
     pub format: &'static str,
+    /// When this buffer was taken, for a consumer joining a frame to a separately sampled
+    /// robot state. Observation time, not a scheduling clock: it is never used to pace capture,
+    /// so an NTP step cannot reach the pipeline through it.
+    pub captured_at: SystemTime,
     /// Tightly packed as the caps describe it, in `format`.
     pub data: Vec<u8>,
 }
@@ -323,14 +346,19 @@ impl Frames {
 
     /// Whether a reader is waiting, taking the request if one is. The callback's whole cost on a
     /// frame nobody asked for.
-    fn take_request(&self) -> bool {
+    ///
+    /// `pub(crate)` so that [`crate::frame`]'s tests can stand in for the capture branch: the
+    /// endpoint's behaviour on a real delivery is only testable by driving this rendezvous.
+    pub(crate) fn take_request(&self) -> bool {
         self.0
             .wanted
             .swap(false, std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Hand the captured frame to whoever is waiting for it.
-    fn deliver(&self, frame: Frame) {
+    ///
+    /// `pub(crate)` for the same reason as [`Frames::take_request`].
+    pub(crate) fn deliver(&self, frame: Frame) {
         let mut latest = self.0.latest.lock().expect("frame lock");
         latest.frame = Some(frame);
         latest.generation = latest.generation.wrapping_add(1);
@@ -357,7 +385,13 @@ pub fn start(
     source: Source,
     producer: &crate::producer::Producer,
     settings: &Settings,
-) -> Result<(gst::Pipeline, mpsc::Receiver<Channel>, Frames)> {
+    relays: Arc<crate::turn::Relays>,
+) -> Result<(
+    gst::Pipeline,
+    mpsc::Receiver<Channel>,
+    Frames,
+    Option<StreamBranch>,
+)> {
     let &Settings {
         port,
         bitrate,
@@ -383,6 +417,8 @@ pub fn start(
     // never arriving — see [`bridge_gstreamer_log`].
     bridge_gstreamer_log();
 
+    prefer_a_usable_h264_encoder();
+
     // **A GStreamer signal handler runs on a GStreamer thread, which is not inside the tokio
     // runtime.** `tokio::spawn` there panics with "there is no reactor running", and a panic
     // crossing the C closure boundary is a non-unwinding abort — the whole daemon dies with
@@ -403,7 +439,19 @@ pub fn start(
             src.set_property("is-live", true);
             src
         }
+        #[cfg(target_os = "linux")]
         Source::Camera(camera) => camera_source(camera, fps)?,
+        // Not "unsupported": `[media] camera = true` off a robot is a config file copied from one,
+        // and the fix is to name whichever of the other two sources was meant.
+        #[cfg(not(target_os = "linux"))]
+        Source::Camera(_) => {
+            return Err(anyhow!(
+                "a head camera is captured with v4l2, which this is not running on. A duck in \
+                 MuJoCo is --sim-camera; a source that needs nothing at all is the default test \
+                 pattern"
+            ));
+        }
+        Source::Sim(addr) => sim_source(addr, width, height, fps)?,
     };
 
     // Pinned rather than negotiated, because both branches of the tee depend on the answer, and a
@@ -557,7 +605,7 @@ pub fn start(
 
     let consumers: Consumers = Arc::new(std::sync::atomic::AtomicU32::new(0));
     let (channels_tx, channels_rx) = mpsc::channel::<Channel>(4);
-    wire_consumers(&sink, channels_tx, runtime, consumers.clone())?;
+    wire_consumers(&sink, channels_tx, runtime, consumers.clone(), relays)?;
 
     // ── the raw branch ──────────────────────────────────────────────────────
     //
@@ -594,6 +642,27 @@ pub fn start(
         .drop(true)
         .build();
     wire_frames(&appsink, frames.clone(), out_width, out_height);
+
+    // ── the H.264 branch, for a Space this robot streams to ─────────────────
+    //
+    // A third branch off the same raw tee, and **valved shut**: with `drop=true` nothing reaches
+    // the encoder, so a second encode costs nothing until `media.stream` asks for it. Built once
+    // rather than added on demand, because adding elements to a live pipeline means pad-blocking
+    // surgery and this file's history with a `videoflip` is a warning about touching this path.
+    //
+    // `webrtcsink` owns the encoder on the other branch and is handed raw video on purpose (see
+    // the header): with pre-encoded input its congestion control cannot reach the encoder. So
+    // there is nothing to tap and this is a second encoder — cheap on a VPU at a few frames a
+    // second, and the reason the rate and the size are pinned here rather than left to the caller.
+    let stream_branch = build_stream_branch(&pipeline, out_width, out_height, fps)
+        .inspect_err(|error| {
+            tracing::warn!(
+                error = %format!("{error:#}"),
+                "no H.264 branch, so this robot cannot stream frames to a Space; the rest of the \
+                 pipeline is unaffected"
+            );
+        })
+        .ok();
 
     if let Some(flip) = flip.as_ref() {
         pipeline
@@ -642,6 +711,10 @@ pub fn start(
     // two links are separate from the `link_many` chains above.
     link_tee_branch(&tee, &video_queue).context("could not attach the video branch to the tee")?;
     link_tee_branch(&tee, &raw_queue).context("could not attach the raw branch to the tee")?;
+    if let Some(branch) = stream_branch.as_ref() {
+        link_tee_branch(&tee, branch.head())
+            .context("could not attach the H.264 branch to the tee")?;
+    }
 
     // **Watch the bus, or every media failure is silent.**
     //
@@ -669,7 +742,341 @@ pub fn start(
         fps,
         "signalling server listening"
     );
-    Ok((pipeline, channels_rx, frames))
+    Ok((pipeline, channels_rx, frames, stream_branch))
+}
+
+/// Build the valved H.264 branch: `queue ! valve ! videorate ! videoscale ! videoconvert ! enc !
+/// parse ! appsink`.
+///
+/// Fails rather than degrades when there is no encoder to use, and the caller carries on without a
+/// branch: a robot that cannot stream to a Space is still a robot that walks, and `media.stream`
+/// then refuses with a reason instead of accepting and sending nothing.
+fn build_stream_branch(
+    pipeline: &gst::Pipeline,
+    width: u32,
+    height: u32,
+    fps: u32,
+) -> Result<StreamBranch> {
+    // Rate and size for the streamed copy, independent of what the video track carries. Five a
+    // second at 640 is what a model wants and a fraction of the encode the WebRTC branch does.
+    const STREAM_FPS: u32 = 5;
+    const STREAM_LONGEST: u32 = 640;
+
+    let make = |name: &str| -> Result<gst::Element> {
+        gst::ElementFactory::make(name)
+            .build()
+            .map_err(|_| anyhow!("no {name} element"))
+    };
+
+    // Leaky like the raw branch: a stalled encoder must never become the video track's problem.
+    let queue = gst::ElementFactory::make("queue")
+        .property("max-size-buffers", 2u32)
+        .property("max-size-bytes", 0u32)
+        .property("max-size-time", 0u64)
+        .property_from_str("leaky", "downstream")
+        .build()
+        .map_err(|_| anyhow!("no queue element"))?;
+
+    let valve = gst::ElementFactory::make("valve")
+        // **Shut until asked.** This is what makes a second encoder free while nobody streams.
+        .property("drop", true)
+        .build()
+        .map_err(|_| anyhow!("no valve element"))?;
+
+    // `drop-only` so it never duplicates a frame to hit a rate — a repeated frame costs the
+    // encoder a whole access unit to say nothing happened.
+    let rate = gst::ElementFactory::make("videorate")
+        .property("drop-only", true)
+        .property("max-rate", STREAM_FPS as i32)
+        .build()
+        .map_err(|_| anyhow!("no videorate element"))?;
+
+    let scale = make("videoscale")?;
+
+    // The turn already happened before the tee, so this branch's input is upright and the aspect
+    // ratio here is the upright one.
+    let scale = (scale, {
+        let longest = width.max(height) as f32;
+        let factor = (STREAM_LONGEST as f32 / longest).min(1.0);
+        // Even dimensions: H.264 chroma is subsampled, and an odd width is a negotiation failure
+        // on some encoders and a green column on others.
+        let even = |value: f32| ((value.round() as u32).max(2) / 2) * 2;
+        gst::Caps::builder("video/x-raw")
+            .field("width", even(width as f32 * factor) as i32)
+            .field("height", even(height as f32 * factor) as i32)
+            .build()
+    });
+    let caps = gst::ElementFactory::make("capsfilter")
+        .property("caps", &scale.1)
+        .build()
+        .map_err(|_| anyhow!("no capsfilter element"))?;
+    let scale = scale.0;
+
+    // The tee carries `UYVY` (see the capture caps above) and neither encoder takes it: `x264enc`
+    // wants planar YUV, `mpph264enc` NV12. Without this the branch **fails to link at build time**,
+    // `start` returns the error, and mediad does not start at all on a machine without `mpph264enc`
+    // — which is every laptop, and the sim twin with it. A passthrough when formats already agree,
+    // so it costs the board nothing.
+    let convert = make("videoconvert")?;
+
+    // `mpph264enc` is the board's hardware encoder — the same one `webrtcsink` uses through the
+    // patched plugin the header describes. `x264enc` is the fallback for a laptop and for a board
+    // whose MPP is missing, which is a slow encode rather than a broken one.
+    let encoder = make("mpph264enc")
+        .or_else(|_| {
+            tracing::info!("no mpph264enc; falling back to x264enc for the frame stream");
+            make("x264enc")
+        })
+        .context("neither mpph264enc nor x264enc is available")?;
+
+    // `config-interval=-1` repeats SPS and PPS in front of every keyframe, which is what lets a
+    // receiver that connects mid-stream decode from the next one without having been sent
+    // anything it missed. Without it a reconnecting Space needs the parameter sets it never saw.
+    let parse = gst::ElementFactory::make("h264parse")
+        .property("config-interval", -1i32)
+        .build()
+        .map_err(|_| anyhow!("no h264parse element"))?;
+
+    let encoded = Encoded::default();
+    let appsink = gst_app::AppSink::builder()
+        .caps(
+            &gst::Caps::builder("video/x-h264")
+                .field("stream-format", "byte-stream")
+                .field("alignment", "au")
+                .build(),
+        )
+        // One WebSocket message is one access unit, which is what `alignment=au` above buys.
+        .sync(false)
+        // **`async=false`, or this sink holds the whole pipeline in PAUSED.** A sink prerolls on
+        // its first buffer, and the bin does not finish going to PLAYING until every async sink
+        // has. This branch's first buffer only arrives once somebody opens the valve — so with the
+        // default the pipeline never completed its state change, and the *raw* appsink one branch
+        // over, which had prerolled, waited for PLAYING for ever: no callbacks, no frames, and the
+        // duck detector and the auto-exposure loop starved on a camera that was capturing at 30
+        // fps. The video track kept working because `webrtcsink` is live and does not preroll,
+        // which is what made this invisible from the console.
+        .async_(false)
+        .max_buffers(ENCODED_DEPTH as u32)
+        .drop(false)
+        .build();
+
+    {
+        let encoded = encoded.clone();
+        appsink.set_callbacks(
+            gst_app::AppSinkCallbacks::builder()
+                .new_sample(move |sink| {
+                    let sample = sink.pull_sample().map_err(|_| gst::FlowError::Eos)?;
+                    let buffer = sample.buffer().ok_or(gst::FlowError::Error)?;
+                    let map = buffer.map_readable().map_err(|_| gst::FlowError::Error)?;
+                    // A keyframe is a buffer *without* the delta-unit flag. Reading it the other
+                    // way round would mark every P-frame a keyframe and defeat the whole queue.
+                    let keyframe = !buffer.flags().contains(gst::BufferFlags::DELTA_UNIT);
+                    encoded.push(map.as_slice().to_vec(), keyframe);
+                    Ok(gst::FlowSuccess::Ok)
+                })
+                .build(),
+        );
+    }
+
+    pipeline
+        .add_many([
+            &queue,
+            &valve,
+            &rate,
+            &scale,
+            &caps,
+            &convert,
+            &encoder,
+            &parse,
+            appsink.upcast_ref(),
+        ])
+        .context("could not add the H.264 branch to the pipeline")?;
+    gst::Element::link_many([
+        &queue,
+        &valve,
+        &rate,
+        &scale,
+        &caps,
+        &convert,
+        &encoder,
+        &parse,
+        appsink.upcast_ref(),
+    ])
+    .context("could not link the H.264 branch")?;
+
+    tracing::info!(
+        encoder = %encoder.factory().map(|f| f.name().to_string()).unwrap_or_default(),
+        fps = STREAM_FPS,
+        "an H.264 branch is available for streaming, shut until something asks"
+    );
+    let _ = fps;
+    Ok(StreamBranch {
+        head: queue,
+        valve,
+        encoder,
+        encoded,
+    })
+}
+
+/// The H.264 branch's output: access units in order, with gaps closed to the next keyframe.
+///
+/// **Not [`Frames`], and the difference is the whole point.** `Frames` is last-value-wins: a slow
+/// reader gets the newest picture and the older ones are discarded, which is exactly right for an
+/// independent frame and exactly wrong for a predicted one. A P-frame whose reference was dropped
+/// decodes to garbage that looks like a broken camera rather than a broken transport, so a reader
+/// that falls behind here is given the next *keyframe* and nothing between.
+///
+/// A short queue rather than one slot for the same reason: a group of pictures has to arrive whole.
+#[derive(Clone, Default)]
+pub struct Encoded(Arc<EncodedShared>);
+
+#[derive(Default)]
+struct EncodedShared {
+    units: Mutex<EncodedQueue>,
+    arrived: std::sync::Condvar,
+}
+
+#[derive(Default)]
+struct EncodedQueue {
+    /// `(bytes, keyframe)`, oldest first.
+    ready: std::collections::VecDeque<(Vec<u8>, bool)>,
+    /// Set when the queue overflowed: everything until the next keyframe is unusable to a reader
+    /// that missed what came before it.
+    awaiting_key: bool,
+    /// How many units were discarded, for the stream's own counters.
+    dropped: u64,
+}
+
+/// How many access units to hold. Two seconds at 15 fps, which is longer than any keyframe
+/// interval worth setting — so a reader that stalls briefly recovers without waiting for one.
+const ENCODED_DEPTH: usize = 32;
+
+impl Encoded {
+    /// Take the next unit, waiting up to `FRAME_TIMEOUT` for one.
+    ///
+    /// `None` means the encoder produced nothing in that time, which on a valved branch is the
+    /// ordinary state: nobody is streaming, so nothing is being encoded.
+    pub fn next_unit(&self) -> Option<(Vec<u8>, bool)> {
+        let mut units = self.0.units.lock().expect("not poisoned");
+        loop {
+            while let Some((bytes, keyframe)) = units.ready.pop_front() {
+                if units.awaiting_key && !keyframe {
+                    units.dropped += 1;
+                    continue;
+                }
+                units.awaiting_key = false;
+                return Some((bytes, keyframe));
+            }
+            let (again, timed_out) = self
+                .0
+                .arrived
+                .wait_timeout(units, FRAME_TIMEOUT)
+                .expect("not poisoned");
+            units = again;
+            if timed_out.timed_out() && units.ready.is_empty() {
+                return None;
+            }
+        }
+    }
+
+    /// Units discarded because a reader was behind. Cumulative.
+    pub fn dropped(&self) -> u64 {
+        self.0.units.lock().expect("not poisoned").dropped
+    }
+
+    fn push(&self, bytes: Vec<u8>, keyframe: bool) {
+        let mut units = self.0.units.lock().expect("not poisoned");
+        if units.ready.len() >= ENCODED_DEPTH {
+            // Behind by two seconds of video. Throwing away one unit would leave a hole that
+            // corrupts everything referring across it, so the queue is emptied and the stream
+            // resumes at the next keyframe.
+            units.dropped += units.ready.len() as u64;
+            units.ready.clear();
+            units.awaiting_key = true;
+        }
+        units.ready.push_back((bytes, keyframe));
+        drop(units);
+        self.0.arrived.notify_one();
+    }
+}
+
+/// Turn the H.264 branch on or off, and ask its encoder for a keyframe.
+///
+/// **A valve rather than adding and removing elements.** The branch is built once and gated: with
+/// `drop=true` no buffer reaches the encoder, so the second encode costs nothing while nobody is
+/// streaming — and turning it on is a property write rather than pad-blocking surgery on a live
+/// pipeline. `remote-webrtc.md`'s note that the encoder is this board's budget is why it is gated
+/// at all, and `pipeline.rs`'s own history with a `videoflip` is why it is not rebuilt.
+#[derive(Clone)]
+pub struct StreamBranch {
+    /// The branch's first element — its `queue`, which is what the tee's request pad links to.
+    ///
+    /// **Separate from the valve, and it cost a panic on the board to learn why.** Both were one
+    /// field called `valve`, holding the queue because that is what has to be linked; `open()`
+    /// then set `drop` on it and glib panicked with `property 'drop' of type 'GstQueue' not
+    /// found`. It killed the task handling the call rather than the daemon, so the symptom was a
+    /// `media.stream` that never answered — silence, from a robot that was otherwise fine.
+    head: gst::Element,
+    valve: gst::Element,
+    encoder: gst::Element,
+    pub encoded: Encoded,
+}
+
+impl StreamBranch {
+    /// What the tee links to: the head of the branch, not the valve behind it.
+    pub fn head(&self) -> &gst::Element {
+        &self.head
+    }
+
+    /// Open the valve, and ask for a keyframe so a receiver has something to start on.
+    ///
+    /// Without the request a receiver waits for the encoder's own keyframe interval before its
+    /// first decodable picture — seconds of nothing, indistinguishable from a stream that is not
+    /// working. `h264parse config-interval=-1` puts SPS and PPS in front of it, so that keyframe
+    /// is enough on its own.
+    pub fn open(&self) {
+        self.gate(false);
+        self.request_keyframe();
+    }
+
+    pub fn close(&self) {
+        self.gate(true);
+    }
+
+    /// Set the valve's `drop`, and **do not panic if it is the wrong element**.
+    ///
+    /// `set_property` panics on a name the element does not have, and this one ran on a tokio
+    /// worker inside the task answering `media.stream` — so the first version of this file killed
+    /// that task and the call simply never came back. A robot that is otherwise healthy, silent
+    /// on one method, is a much worse failure than a refusal. The element is right now; the guard
+    /// is for the next time somebody moves a field.
+    fn gate(&self, drop: bool) {
+        if self
+            .valve
+            .has_property_with_type("drop", bool::static_type())
+        {
+            self.valve.set_property("drop", drop);
+        } else {
+            tracing::error!(
+                element = %self.valve.factory().map(|f| f.name().to_string()).unwrap_or_default(),
+                "the frame stream's valve has no `drop` property, so it cannot be gated"
+            );
+        }
+    }
+
+    /// Ask the encoder for a keyframe now.
+    pub fn request_keyframe(&self) {
+        if let Some(pad) = self.encoder.static_pad("sink") {
+            // Upstream, on the encoder's sink pad: the event travels to the encoder, which is the
+            // element that can honour it. `all_headers` is what repeats SPS/PPS with it.
+            let event = gst_video::UpstreamForceKeyUnitEvent::builder()
+                .all_headers(true)
+                .build();
+            if !pad.send_event(event) {
+                tracing::debug!("the encoder would not take a keyframe request");
+            }
+        }
+    }
 }
 
 /// Request a source pad from the tee and link it to a branch's sink pad.
@@ -720,6 +1127,9 @@ fn wire_frames(appsink: &gst_app::AppSink, frames: Frames, width: u32, height: u
                     width,
                     height,
                     format: CAPTURE_FORMAT,
+                    // Taken here rather than at delivery: this is the moment the buffer existed,
+                    // and it costs one clock read on a frame someone already asked for.
+                    captured_at: SystemTime::now(),
                     data: map.as_slice().to_vec(),
                 });
 
@@ -849,6 +1259,36 @@ fn watch_bus(pipeline: &gst::Pipeline) {
         );
 }
 
+/// Get `webrtcsink` off an encoder it cannot drive.
+///
+/// **A rank fix, because the choice is made by rank and on macOS it is a tie.** `webrtcsink` picks
+/// among the H.264 encoders by factory rank, and there `vtenc_h264`, `vtenc_h264_hw` and `x264enc`
+/// all register at `primary` — so the winner is registry order rather than a decision. VideoToolbox
+/// winning it is a broken stream and not a slow one: `webrtcsink` reports `Bitrate handling is not
+/// supported yet for vtenc_h264`, the encoder then fails to negotiate, and the discovery pass dies
+/// with `not-negotiated`. Software H.264 at 640x360 costs a fraction of a laptop core.
+///
+/// The board is untouched, deliberately: there the ranks are not a tie — `mpph264enc` registers at
+/// `primary+1` on purpose — and reaching into that would be changing the one arrangement that was
+/// measured.
+#[cfg(target_os = "macos")]
+fn prefer_a_usable_h264_encoder() {
+    use gst::prelude::*;
+
+    for name in ["vtenc_h264", "vtenc_h264_hw"] {
+        if let Some(factory) = gst::ElementFactory::find(name) {
+            factory.set_rank(gst::Rank::NONE);
+            tracing::info!(
+                encoder = name,
+                "demoted below x264enc: webrtcsink cannot set its bitrate"
+            );
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn prefer_a_usable_h264_encoder() {}
+
 fn make(name: &str) -> Result<gst::Element> {
     gst::ElementFactory::make(name)
         .build()
@@ -857,11 +1297,16 @@ fn make(name: &str) -> Result<gst::Element> {
 
 /// The head camera as a `v4l2src`, with the one adjustment this driver needs.
 ///
+/// This function, [`CAPTURE_BUFFERS`]/[`raise_capture_buffers`] and the two sensor-mode helpers
+/// below are the whole of what ties this file to Linux. Everything else here is GStreamer, which
+/// runs wherever it is installed.
+///
 /// `v4l2src` rather than a hand-written V4L2 loop. The case for our own capture was that this
 /// driver drops every third frame, and that raw bytes through `fdsrc` need
 /// `rawvideoparse blocksize=…`, which is silently wrong the moment stride padding appears. Both
 /// belong to the *subprocess* shape: `v4l2src` attaches a `GstVideoMeta` describing the real
 /// layout, and the frame loss has a cause with a small fix — see [`raise_capture_buffers`].
+#[cfg(target_os = "linux")]
 fn camera_source(camera: &Camera, fps: u32) -> Result<gst::Element> {
     pin_sensor_mode(fps)?;
 
@@ -894,6 +1339,102 @@ fn camera_source(camera: &Camera, fps: u32) -> Result<gst::Element> {
     Ok(src)
 }
 
+/// A simulated camera as an `appsrc`, fed by a thread reading frames off a socket.
+///
+/// **`is-live` and `do-timestamp`, both of them.** A camera is live by construction; an `appsrc` is
+/// not, and without saying so the pipeline races ahead of the clock and `webrtcsink` sees a source
+/// that can be pulled faster than real time. And without timestamps every downstream element has to
+/// invent them, which shows up as a stream that plays at the wrong speed rather than as an error.
+///
+/// The reader owns the reconnect: MuJoCo restarts whenever the number of ducks changes, and a
+/// camera that goes away must not take the pipeline with it — the encoder simply has no new frames
+/// until it comes back, which is what a real camera being unplugged looks like too.
+fn sim_source(addr: &str, width: u32, height: u32, fps: u32) -> Result<gst::Element> {
+    use gst_app::prelude::*;
+
+    let caps = gst::Caps::builder("video/x-raw")
+        .field("format", CAPTURE_FORMAT)
+        .field("width", width as i32)
+        .field("height", height as i32)
+        .field("framerate", gst::Fraction::new(fps as i32, 1))
+        .build();
+
+    let src = gst_app::AppSrc::builder()
+        .caps(&caps)
+        .is_live(true)
+        .do_timestamp(true)
+        .format(gst::Format::Time)
+        .build();
+
+    let expected = (width as usize) * (height as usize) * 2;
+    let announce = addr.to_owned();
+    let addr = addr.to_owned();
+    let pushable = src.clone();
+    std::thread::Builder::new()
+        .name("sim-camera".into())
+        .spawn(move || {
+            let mut complained = false;
+            loop {
+                match read_frames(&addr, expected, &pushable) {
+                    // A clean close means it had connected and streamed; clear the flag so the
+                    // *next* failure is logged, as `tofd`'s `sim_loop` and `RemoteIo` both do.
+                    Ok(()) => {
+                        complained = false;
+                        tracing::warn!(%addr, "the simulated camera closed");
+                    }
+                    Err(e) if !complained => {
+                        complained = true;
+                        tracing::warn!(%addr, error = %e, "no simulated camera; retrying");
+                    }
+                    Err(_) => {}
+                }
+                std::thread::sleep(std::time::Duration::from_secs(1));
+            }
+        })
+        .map(|_| ())
+        .unwrap_or_else(
+            |e| tracing::error!(error = %e, "no reader thread for the simulated camera"),
+        );
+
+    tracing::info!(addr = %announce, width, height, fps, "simulated head camera");
+    Ok(src.upcast())
+}
+
+/// Length-prefixed frames from the simulator into an `appsrc`, until it stops or the frames stop.
+fn read_frames(addr: &str, expected: usize, src: &gst_app::AppSrc) -> std::io::Result<()> {
+    use std::io::Read;
+
+    let stream = std::net::TcpStream::connect(addr)?;
+    stream.set_nodelay(true)?;
+    let mut reader = std::io::BufReader::new(stream);
+    let mut header = [0u8; 4];
+    let mut frame = vec![0u8; expected];
+    tracing::info!(%addr, "the simulated camera is feeding the pipeline");
+
+    loop {
+        reader.read_exact(&mut header)?;
+        let len = u32::from_le_bytes(header) as usize;
+        // A frame of the wrong size means the two ends disagree about the geometry, and pushing it
+        // would be a picture nobody can read. Said once, loudly, rather than a stream of noise.
+        if len != expected {
+            return Err(std::io::Error::other(format!(
+                "the simulator sent a {len}-byte frame and this pipeline expects {expected} — the simulator's camera must match `[media] quality`"
+            )));
+        }
+        reader.read_exact(&mut frame)?;
+        let mut buffer = gst::Buffer::with_size(len).map_err(std::io::Error::other)?;
+        buffer
+            .get_mut()
+            .expect("a fresh buffer is writable")
+            .map_writable()
+            .map_err(std::io::Error::other)?
+            .copy_from_slice(&frame);
+        if src.push_buffer(buffer).is_err() {
+            return Ok(()); // the pipeline is gone
+        }
+    }
+}
+
 /// What the tee carries, and what both branches therefore see.
 ///
 /// Single-plane on purpose: `v4l2src` cannot drive rkisp's two-plane `NM12` at full rate, and
@@ -909,6 +1450,7 @@ pub const CAPTURE_FORMAT: &str = "UYVY";
 /// | seconds | 15.2 | 10.3 | 10.3 | 10.3 |
 ///
 /// 19.7 fps against 29.2 from a 30 fps sensor, and `v4l2src` lands on two.
+#[cfg(target_os = "linux")]
 const CAPTURE_BUFFERS: u32 = 4;
 
 /// Get `v4l2src` off two capture buffers, which costs a third of the frames.
@@ -951,6 +1493,7 @@ const CAPTURE_BUFFERS: u32 = 4;
 /// encoder's zero on the way back. A pad probe fires in both directions, so this rewrites pool 0
 /// every time it sees the query and the last word is ours. That is the bug that made three
 /// earlier versions of this function look like they were being ignored.
+#[cfg(target_os = "linux")]
 fn raise_capture_buffers(src: &gst::Element) -> Result<()> {
     let pad = src
         .static_pad("src")
@@ -1020,6 +1563,20 @@ fn raise_capture_buffers(src: &gst::Element) -> Result<()> {
     Ok(())
 }
 
+/// Which sensor mode this process managed to put the camera in, once it has tried.
+///
+/// A `OnceLock` rather than a value threaded up through the pipeline builder, because that is what
+/// it is: one fact about this process's camera, established while the pipeline is built and read
+/// afterwards by whatever answers `media.video`. `None` — never set, or set after a failed switch
+/// — means the geometry is unknown, and `crate::camera` publishes no intrinsics for it.
+static SENSOR_MODE: std::sync::OnceLock<Option<crate::camera::SensorMode>> =
+    std::sync::OnceLock::new();
+
+/// The sensor mode in force, or `None` when there is no camera or the switch did not take.
+pub fn sensor_mode() -> Option<crate::camera::SensorMode> {
+    *SENSOR_MODE.get().unwrap_or(&None)
+}
+
 /// Switch the IMX219 out of its boot mode, which caps capture at 21 fps.
 ///
 /// The sensor boots in 3280x2464 and the rkisp scaler will happily give us 1280x720 from it — at
@@ -1030,6 +1587,7 @@ fn raise_capture_buffers(src: &gst::Element) -> Result<()> {
 /// entity whose name embeds its I2C bus and address (`m00_b_imx219 2-0010`) and therefore has to
 /// be discovered from the topology rather than named. Doing it here rather than in the unit means
 /// a run with `[media] camera` off needs no camera at all.
+#[cfg(target_os = "linux")]
 fn pin_sensor_mode(fps: u32) -> Result<()> {
     let (media, entity) = find_sensor()?;
 
@@ -1046,9 +1604,13 @@ fn pin_sensor_mode(fps: u32) -> Result<()> {
             %media, %entity,
             why = %String::from_utf8_lossy(&output.stderr).trim(),
             "media-ctl would not set the 1920x1080 sensor mode — capture stays in the boot \
-             mode, which caps it at 21 fps"
+             mode, which caps it at 21 fps, and `media.video` publishes no camera intrinsics \
+             because the exact framing is then the boot mode's (same ~62 deg field, different \
+             4:3->16:9 crop) rather than the pinned mode the calibration is for"
         );
+        let _ = SENSOR_MODE.set(None);
     } else {
+        let _ = SENSOR_MODE.set(Some(crate::camera::SensorMode::PINNED));
         tracing::info!(%media, %entity, target_fps = fps, "sensor mode 1920x1080");
     }
     Ok(())
@@ -1063,6 +1625,7 @@ fn pin_sensor_mode(fps: u32) -> Result<()> {
 /// reported "no imx219 entity" for all of them, which sent the first real run chasing the
 /// overlay when the actual cause was `media-ctl` being denied `/dev/media0`. The three cases want
 /// three different fixes and look identical from the outside.
+#[cfg(target_os = "linux")]
 fn find_sensor() -> Result<(String, String)> {
     let mut nodes = 0;
     let mut failures = Vec::new();
@@ -1360,6 +1923,7 @@ fn wire_consumers(
     channels: mpsc::Sender<Channel>,
     runtime: tokio::runtime::Handle,
     consumers: Consumers,
+    relays: Arc<crate::turn::Relays>,
 ) -> Result<()> {
     // Counted here rather than inferred from the log, so `robotctl health` can say whether anyone
     // is actually watching. `consumer-removed` is guarded the same way `consumer-added` is: a
@@ -1400,6 +1964,15 @@ fn wire_consumers(
             .and_then(|v| v.get::<String>().ok())
             .unwrap_or_else(|| "?".into());
 
+        // Before the datachannel, because this is what the *offer* needs and the offer is
+        // generated as soon as this handler returns. §6 of `remote-access-design.md`.
+        let turn_servers = offer_relay_candidates(&webrtcbin, &peer, &relays);
+        // And before the offer too, for the same reason: gathering starts when the offer is
+        // built, so a listener attached after this handler returns can miss the early candidates.
+        count_gathered_candidates(&webrtcbin, &peer, turn_servers, &runtime);
+        // What was gathered is not what was used; this is the other half.
+        watch_ice_connection(&webrtcbin, &peer);
+
         match open_control_channel(&webrtcbin, &peer, &runtime) {
             Ok(channel) => {
                 // A full queue means nobody is accepting sessions, which is a bug rather than
@@ -1413,6 +1986,392 @@ fn wire_consumers(
         None
     });
     Ok(())
+}
+
+/// Add this robot's TURN servers to one consumer's `webrtcbin`, and answer how many it took.
+///
+/// **The count is of servers accepted, not of relay candidates gathered**, and the difference is
+/// the whole reason [`count_gathered_candidates`] exists. This runs before any allocation has been
+/// attempted, so it cannot know whether one will succeed.
+///
+/// **Runs on the thread that builds the offer, and must not block it.** `Relays::uris` reads a
+/// cache and never does I/O for exactly this reason: a fetch here would delay every consumer's
+/// connection, including the LAN ones that will never use a relay. An empty list is the ordinary
+/// state right after boot and on a robot nobody has signed in — host and srflx candidates are
+/// enough for anything on the same network.
+///
+/// Nothing here is fatal. A robot that cannot offer a relay is reachable from most places; one
+/// whose negotiation broke because a credential was malformed is reachable from none.
+fn offer_relay_candidates(
+    webrtcbin: &gst::Element,
+    peer: &str,
+    relays: &Arc<crate::turn::Relays>,
+) -> usize {
+    let uris = relays.uris();
+    if uris.is_empty() {
+        tracing::debug!(peer, "no relay servers held; offering host and srflx only");
+        return 0;
+    }
+    // Checked before it is emitted, for the reason `open_control_channel` checks its own signal:
+    // `emit_by_name` panics when a signal is absent or its signature has changed, and a panic in
+    // a C closure aborts the process instead of unwinding.
+    if glib::subclass::signal::SignalId::lookup("add-turn-server", webrtcbin.type_()).is_none() {
+        tracing::warn!(
+            peer,
+            "webrtcbin has no add-turn-server signal; this consumer gets no relay candidate"
+        );
+        return 0;
+    }
+    let mut added = 0;
+    for uri in uris.iter() {
+        // The return is whether the server was accepted; a rejected URI is worth a line and not
+        // an abandoned session.
+        if webrtcbin.emit_by_name::<bool>("add-turn-server", &[&uri.as_str()]) {
+            added += 1;
+        } else {
+            // The host only. **A TURN URI carries a password**, and a log line is the one place
+            // it must never appear.
+            tracing::warn!(peer, "a relay server was refused by webrtcbin");
+        }
+    }
+    // **Named for what it counted.** It said "offering relay candidates" once, and six sessions
+    // that gathered no relay at all were read as proof the relay path was working.
+    tracing::info!(
+        peer,
+        servers = added,
+        "added TURN servers for this consumer"
+    );
+    added
+}
+
+/// What one consumer's ICE gathering actually produced, by candidate type.
+#[derive(Debug, Default)]
+struct Candidates {
+    host: usize,
+    srflx: usize,
+    prflx: usize,
+    relay: usize,
+    /// A candidate line with no `typ` in it, which is this parser being wrong rather than ICE.
+    unparsed: usize,
+}
+
+impl Candidates {
+    /// Count one `candidate:…` line by the token after `typ`.
+    ///
+    /// Read positionally rather than by index: the prefix differs between stacks — some hand over
+    /// `candidate:1 1 UDP …`, some the bare `1 1 UDP …` — and the extensions after the type are
+    /// open-ended. `typ` is the one fixture in the grammar (RFC 5245 §15.1).
+    fn count(&mut self, candidate: &str) {
+        match candidate
+            .split_whitespace()
+            .skip_while(|token| *token != "typ")
+            .nth(1)
+        {
+            Some("host") => self.host += 1,
+            Some("srflx") => self.srflx += 1,
+            Some("prflx") => self.prflx += 1,
+            Some("relay") => self.relay += 1,
+            _ => self.unparsed += 1,
+        }
+    }
+}
+
+/// How long to wait for gathering to finish before reporting what there is anyway.
+///
+/// **A tally that only lands when gathering completes is no use**, which a first run on a board
+/// proved: `ice-gathering-state` had not reached `Complete` by the time a ten-second session tore
+/// down — five TURN servers is five allocations, and the last relay candidate arrived after the
+/// control channel had already done its work — so the line that was supposed to settle the
+/// question never appeared at all. The failure being diagnosed is a session that dies early, so
+/// the diagnostic cannot be the one thing that needs it to live.
+const CANDIDATE_REPORT_AFTER: Duration = Duration::from_secs(8);
+
+/// Say what this consumer gathered: once, when gathering finishes or the deadline passes.
+///
+/// **`added TURN servers for this consumer` is not evidence that a relay candidate exists**, and
+/// this function is here because that was once read as though it were. That line counts the URIs
+/// `webrtcbin` accepted, inside `consumer-added`, before any allocation has been attempted — so a
+/// robot whose allocation fails every time, for a spent monthly allowance or a transport `libnice`
+/// will not use, logs exactly what a working robot logs. Six sessions on olducky were diagnosed
+/// against that line and `remote-access-design.md` §6 records the conclusion it led to.
+///
+/// So the journal now carries the other half: how many candidates of each type actually came back.
+/// `relay=0` on a robot that added servers is the failure that has no other symptom — ICE simply
+/// finds no pair and the session negotiates perfectly and carries nothing, which is also what a
+/// robot that was never offered a relay looks like.
+///
+/// `complete=false` marks a tally taken at [`CANDIDATE_REPORT_AFTER`] rather than at the end of
+/// gathering; more candidates may still have been coming. It is the ordinary case for a short
+/// session and it is still the answer to "was there a relay in there", which is what this is for.
+///
+/// **A candidate line carries no secret.** The relayed address is not one, and the host and srflx
+/// addresses are in the SDP the peer is about to receive anyway — unlike a TURN *URI*, which
+/// carries a password and is why `offer_relay_candidates` logs no URI at all. So the whole line is
+/// loggable, at debug, where it answers "which relayed address, over which transport".
+fn count_gathered_candidates(
+    webrtcbin: &gst::Element,
+    peer: &str,
+    turn_servers: usize,
+    runtime: &tokio::runtime::Handle,
+) {
+    // Both guarded before use, for the reason every other signal here is: `connect` and
+    // `connect_notify` panic on a name that is absent or has changed, and a panic in a C closure
+    // aborts the process rather than unwinding. An upstream rename should cost the journal a line,
+    // not take the daemon down.
+    if glib::subclass::signal::SignalId::lookup("on-ice-candidate", webrtcbin.type_()).is_none() {
+        tracing::warn!(
+            peer,
+            "webrtcbin has no on-ice-candidate signal; this session's candidate types will not \
+             be in the journal"
+        );
+        return;
+    }
+    if webrtcbin.find_property("ice-gathering-state").is_none() {
+        tracing::warn!(
+            peer,
+            "webrtcbin has no ice-gathering-state property; this session's candidate types will \
+             be reported on the deadline alone"
+        );
+    }
+
+    let tally = Arc::new(Mutex::new(Candidates::default()));
+    // Whoever gets there first reports; the other finds it already said and does nothing.
+    let said = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    let counting = Arc::clone(&tally);
+    let owner = peer.to_owned();
+    webrtcbin.connect("on-ice-candidate", false, move |values| {
+        // (webrtcbin, mline_index, candidate).
+        let candidate = values.get(2).and_then(|value| value.get::<String>().ok())?;
+        // An empty string is how several stacks say "that was the last one"; it is not a candidate
+        // and must not count as one this parser failed to read.
+        if candidate.trim().is_empty() {
+            return None;
+        }
+        tracing::debug!(peer = %owner, %candidate, "gathered an ICE candidate");
+        if let Ok(mut counting) = counting.lock() {
+            counting.count(&candidate);
+        }
+        None
+    });
+
+    if webrtcbin.find_property("ice-gathering-state").is_some() {
+        let (finished, done, owner) = (Arc::clone(&tally), Arc::clone(&said), peer.to_owned());
+        webrtcbin.connect_notify(Some("ice-gathering-state"), move |webrtcbin, _| {
+            let state =
+                webrtcbin.property::<gst_webrtc::WebRTCICEGatheringState>("ice-gathering-state");
+            if state == gst_webrtc::WebRTCICEGatheringState::Complete {
+                report_candidates(&finished, &done, &owner, turn_servers, true);
+            }
+        });
+    }
+
+    // The deadline, on the tokio runtime this daemon already has rather than a GLib timeout: a
+    // consumer that never finishes gathering — or never lives long enough to — still gets a line.
+    let (pending, done, owner) = (tally, said, peer.to_owned());
+    runtime.spawn(async move {
+        tokio::time::sleep(CANDIDATE_REPORT_AFTER).await;
+        report_candidates(&pending, &done, &owner, turn_servers, false);
+    });
+}
+
+/// Follow one consumer's ICE connection state, and say which pair won when it connects.
+///
+/// **The tally above says what was offered; this says what was used**, and the two answer
+/// different questions. A robot can gather nine relay candidates and still fail, and a robot that
+/// gathers them and connects may be connecting *directly* — which is the ordinary, cheap outcome
+/// and also the one that tells you the relay was never exercised. Neither is visible without this.
+///
+/// The pair is read out of `get-stats` rather than guessed at, and the **raw structures are
+/// logged**. That is deliberate rather than lazy: the field names and enum nicks in
+/// `webrtcbin`'s stats are not something this code should assert from memory, and a summary
+/// built on a wrong field name would print confidently and say nothing — which is exactly the
+/// mistake `relays=N` made. One run against a real consumer turns this into a summary; until
+/// then the journal carries what is actually there.
+fn watch_ice_connection(webrtcbin: &gst::Element, peer: &str) {
+    if webrtcbin.find_property("ice-connection-state").is_none() {
+        tracing::warn!(
+            peer,
+            "webrtcbin has no ice-connection-state property; this session's ICE progress and \
+             selected pair will not be in the journal"
+        );
+        return;
+    }
+
+    // Once: `Connected` and `Completed` both arrive, and a flapping session would ask again on
+    // every transition.
+    let asked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let owner = peer.to_owned();
+    webrtcbin.connect_notify(Some("ice-connection-state"), move |webrtcbin, _| {
+        let state =
+            webrtcbin.property::<gst_webrtc::WebRTCICEConnectionState>("ice-connection-state");
+        tracing::info!(peer = %owner, ?state, "ICE connection state");
+
+        use gst_webrtc::WebRTCICEConnectionState as State;
+        if !matches!(state, State::Connected | State::Completed) {
+            return;
+        }
+        use std::sync::atomic::Ordering;
+        if asked
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return;
+        }
+        report_selected_pair(webrtcbin, &owner);
+    });
+}
+
+/// Ask `webrtcbin` for its stats and say which candidate pair carried the session.
+///
+/// Nothing here is fatal and nothing here blocks: `get-stats` is asynchronous through a
+/// `Promise`, its reply is borrowed for the duration of the callback, and a reply that never comes
+/// costs a missing line rather than a stuck consumer.
+///
+/// The shape below was read off a live session rather than assumed, which is the only reason it is
+/// safe to summarise: the `transport` stat names a `selected-candidate-pair-id`, that pair names a
+/// local and a remote candidate id, and each candidate carries `candidate-type`, `address`, `port`
+/// and `protocol`. A relay candidate also carries `url`, the TURN server that allocated it. When
+/// any of that is missing the raw entries go to the journal instead, so a stats change upstream
+/// degrades to what it did before rather than to silence.
+fn report_selected_pair(webrtcbin: &gst::Element, peer: &str) {
+    if glib::subclass::signal::SignalId::lookup("get-stats", webrtcbin.type_()).is_none() {
+        tracing::warn!(
+            peer,
+            "webrtcbin has no get-stats signal; no selected pair to report"
+        );
+        return;
+    }
+    let owner = peer.to_owned();
+    let promise = gst::Promise::with_change_func(move |reply| {
+        let stats = match reply {
+            Ok(Some(stats)) => stats,
+            Ok(None) => {
+                tracing::warn!(peer = %owner, "get-stats answered with nothing");
+                return;
+            }
+            Err(error) => {
+                tracing::warn!(peer = %owner, ?error, "get-stats failed");
+                return;
+            }
+        };
+        if !summarise_selected_pair(stats, &owner) {
+            // The shape has moved. Say everything candidate-shaped, verbatim, which is what this
+            // logged before it knew the field names — and is how they were learned.
+            for (name, value) in stats.iter() {
+                let Ok(nested) = value.get::<gst::Structure>() else {
+                    continue;
+                };
+                let text = nested.to_string();
+                if text.contains("candidate") {
+                    tracing::info!(peer = %owner, stat = %name, entry = %text, "ICE stat");
+                }
+            }
+        }
+    });
+    webrtcbin.emit_by_name::<()>("get-stats", &[&None::<gst::Pad>, &promise]);
+}
+
+/// One candidate, as the selected-pair line names it.
+fn describe_candidate(stats: &gst::StructureRef, id: &str) -> Option<String> {
+    let candidate = stats.get::<gst::Structure>(id).ok()?;
+    let kind = candidate
+        .get::<String>("candidate-type")
+        .unwrap_or_else(|_| "?".to_owned());
+    let address = candidate
+        .get::<String>("address")
+        .unwrap_or_else(|_| "?".to_owned());
+    let port = candidate.get::<u32>("port").unwrap_or_default();
+    let protocol = candidate
+        .get::<String>("protocol")
+        .unwrap_or_else(|_| "?".to_owned());
+    // Only a relay candidate has one, and it names the TURN server that allocated the address —
+    // which is the difference between "relayed" and "relayed through whom".
+    match candidate.get::<String>("url") {
+        Ok(url) if !url.is_empty() && url != "none" => {
+            Some(format!("{kind} {address}:{port}/{protocol} via {url}"))
+        }
+        _ => Some(format!("{kind} {address}:{port}/{protocol}")),
+    }
+}
+
+/// The selected pair as one line, or `false` if the stats did not carry one.
+///
+/// **`local=relay …` is the whole point.** A session that negotiated over a relay and one that
+/// found a direct pair look identical everywhere else in this journal, and they mean opposite
+/// things: the first says the relay path works, the second says it was never exercised.
+fn summarise_selected_pair(stats: &gst::StructureRef, peer: &str) -> bool {
+    // The transport names the pair; there is one per DTLS transport and a session has one.
+    let selected = stats.iter().find_map(|(_, value)| {
+        value
+            .get::<gst::Structure>()
+            .ok()?
+            .get::<String>("selected-candidate-pair-id")
+            .ok()
+    });
+    let Some(selected) = selected else {
+        return false;
+    };
+    let Ok(pair) = stats.get::<gst::Structure>(selected.as_str()) else {
+        return false;
+    };
+    let (Ok(local), Ok(remote)) = (
+        pair.get::<String>("local-candidate-id"),
+        pair.get::<String>("remote-candidate-id"),
+    ) else {
+        return false;
+    };
+    let (Some(local), Some(remote)) = (
+        describe_candidate(stats, &local),
+        describe_candidate(stats, &remote),
+    ) else {
+        return false;
+    };
+    tracing::info!(peer, %local, %remote, "selected candidate pair");
+    true
+}
+
+/// Log one consumer's tally, the first time anybody asks.
+fn report_candidates(
+    tally: &Mutex<Candidates>,
+    said: &std::sync::atomic::AtomicBool,
+    peer: &str,
+    turn_servers: usize,
+    complete: bool,
+) {
+    use std::sync::atomic::Ordering;
+    if said
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return;
+    }
+    let Ok(tally) = tally.lock() else {
+        return;
+    };
+    tracing::info!(
+        peer,
+        host = tally.host,
+        srflx = tally.srflx,
+        prflx = tally.prflx,
+        relay = tally.relay,
+        unparsed = tally.unparsed,
+        complete,
+        "gathered ICE candidates"
+    );
+    // The one combination that is silent otherwise, and the one worth waking up for: the
+    // credentials were there, `webrtcbin` took them, and the allocation still produced nothing.
+    // A consumer that needs a relay has no path, and every other line looks healthy.
+    if turn_servers > 0 && tally.relay == 0 {
+        tracing::warn!(
+            peer,
+            servers = turn_servers,
+            complete,
+            "TURN servers were added and no relay candidate came back, so a consumer that cannot \
+             reach this robot directly has no path to it; the allocation failed rather than the \
+             credentials being missing"
+        );
+    }
 }
 
 /// Create the `control` datachannel on one peer's `webrtcbin` and bridge it to channels.
@@ -1489,12 +2448,122 @@ fn open_control_channel(
 mod tests {
     use super::*;
 
+    /// **A reader gets a frame out of the real pipeline.** The rendezvous tests below stand in
+    /// for the appsink; this one runs the appsink, on the test pattern, with every branch the
+    /// robot has — because the bug this guards was between branches. The valved H.264 sink
+    /// prerolled nothing, so the bin never finished going to PLAYING, and the raw appsink sat in
+    /// preroll holding its first buffer for ever: `starved=20` on every detector report and no
+    /// `metering` line from auto-exposure, on a robot whose console video was fine.
+    ///
+    /// Skipped, and loudly, where the plugins are not installed: CI has GStreamer's base and bad
+    /// sets but neither `webrtcsink` nor an H.264 encoder, and a test that fails for want of a
+    /// plugin says nothing about the pipeline. A machine set up to run `mediad` has them.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reader_gets_a_frame_from_the_running_pipeline() {
+        gst::init().expect("gstreamer");
+        let missing: Vec<&str> = ["videotestsrc", "webrtcsink", "valve", "h264parse"]
+            .into_iter()
+            .filter(|name| gst::ElementFactory::find(name).is_none())
+            .collect();
+        let no_encoder = ["mpph264enc", "x264enc"]
+            .iter()
+            .all(|name| gst::ElementFactory::find(name).is_none());
+        if !missing.is_empty() || no_encoder {
+            eprintln!("skipping: no {missing:?} / no H.264 encoder on this machine");
+            return;
+        }
+
+        let producer = crate::producer::Producer::local(duck_ipc_proto::build_info!());
+        let settings = Settings {
+            host: "127.0.0.1".into(),
+            // Not 8443, so a `mediad` already running on this machine is left alone.
+            port: 18_443,
+            bitrate: 500_000,
+            congestion_control: robotd_params::CongestionControl::default(),
+            width: 320,
+            height: 240,
+            fps: 15,
+            rotation: Rotation::None,
+        };
+        let (pipeline, _channels, frames, _stream) = start(
+            Source::Test,
+            &producer,
+            &settings,
+            crate::turn::Relays::empty(),
+        )
+        .expect("the pipeline starts on the test pattern");
+
+        // Several asks, because the first can legitimately land before the source has produced
+        // anything; what must not happen is every one of them timing out.
+        let frame = tokio::task::spawn_blocking(move || (0..10).find_map(|_| frames.next_frame()))
+            .await
+            .expect("the reader thread");
+        let _ = pipeline.set_state(gst::State::Null);
+
+        let frame = frame.expect("a frame within five seconds; the raw branch is starved");
+        assert_eq!((frame.width, frame.height), (320, 240));
+        assert_eq!(frame.format, CAPTURE_FORMAT);
+        assert_eq!(frame.data.len(), 320 * 240 * 2, "packed UYVY");
+    }
+
+    /// The four types ICE defines, in the shape `webrtcbin` hands them over.
+    ///
+    /// Real lines, because the fields after the type are what a naive index-based parser trips on:
+    /// an srflx and a relay both carry `raddr`/`rport` after `typ`, and a TCP candidate carries a
+    /// `tcptype` that a fixed offset would read as the type.
+    #[test]
+    fn every_candidate_type_is_counted_as_itself() {
+        let mut tally = Candidates::default();
+        for line in [
+            "candidate:1 1 UDP 2015363327 192.168.10.116 47078 typ host",
+            "candidate:3 1 TCP 1518149375 192.168.10.116 9 typ host tcptype active",
+            "candidate:2 1 UDP 1677729535 45.80.22.227 47078 typ srflx raddr 192.168.10.116 \
+             rport 47078",
+            "candidate:4 1 UDP 92216575 141.101.90.1 60000 typ relay raddr 45.80.22.227 \
+             rport 47078",
+            "candidate:5 1 UDP 1845501695 10.0.0.9 51000 typ prflx",
+        ] {
+            tally.count(line);
+        }
+
+        assert_eq!(
+            (tally.host, tally.srflx, tally.prflx, tally.relay),
+            (2, 1, 1, 1)
+        );
+        assert_eq!(tally.unparsed, 0, "every line above has a `typ`");
+    }
+
+    /// Some stacks hand over the bare attribute and some keep the `candidate:` prefix, and the
+    /// type is read by position relative to `typ` rather than to the start of the line.
+    #[test]
+    fn the_prefix_is_not_what_locates_the_type() {
+        let mut tally = Candidates::default();
+        tally.count("candidate:1 1 UDP 2015363327 192.168.10.116 47078 typ relay");
+        tally.count("1 1 UDP 2015363327 192.168.10.116 47078 typ relay");
+        assert_eq!(tally.relay, 2);
+    }
+
+    /// **A line this parser cannot read is counted apart from the types**, so a grammar change
+    /// upstream shows up as `unparsed=N` rather than as a robot that gathered nothing.
+    #[test]
+    fn a_line_without_a_type_is_counted_as_unparsed_and_not_as_absent() {
+        let mut tally = Candidates::default();
+        tally.count("candidate:1 1 UDP 2015363327 192.168.10.116 47078");
+        tally.count("typ");
+        assert_eq!(tally.unparsed, 2, "a trailing `typ` names nothing either");
+        assert_eq!(
+            (tally.host, tally.srflx, tally.prflx, tally.relay),
+            (0, 0, 0, 0)
+        );
+    }
+
     /// A frame whose every byte is `tag`, so a test can say *which* capture came back.
     fn frame(tag: u8) -> Frame {
         Frame {
             width: 4,
             height: 2,
             format: CAPTURE_FORMAT,
+            captured_at: SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(tag as u64),
             data: vec![tag; 16],
         }
     }

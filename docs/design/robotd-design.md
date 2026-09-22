@@ -43,24 +43,41 @@ the hardware does: the v2 board sits on the Dynamixel bus and serves an on-chip 
 quaternion out of the same register block the servos answer at. One board, one code path, no
 IMU abstraction. It is listed first in the id vector so it answers before the servo burst.
 
-**One owner at a time, and nothing hard-enforces it.** `serialport` sets `TIOCEXCL`, which
+**One owner at a time; tty exclusivity alone does not enforce it.** `serialport` sets `TIOCEXCL`, which
 turns a second *unprivileged* open into `EBUSY` — but `robotd.service` runs as root, because
-motor control needs the character devices, and root is not stopped by that flag. So the
-exclusion is arranged rather than enforced, and each other claimant is kept off the port
-deliberately:
+motor control needs the character devices, and root is not stopped by that flag. The daemon
+and standalone `init` therefore share an advisory lock, and other claimants are kept off the
+port separately:
 
 - **The control loop** owns it for as long as the daemon runs.
-- **`robotd init`** opens the port itself, and as root it will succeed *while the daemon is
-  running* — two writers interleaving packets on one bus, which reads as a hardware fault. So
-  it wants the daemon stopped, and that is exactly why `robot.init` and `robot.relax` exist as
-  IPC methods (§3.3): the daemon serves both from inside the loop, so nothing else has to open
-  the bus at all. `init` is the escape hatch for a robot whose daemon is not running.
+- **`robotd init`** opens the port itself, but must first take the daemon's endpoint lock.
+  It holds that lock through the entire ramp: a running daemon refuses `init`, and an `init`
+  already moving the robot refuses a daemon startup or another `init`. `robot.init` and
+  `robot.relax` remain the IPC methods (§3.3) for a running daemon; standalone `init` is the
+  escape hatch for a robot whose daemon is not running.
 - **`serial-getty@ttyS2`** — Armbian runs a login console on UART2 by default, and an `agetty`
   holding the port makes every servo invisible to everything else. `scripts/setup-board.sh`
   masks the unit; `fuser -v /dev/ttyS2` naming `agetty` is how that was found, and it is still
   the command that answers "who has the bus".
 - **The runtime**, at a coarser grain: it drives the same bus, so a board runs the runtime or
   `robotd` and never both, and the units say so with `Conflicts=` (§5.2).
+
+**Socket ownership.** Both entry points acquire `<socket>.lock` (normally
+`/run/robotd.sock.lock`) before publishing `/run/robotd/identity.json` or opening the bus.
+The daemon also binds its listener before starting the control thread, and keeps the lock
+through control-thread shutdown and socket cleanup. A refused duplicate must not overwrite
+the owner's PID and build: `robotctl health` and updater startup checks read that identity.
+For a listener left by an older daemon without a lock, the daemon's bind path removes only
+an actual socket that refuses a bounded connection probe; live listeners and ambiguous paths
+are preserved. Standalone `init` only locks and never binds or cleans up the socket.
+
+**Never unlink the lock file, even at shutdown.** The kernel releases the advisory lock when
+its file is closed or the process exits, including `SIGKILL`; the file itself stays in place.
+Deleting and recreating it could leave contenders locking two different inodes under the same
+name. File existence does not mean the lock is held. The lock is per `--socket`, so callers
+using the same physical bus must use the same socket setting; separate endpoints remain useful
+for independent fake daemons. Older binaries and other tools do not participate in this lock
+and must still be stopped before standalone `init` takes over the bus.
 
 ### 1.2 Who talks to `robotd`
 
@@ -131,19 +148,19 @@ targets and none of them can send one. That is the borrow checker, not a convent
 transactions per tick, plus a third once a second:
 
 ```text
-read()          one sync_read  · IMU board + 15 servos · registers 124–136   (§2.1)
+read()          one fast sync_read · IMU board + 15 servos · regs 124–136   (§2.1)
 decide          observation → policy → targets → clamp                 (§2.2–§2.4)
-write()         one sync_write · goal positions
+write()         one sync_write     · goal positions
 publish         atomics always; a state frame only if someone subscribed     (§4.1)
 
-every 1 s       slow_sensors() · registers 144–146 · voltage + temperature   (§2.1)
+every 1 s       slow_sensors()     · registers 144–146 · voltage + temperature (§2.1)
 ```
 
 Where the data goes, once per period:
 
 ```text
   Dynamixel bus
-       │  one sync_read: IMU board + 15 servos, one transaction
+       │  one fast sync_read: IMU board + 15 servos, one transaction
        ▼
    Sensors ──────────┬──────────────────────► safety.observe ──► fallen? (debounced)
    joints, IMU       │
@@ -243,7 +260,7 @@ intended:
 
 ### 2.1 The bus layer and `RobotIo`
 
-A thin layer over `rustypot`: open, one combined `sync_read`, `sync_write` goal positions,
+A thin layer over `rustypot`: open, one combined fast `sync_read`, `sync_write` goal positions,
 torque enable, gains, the slow sensor read, and the startup register check. Written fresh
 rather than lifted, but **the numbers are borrowed from the runtime**, each with a comment
 saying so:
@@ -256,6 +273,15 @@ saying so:
   swapped in arrives at 250, so the check is what removes a whole class of "why is it slow on
   this robot". `shutdown = 52` is the error mask that latches on overload, overheating and
   input-voltage faults.
+- **A swapped-in servo is adopted, not configured by hand.** A new XL330 answers as ID 1 at
+  57 600 baud, and neither is used on this bus. So before the register check, `open_bus` pings
+  the fifteen expected IDs; if *exactly one* is silent, it looks for ID 1 — first at 1 Mbps,
+  then by reopening the port at 57 600 — writes it the missing ID and then the bus's baud rate,
+  reopens at 1 Mbps, runs the same register check on it, and reboots it. The reboot is what
+  clears the hardware-error alert the flash leaves set, which would otherwise hold torque off
+  until someone pulled the battery. A complete bus pays fifteen pings for this and nothing
+  else — the 57 600 probe never runs unless a servo is missing. Two missing servos are left
+  alone: there is no telling which one a fresh servo replaces, and the journal says so.
 - The position P gain is written with I and D at **zero**, the runtime's `--ki`/`--kd`
   defaults. These are RAM registers, so a power cycle restores the servo's factory values, and
   the factory D is not zero: left in place it damps the servo's internal PID and the robot runs
@@ -280,6 +306,35 @@ A silent servo does not produce a short answer: `rustypot`'s `sync_read` waits f
 fails the whole transaction if one does not reply. So both reads are all-or-nothing, and the
 caller keeps its previous sample rather than treating one miss as news.
 
+**Every sync read is a fast sync read** (protocol 2.0 instruction 0x8A), enabled once on the
+controller so the tick's combined read, the slow read and the startup position read all use it
+without naming it. The instruction packet is a plain sync read's; what changes is the answer.
+Instead of sixteen status packets, each with its ten-byte protocol 2.0 header and each preceded
+by that device's turnaround, the devices append their blocks to **one** status packet from the
+broadcast id. The bus turns around once per tick rather than sixteen times, which is the same
+cost `return_delay_time = 0` above exists to hold down — the register check still matters,
+because every other transaction on this bus is an ordinary one that pays it per device.
+
+It is the same all-or-nothing shape, for a new reason: the blocks arrive in one packet, so a
+device whose firmware does not implement 0x8A simply does not answer and the read times out
+rather than coming back short. **XL330 firmware must be v46 or newer**, and the `imu_to_dxl`
+board — `id 200`, the first block in the tick's read — has to implement it too.
+
+That is firmware, not software, and it is the one thing on this bus the daemon cannot talk its
+way out of — so it is `bus.fast_sync_read`, **on by default**, rather than a constant. Off, every
+sync read is a plain one and the robot behaves exactly as it did before the instruction was used
+at all; `open_bus` says so once in the journal, because otherwise a robot running the slow path
+is indistinguishable from a slow robot.
+
+The default is the brave one because getting it wrong is unambiguous rather than subtle. A device
+that does not implement 0x8A does not answer at all, so *every* read times out — not some of them
+returning something plausible. The loop reports bus drops from its first tick, `min_achieved_hz`
+(§3.4) sees an unhealthy robot, and a release that turned this on against firmware that cannot do
+it rolls itself back. A robot that predates the firmware needs one key set, once, by whoever
+notices; there is no version negotiation here and no probe at startup, because a device that does
+not answer looks exactly like one that is unpowered and a probe would have to tell those apart
+before it could say anything useful.
+
 **Board temperature is a third source, and not on the bus at all.** The hottest of the SoC's
 thermal zones, read from `sysfs` in the same once-a-second sample (`robotd/src/soc.rs`). It
 lives in `robotd` rather than `duck-control` because it is a property of the Linux board, not
@@ -288,6 +343,20 @@ precisely when it earns its place: a board cooking behind a blocked vent and a r
 servos are the same symptom until you can see both numbers. The maximum across zones rather
 than one zone by name, so a board that wires its sensors differently cannot silently omit the
 one that was climbing.
+
+**And what the heat is costing, which the temperature does not say.** The same sample reads the
+clock ceiling — `scaling_max_freq` against `cpuinfo_max_freq` — and the cpufreq cooling device's
+state. A Radxa Zero 3 at 95 °C is not merely warm: the thermal governor has already pinned it to
+408 MHz of 1800, under a quarter of the CPU the gaits were tuned on, and a duck walking badly on
+a hot board is walking badly *because of that*. The temperature alone reads as a robot somebody
+should keep an eye on; the pair says the robot is already impaired.
+
+Both readings, because either alone is half an answer. The cooling state names heat as the cause
+but is an index into a frequency table, so "6 of 6" says nothing about what was lost; the ceiling
+is what was lost but can also be a userspace policy. The worst cluster and the deepest cpufreq
+cooler win, for the same reason the hottest zone does — a big.LITTLE board throttles its big
+cores first, and reporting `policy0` there would show a board running freely while the cores the
+loop is on are halved.
 
 **IMU staleness is tracked, permanently.** "The read succeeded but the board handed back the
 same sample" feeds dead orientation to the policy, is invisible unless someone counts it, and
@@ -474,7 +543,8 @@ a robot lying on its side, and the wrong one for softening a landing: gravity pa
 `fall_gravity_z` held for 200 ms *is* the robot on the floor, and the window worth acting in
 has closed by then.
 
-So `limp_fall` (on by default since it was validated on a robot) runs a second, separate
+So `limp_fall` (off by default: the default velstand gait loads no standing network to hand
+back to) runs a second, separate
 detector — `duck_control::fall` — on the rate rather than the position. Projected gravity
 rotates with the trunk, so `ġ = −ω × g` is exact and comes straight from the gyro in the same
 12-byte IMU block; extrapolating it over ~0.3 s says where gravity is heading. It fires when
@@ -670,7 +740,7 @@ robot.
 
 | method | answer |
 |---|---|
-| `robot.health` | **the loop is meeting its deadline** — from achieved rate and missed-deadline count — plus a description of the robot the verdict never consults: loop, bus, IMU, battery, servo and board temperature |
+| `robot.health` | **the loop is meeting its deadline** — from achieved rate and missed-deadline count — plus a description of the robot the verdict never consults: loop, bus, IMU, battery, servo and board temperature, and the board's clock ceiling |
 | `robot.safeToRestart` | false while the policy is enabled and the robot is moving |
 | `robot.modelApi` | constant |
 | `robot.remoteSessionActive` | `false` — `mediad` owns the real answer |
@@ -685,10 +755,13 @@ distinction real is why the control loop was built before anything that walks (�
 **What may and may not reach the verdict.** `healthy` and `degraded` are the update system's
 inputs, so only conditions a *release* can be blamed for may set them — that is what `degraded`
 already exists to enforce for an unpowered bench board. Everything else on the answer is a
-**description**, and no automatic decision may read it: battery, motor temperature, and the
-loop/bus/IMU counters. Gating on the battery would mean a robot updated on a low pack rolls the
-release back, then judges its replacement on the same low pack, and cannot be updated at all until
-someone works out why. Motor temperature would do the same on a hot afternoon.
+**description**, and no automatic decision may read it: battery, motor and board temperature, the
+clock ceiling, and the loop/bus/IMU counters. Gating on the battery would mean a robot updated on
+a low pack rolls the release back, then judges its replacement on the same low pack, and cannot be
+updated at all until someone works out why. Motor temperature would do the same on a hot
+afternoon, and a throttled clock on a robot that had got warm once — which is the strongest case
+of the three, since the release that would fix the heat is the one the gate would refuse to
+keep.
 
 **Why they travel together anyway.** One method, because the question arrives once: a robot
 behaving oddly gets asked "what is going on", and a verdict without the numbers behind it just
@@ -751,9 +824,19 @@ single last-writer slot would lose.
 
 ### 4.2 Params
 
-A TOML file read at startup, **not watched** — live reload comes later. It lives outside
+A TOML file read at startup and, for the most part, **not watched**. It lives outside
 `releases/<ver>/` so it survives update *and* rollback, next to the updater's own config at
 `/etc/robot/robotd.toml`.
+
+Two parts of it are watched, and both are exceptions earned by what a restart would cost rather
+than steps towards watching the whole file. `padd` stats the file once a second and re-reads
+`[pad]` and `[pad_imu_head_control]` when the mtime moves: a binding is changed from a phone, and restarting
+`padd` to apply it would drop the pad session and let `robotd`'s deadman zero a walking robot.
+`robotd` re-reads `[policy]` — all of it but `mode` and `enabled` — when asked to, which is how
+`robotctl policy add` lands a skill without taking motor control away from a standing robot.
+Re-reading `[safety]` or `[control]` under a running loop is a different and much larger promise,
+and it is still not made. `robotctl configure` knows which of the three answers a key wants, and
+a key that says nothing fails a test in `robotctl`.
 
 Belonging to the board rather than the release is what makes a hand-edited policy path stick: the
 defaults point inside `releases/<ver>/`, so an ordinary update keeps a policy alongside the
@@ -819,8 +902,8 @@ intents the loop already arbitrates.
 | `chorale.rs` | several ducks singing one piece: the lowest id conducts, the conductor owns the seating, `btd` carries the beacons and does no thinking | the module header |
 | `pet-detect/` | a ~20 KB CNN over a 40-band log-mel window from the onboard mic, in its own worker | the crate header |
 
-Plus `soc.rs`, which reads the board's own thermal zones out of `sysfs` — not behind `RobotIo`,
-because it has to keep answering when the motor bus does not.
+Plus `soc.rs`, which reads the board's own thermal zones and clock ceiling out of `sysfs` — not
+behind `RobotIo`, because it has to keep answering when the motor bus does not.
 
 **None of them has a design page, and that is the rule working rather than a gap.** A service earns
 one when a second reader would otherwise have to derive its contract from the code
@@ -959,3 +1042,24 @@ path map now does. §4.4.
    has to reach the board, so prefer pure-Rust crates on that path. *Unverified on macOS:* the
    cross-build needs an aarch64 sysroot, which a Mac cannot provide, so `cargo board --bins` fails
    locally there — build the shipped set with `-p updater -p robotd -p robotctl`, or build on Linux.
+
+## Mapping telemetry (API v24)
+
+A mapper on the far end of the video — a laptop today, a server later — needs three things from
+the robot that `robot.state` did not carry: a clock shared with `tof.frame`, the IMU beyond its
+projected gravity, and where the camera and the ToF sensor are. All three are additive.
+
+- **`t_ns`** on `robot.state` and `tof.frame` is `CLOCK_MONOTONIC` in nanoseconds (`proto::clock`).
+  `t` and `at_us` stay: they are each daemon's own elapsed time, and a reader that only has one
+  stream still wants a number that starts at zero. `mediad`'s `media.video` answer reads
+  `mono_ns` and `real_ns` at one instant, so RTP timestamps — which RTCP sender reports state in
+  wall-clock — can be put on the same axis.
+- **`imu: {gyro, quat}`** is `ImuData` as the loop read it: the trunk IMU, 50 Hz, nothing above
+  it (`docs/design/robotd-design.md` §IMU). The head IMU on the prototype HAT is not read by
+  anything yet; when it is, it streams beside `tof.frame`, not here.
+- **`frames: {camera, tof}`** are trunk-frame poses at this tick's *measured* head joints from
+  `kinematics::head::HeadFk` — the same FK `robot.look` solves against — and **`robot.model`**
+  answers the static geometry (trunk height, joint order, ToF beam directions, the poses at head
+  zero). The kinematics stay in one crate; a client asks rather than transcribes.
+
+Cost: three small structs per published tick, only while someone is subscribed; the FK is ~50 ns.

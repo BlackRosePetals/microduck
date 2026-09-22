@@ -11,7 +11,7 @@ use configd::net::{FakeNet, Net};
 use configd::pad::{FakePads, Pads};
 use configd::power;
 use configd::store::Store;
-use configd::{pad, units};
+use configd::{logs, pad, units};
 use duck_ipc_proto as proto;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
@@ -72,6 +72,25 @@ struct Args {
     /// between them.
     #[arg(long)]
     fake_pads: bool,
+
+    /// This robot is a duck in MuJoCo. The value is the serial it answers with.
+    ///
+    /// **A simulated robot needs an identity for the same reasons a real one does**, and it has
+    /// nowhere to read one from: there is no SoC and no devicetree, `/etc/machine-id` is one value
+    /// per machine so four ducks in one scene would share it, and macOS has none at all. So the
+    /// simulator names them, one per duck and stable across restarts: `sim-duck-a`.
+    ///
+    /// That identity is load-bearing twice. The robot's default name derives from it, so a duck in
+    /// the twin is called `duck-3f9c` as a robot is rather than falling back to the laptop's
+    /// hostname. And it is what `mediad` registers with the rendezvous as `hardware_id`, the key
+    /// the service evicts an older producer of the same robot on — so a restarted sim duck replaces
+    /// itself in the listing instead of appearing twice (`remote-access-design.md` §3.7).
+    ///
+    /// One flag rather than a `--simulated` beside a `--serial`, because those two can disagree: a
+    /// real robot handed a serial override is a robot lying about which one it is, and there is no
+    /// reason to build the switch that allows it.
+    #[arg(long, value_name = "SERIAL")]
+    simulated: Option<String>,
 }
 
 /// Who may change this robot's configuration.
@@ -159,6 +178,8 @@ struct Service {
     /// Read once at startup rather than per call: it comes from the SoC's fuses by way of the
     /// bootloader, so it cannot change while this process is running.
     serial: Option<String>,
+    /// Whether that serial names a duck in MuJoCo. See [`Args::simulated`].
+    simulated: bool,
 }
 
 fn hostname() -> String {
@@ -210,7 +231,11 @@ async fn main() -> ExitCode {
 
     // The identity, and the name that hangs off it. A board with no readable serial keeps the old
     // behaviour — the hostname — rather than losing its name over a missing devicetree property.
-    let serial = configd::identity::serial();
+    // A simulated duck's serial comes from the flag rather than the devicetree, and everything
+    // downstream — the derived name, `system.info`, what `mediad` registers with — cannot tell the
+    // difference. Which is the point of putting it here rather than teaching each of them.
+    let simulated = args.simulated.is_some();
+    let serial = args.simulated.clone().or_else(configd::identity::serial);
     let default_name = match &serial {
         Some(serial) => configd::identity::default_name(serial),
         None => {
@@ -223,13 +248,14 @@ async fn main() -> ExitCode {
             name
         }
     };
-    tracing::info!(serial = ?serial, %default_name, "identity");
+    tracing::info!(serial = ?serial, %default_name, simulated, "identity");
 
     let service = Arc::new(Service {
         net,
         pads,
         store: Store::new(args.state_dir.join("config.json"), default_name),
         serial,
+        simulated,
         policy: PeerPolicy {
             owner_uid: unsafe { libc::getuid() },
             allow_uids: args
@@ -445,11 +471,33 @@ async fn dispatch(
         // exactly the person diagnosing a robot.
         proto::Call::SystemServices => proto::Response::ok(Some(id), &units::all().await),
 
+        // Read-only, and not gated behind `may_mutate` for the same reason as the line above: the
+        // person who needs a daemon's last words is the person diagnosing a robot, and needing
+        // privilege to read them would put them out of that person's reach.
+        //
+        // The unit is resolved against a fixed list *before* it reaches `journalctl`, which is
+        // what makes this safe to route over BLE — see `logs` for the boundary and `btd::route`
+        // for the decision to route it.
+        proto::Call::SystemLogs(params) => match logs::resolve(&params.unit) {
+            None => proto::Response::err(Some(id), logs::refusal(&params.unit)),
+            Some(unit) => match logs::read(unit, params.lines, params.boot).await {
+                Ok(result) => proto::Response::ok(Some(id), &result),
+                // INTERNAL rather than INVALID_PARAMS: the request was well-formed and something
+                // on the board could not answer it. The one exception a caller will actually meet
+                // — a boot that is not in the journal — carries journalctl's own wording.
+                Err(e) => proto::Response::err(
+                    Some(id),
+                    proto::Error::new(proto::code::INTERNAL_ERROR, e),
+                ),
+            },
+        },
+
         proto::Call::SystemInfo => proto::Response::ok(
             Some(id),
             &proto::SystemInfoResult {
                 name: service.store.name(),
                 serial: service.serial.clone(),
+                simulated: service.simulated,
                 uptime_seconds: uptime_seconds(),
             },
         ),

@@ -31,7 +31,7 @@ use ratatui::widgets::{
     Block, Cell, Paragraph, RenderDirection, Row, Sparkline, Table, TableState,
 };
 
-use crate::{Client, Failure, duck, exit, path_map};
+use crate::{Client, Failure, camera, duck, exit, frame, imu_view, path_map};
 
 /// Tracking error at the edge of a deviation bar, radians.
 ///
@@ -72,6 +72,21 @@ const SUBSCRIBE_ID: u64 = 1;
 /// deliberate act, and everything below moving then is what the reader asked for.
 const PAD_HEIGHT: u16 = 8;
 
+/// Rows the pad block grows by while the pad has an IMU: two borders and ten rows of a
+/// wireframe pad tilting with the real one, beside the numbers. Ten because the picture is drawn
+/// two pixels a row and a pad needs about twenty to read as one.
+///
+/// Only while one is attached. An Xbox pad has none and its block is exactly what it was; the
+/// Pro Controller clones have one and the block opens up the moment `padd` finds it — which is the
+/// right moment for the reader to learn the pad can do that at all.
+const IMU_HEIGHT: u16 = 12;
+
+/// How often IMU samples alone may repaint the frame.
+///
+/// The clone sends six hundred a second, and a terminal redrawn at that rate is a terminal doing
+/// nothing else. Thirty a second is smooth to the eye and leaves the CPU for the filter.
+const IMU_REPAINT: Duration = Duration::from_millis(33);
+
 /// Rows the ToF block occupies while it is open: two borders and the eight rows
 /// of an 8×8 frame.
 ///
@@ -80,6 +95,29 @@ const PAD_HEIGHT: u16 = 8;
 /// reason, like the pad block, and everything below it moves only when the reader
 /// asks for it with `t`.
 const TOF_HEIGHT: u16 = 10;
+
+/// Rows the camera block occupies while it is open: two borders and fourteen rows of picture.
+///
+/// Sixteen rows is a lot, and it buys a picture 28 pixels tall — which, after the quarter turn
+/// this camera is mounted at, is 16 wide. That is small, and it is enough for what the block is
+/// for: where the head is pointing, whether the room is lit, whether the lens is covered. Fewer
+/// rows and it stops answering those; more and it is the whole terminal.
+///
+/// Fixed, like the pad and ToF blocks and for the same reason — but only while open, and opening
+/// it is a deliberate act.
+const CAMERA_HEIGHT: u16 = 16;
+
+/// Between frames while the camera block is open.
+///
+/// Twice a second, deliberately, and not the camera's 30: every request makes `mediad` copy 1.84
+/// MiB off the capture branch that it would otherwise drop unread, and a picture of a room does
+/// not change faster than a person can look at it.
+const CAMERA_PERIOD: Duration = Duration::from_millis(500);
+
+/// Before asking again after a failed request — a stopped `mediad`, or a camera that did not
+/// produce a frame in time. Long enough that a duck with no camera is not answering a connect
+/// twice a second for as long as the block is open.
+const CAMERA_RETRY: Duration = Duration::from_secs(2);
 
 /// Rows of axis cells the pad block draws.
 ///
@@ -256,6 +294,13 @@ enum Update {
     /// [`Self::PadLost`] is not: it is a third daemon on a third socket, and most
     /// ducks have no ToF fitted at all.
     TofLost(String),
+    /// One frame off `mediad`'s local snapshot endpoint, asked for because the camera block is
+    /// open. Nothing arrives while it is closed — see [`read_camera`].
+    Camera(Box<camera::Shot>),
+    /// Why there is no picture. Not fatal, for the reason [`Self::TofLost`] is not: it is a
+    /// connection of its own to a daemon the state stream does not come from, and a duck whose
+    /// `mediad` is stopped is still a duck worth watching.
+    CameraLost(String),
     /// One answer to `robot.health` — the battery, the temperatures, the bus counters and the
     /// IMU's staleness, none of which is on the state stream.
     Health(Box<proto::HealthResult>),
@@ -273,6 +318,7 @@ pub fn run(
     robot_socket: &Path,
     pad_socket: &Path,
     tof_socket: &Path,
+    media_socket: &Path,
     hz: u32,
     json: bool,
 ) -> Result<(), Failure> {
@@ -312,6 +358,7 @@ pub fn run(
 
     let (tx, rx) = mpsc::channel();
     let pad_tx = tx.clone();
+    let camera_tx = tx.clone();
     let tx_for_tof = tx.clone();
     let health_tx = tx.clone();
     let pad_socket = pad_socket.to_path_buf();
@@ -348,8 +395,10 @@ pub fn run(
     let health_socket = robot_socket.to_path_buf();
     thread::spawn(move || poll_health(&health_socket, &health_tx));
 
+    // The camera has no reader thread yet, and deliberately: `media.frame` is a *request*, and one
+    // is only made while the block is open. `live` owns the toggle, so it owns the thread.
     let mut terminal = ratatui::init();
-    let outcome = live(&mut terminal, &rx, hz, no_robot);
+    let outcome = live(&mut terminal, &rx, camera_tx, hz, no_robot, media_socket);
     ratatui::restore();
     outcome
 }
@@ -584,6 +633,53 @@ fn subscribe_to_tof(socket: &Path, tx: &mpsc::Sender<Update>) -> Result<(), Stri
     }
 }
 
+/// Ask `mediad` for a picture, twice a second, and only while the camera block is open.
+///
+/// **The only reader here that has to be told to read.** The pad tap and the depth stream are
+/// subscriptions: they cost the daemon at the other end nothing extra while nobody is looking,
+/// so they run whether or not their block is open. `media.frame` is a request, and answering one
+/// makes `mediad` copy 1.84 MiB off the capture branch it would otherwise drop unread — so this
+/// thread parks on `asked_for` until the reader presses `c`, and parks again when they press it
+/// twice.
+///
+/// Every failure is a sentence for the block rather than an error for the process, exactly as the
+/// pad and ToF readers treat theirs: most ducks run a camera, and none of them stop being worth
+/// watching because `mediad` is being restarted.
+fn read_camera(socket: &Path, tx: &mpsc::Sender<Update>, asked_for: &Receiver<bool>) {
+    let mut open = false;
+    loop {
+        if !open {
+            match asked_for.recv() {
+                Ok(next) => open = next,
+                Err(_) => return, // the UI is gone
+            }
+            continue;
+        }
+        let asked = Instant::now();
+        let (update, again) = match frame::fetch(socket) {
+            Ok((header, data)) => (
+                Update::Camera(Box::new(camera::Shot {
+                    header,
+                    data,
+                    waited: asked.elapsed(),
+                })),
+                CAMERA_PERIOD,
+            ),
+            Err(why) => (Update::CameraLost(why.to_string()), CAMERA_RETRY),
+        };
+        if tx.send(update).is_err() {
+            return; // the UI is gone
+        }
+        // Waiting on the line rather than sleeping on it: closing the block must stop the asking
+        // now, not at the end of the period.
+        match asked_for.recv_timeout(again) {
+            Ok(next) => open = next,
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => return,
+        }
+    }
+}
+
 /// Ask `robotd` how it is, for as long as the view lives.
 ///
 /// Every way this ends is a sentence for the power row rather than an error for the process,
@@ -807,14 +903,23 @@ fn decode_pad(line: &str) -> Option<Result<proto::PadReport, String>> {
 fn live(
     terminal: &mut DefaultTerminal,
     rx: &Receiver<Update>,
+    tx: mpsc::Sender<Update>,
     hz: u32,
     no_robot: Option<String>,
+    media_socket: &Path,
 ) -> Result<(), Failure> {
     // A frame every `1/hz`, so waiting a fifth of a period keeps the keyboard responsive
     // without spinning. Clamped: `--hz 1000` must not turn this into a busy loop.
     let poll = Duration::from_secs_f64(1.0 / f64::from(hz.clamp(1, 200)) / 5.0);
     let mut view = View::new(hz, no_robot);
     let mut painted = Instant::now();
+
+    // The camera's thread, and the line this loop tells it to start and stop asking on. It sleeps
+    // on that line while the block is shut, which is the whole point: a request is 1.84 MiB
+    // `mediad` would otherwise never have copied.
+    let (wanted, asked_for) = mpsc::channel();
+    let camera_socket = media_socket.to_path_buf();
+    thread::spawn(move || read_camera(&camera_socket, &tx, &asked_for));
 
     loop {
         let mut fresh = false;
@@ -866,6 +971,13 @@ fn live(
                     // them.
                     KeyCode::Char('t') => {
                         view.toggle_tof();
+                        fresh = true;
+                    }
+                    // The camera. Off by default, and the only block that *costs* the robot
+                    // something to have open, so the keypress is also what starts the asking.
+                    KeyCode::Char('c') => {
+                        view.toggle_camera();
+                        let _ = wanted.send(view.show_camera);
                         fresh = true;
                     }
                     // The 3D robot view. On by default — it appears whenever the
@@ -964,15 +1076,36 @@ struct PadView {
     /// Times the robot's realtime clock stepped backwards between two reports. Expected exactly
     /// once on a board with no RTC, when its first NTP reply lands.
     clock_steps: u64,
+    /// The pad's inertial unit, while `padd` has one open. Its own lifecycle: a pad without one
+    /// never sets this, and a pad that drops takes it away through `ImuDetached`, not `Detached`.
+    /// The two paths no report ever arrives on are covered instead below: a new `Attached` clears
+    /// it until the new pad's own `ImuAttached`, and a lost tap clears it with the pad.
+    imu: Option<pad_imu::Imu>,
+    /// When a sample last earned a repaint — see [`IMU_REPAINT`].
+    imu_painted: Option<Instant>,
 }
 
 impl PadView {
+    /// Has enough time passed since the last IMU-driven repaint for another one?
+    fn imu_repaint_due(&mut self) -> bool {
+        let now = Instant::now();
+        match self.imu_painted {
+            Some(at) if now.duration_since(at) < IMU_REPAINT => false,
+            _ => {
+                self.imu_painted = Some(now);
+                true
+            }
+        }
+    }
+
     /// Take one report.
     fn absorb(&mut self, report: proto::PadReport) {
         match report {
             proto::PadReport::Attached { device } => {
                 // A new device is a new measurement: the counters and the trace describe *a link*,
                 // and carrying the old ones over would blame this pad for the last one's stalls.
+                // The IMU as well: if the new pad has one its `ImuAttached` follows, and a pad
+                // without one must not inherit the last pad's panel.
                 let device = *device;
                 self.axes = device.axes.iter().map(|a| (a.code, a.value)).collect();
                 self.held = device
@@ -982,6 +1115,7 @@ impl PadView {
                     .map(|b| b.code)
                     .collect();
                 self.device = Some(device);
+                self.imu = None;
                 self.trouble = None;
                 self.arrived = None;
                 self.reports = 0;
@@ -1002,6 +1136,15 @@ impl PadView {
                 self.trouble = Some(why);
             }
             proto::PadReport::Frame(frame) => self.frame(frame),
+            proto::PadReport::ImuAttached { device } => {
+                self.imu = Some(pad_imu::Imu::new(*device));
+            }
+            proto::PadReport::Imu(batch) => {
+                if let Some(imu) = self.imu.as_mut() {
+                    imu.absorb(&batch);
+                }
+            }
+            proto::PadReport::ImuDetached { .. } => self.imu = None,
         }
     }
 
@@ -1089,6 +1232,109 @@ impl PadView {
     }
 }
 
+/// The pad's inertial unit: a wireframe pad posed like the real one, and the numbers beside it.
+///
+/// Left, the picture; right, the words. The picture is what a person reads — a pad tilting on
+/// screen as it tilts in the hand is understood in the time it takes to see it — and the numbers
+/// are for when the picture is wrong: they say which axis, by how much, and whether the gyro bias
+/// the picture depends on has been learned yet.
+fn render_imu(imu: &pad_imu::Imu, frame: &mut ratatui::Frame, area: ratatui::layout::Rect) {
+    let device = imu.device();
+    let mut title = vec![
+        Span::raw(" imu "),
+        Span::styled(
+            device.name.clone(),
+            Style::new().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+        ),
+    ];
+    match imu.rate_hz() {
+        Some(hz) => title.push(Span::raw(format!(" · {hz:.0} Hz ")).dim()),
+        None => title.push(Span::raw(" · waiting for samples ").dim()),
+    }
+    let block = Block::bordered()
+        .border_style(Style::new().fg(Color::Magenta))
+        .title(Line::from(title))
+        .title_bottom(
+            Line::from(format!(
+                " {} samples · {} · yellow bar = front edge ",
+                imu.samples(),
+                device.node
+            ))
+            .dim(),
+        );
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    // The picture gets the left half of the width, capped where a wider one stops adding detail;
+    // the words take the rest. The picture is the one that earns its place, so it is sized first.
+    let picture_width = (inner.width / 2).clamp(12, 48);
+    let [picture, words] =
+        Layout::horizontal([Constraint::Length(picture_width), Constraint::Min(0)])
+            .areas::<2>(inner);
+    imu_view::draw(imu, picture, frame.buffer_mut());
+
+    let [pitch, roll, yaw] = imu.euler_deg();
+    let a = imu.accel_g();
+    let g = imu.gyro_dps();
+    let magnitude = (a[0] * a[0] + a[1] * a[1] + a[2] * a[2]).sqrt();
+    let signed = |v: f32| format!("{v:+7.2}");
+    let bias = match imu.bias_dps() {
+        Some(b) => Line::from(vec![
+            Span::raw(" bias  "),
+            Span::raw(format!(
+                "{} {} {} °/s ",
+                signed(b[0]),
+                signed(b[1]),
+                signed(b[2])
+            )),
+            Span::styled("settled", Style::new().fg(Color::Green)),
+            Span::raw(" — removed from the rates above").dim(),
+        ]),
+        None => Line::from(vec![
+            Span::raw(" bias  "),
+            Span::styled(
+                "learning — hold the pad still for half a second",
+                Style::new().fg(Color::Yellow),
+            ),
+        ]),
+    };
+    let mut lines = vec![
+        Line::from(vec![
+            Span::raw(" tilt  "),
+            Span::styled(
+                format!("pitch {pitch:+6.1}°  roll {roll:+6.1}°"),
+                Style::new().add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(format!("  yaw {yaw:+6.1}°")),
+            Span::raw(" (gyro only, drifts)").dim(),
+        ]),
+        Line::from(format!(
+            " accel {} {} {} g   |a| {magnitude:.2} g",
+            signed(a[0]),
+            signed(a[1]),
+            signed(a[2])
+        )),
+        Line::from(format!(
+            " gyro  {} {} {} °/s",
+            signed(g[0]),
+            signed(g[1]),
+            signed(g[2])
+        )),
+        bias,
+        Line::from(" axes  +X front · +Y left · +Z up · at rest Z reads +1 g").dim(),
+    ];
+    if imu.socket_dropped() > 0 {
+        lines.push(Line::from(vec![Span::styled(
+            format!(
+                " {} samples dropped reaching this view",
+                imu.socket_dropped()
+            ),
+            Style::new().fg(Color::Magenta),
+        )]));
+    }
+    frame.render_widget(Paragraph::new(lines), words);
+}
+
 /// What the time since the last report means.
 ///
 /// The distinction between the last two is the whole difficulty of measuring a pad link, and
@@ -1165,6 +1411,11 @@ struct View {
     tof_lost: Option<String>,
     /// Is the ToF block open? Closed to begin with — see [`TOF_HEIGHT`].
     show_tof: bool,
+    /// The last frame off `mediad`, and the picture drawn from it.
+    camera: camera::CameraView,
+    /// Is the camera block open? Closed to begin with, and unlike every other block that also
+    /// means nothing is being *fetched* — see [`read_camera`].
+    show_camera: bool,
     /// The last answer to `robot.health`: the battery, the temperatures, the bus counters and
     /// how stale the IMU's reads are. None of it is on the state stream.
     health: Option<proto::HealthResult>,
@@ -1200,6 +1451,8 @@ impl View {
             tof_status: None,
             tof_lost: None,
             show_tof: false,
+            camera: camera::CameraView::default(),
+            show_camera: false,
             health: None,
             health_at: None,
             health_lost: None,
@@ -1212,6 +1465,15 @@ impl View {
 
     fn toggle_tof(&mut self) {
         self.show_tof = !self.show_tof;
+    }
+
+    /// Open or close the camera block. Closing forgets the picture: nothing is fetched while it
+    /// is shut, so what is held would be minutes old by the time it was shown again.
+    fn toggle_camera(&mut self) {
+        self.show_camera = !self.show_camera;
+        if !self.show_camera {
+            self.camera.forget();
+        }
     }
 
     fn toggle_pad(&mut self) {
@@ -1250,10 +1512,15 @@ impl View {
                 Ok(true)
             }
             Update::Pad(report) => {
+                let sample = matches!(*report, proto::PadReport::Imu(_));
                 self.pad.absorb(*report);
                 // A repaint even while the block is closed would be a redraw per report, at up to
-                // 125 a second, for something nobody is looking at.
-                Ok(self.show_pad)
+                // 125 a second, for something nobody is looking at — and an IMU sample, at six
+                // hundred a second, earns one only every [`IMU_REPAINT`] even when it is.
+                if !self.show_pad {
+                    return Ok(false);
+                }
+                Ok(!sample || self.pad.imu_repaint_due())
             }
             Update::Tof(frame) => {
                 self.tof = Some(*frame);
@@ -1276,8 +1543,21 @@ impl View {
             }
             Update::PadLost(why) => {
                 self.pad.device = None;
+                // The IMU goes with it: the `ImuDetached` for this pad died with the tap, and
+                // the next subscription seeds only what the new `padd` has — a pad without an
+                // IMU would leave the last one's panel frozen on screen forever.
+                self.pad.imu = None;
                 self.pad.trouble = Some(why);
                 Ok(self.show_pad)
+            }
+            // A frame only arrives because the block is open, so it is always worth a repaint.
+            Update::Camera(shot) => {
+                self.camera.absorb(*shot);
+                Ok(true)
+            }
+            Update::CameraLost(why) => {
+                self.camera.lost(why);
+                Ok(self.show_camera)
             }
             Update::Health(health) => {
                 self.health = Some(*health);
@@ -1329,11 +1609,13 @@ impl View {
             // connect to. Either way the pad block is still drawn when it is open: it reads a
             // different daemon over a different socket, and a robot is not a precondition for
             // watching the sticks.
-            let pad_height = if self.show_pad { PAD_HEIGHT } else { 0 };
+            let pad_height = self.pad_height();
             let tof_height = if self.show_tof { TOF_HEIGHT } else { 0 };
-            let [pad, tof, rest] = Layout::vertical([
+            let camera_height = if self.show_camera { CAMERA_HEIGHT } else { 0 };
+            let [pad, tof, camera, rest] = Layout::vertical([
                 Constraint::Length(pad_height),
                 Constraint::Length(tof_height),
+                Constraint::Length(camera_height),
                 Constraint::Min(3),
             ])
             .areas(area);
@@ -1343,12 +1625,18 @@ impl View {
             if self.show_tof {
                 self.render_tof(frame, tof);
             }
+            // Drawn here too, and this is the case it is most needed in: a camera answers on a
+            // board whose servo power is off, so a picture is one of the few things this frame
+            // can still show when no state will ever arrive.
+            if self.show_camera {
+                self.render_camera(frame, camera);
+            }
             let waiting = match &self.no_robot {
                 // Named rather than folded into "waiting", because waiting for a robot that is
                 // there and waiting for one that is not need different things done about them.
                 Some(why) => {
                     format!(
-                        "no robotd: {why}\nthe pad and tof blocks still work — p and t toggle them"
+                        "no robotd: {why}\nthe pad, tof and camera blocks still work — p, t and c toggle them"
                     )
                 }
                 None => "waiting for robot.state…".to_owned(),
@@ -1386,16 +1674,20 @@ impl View {
         // The pad block, when open, sits directly under the header rather than at the bottom: it is
         // the *source* of the command the header reports, and the frame then reads top to bottom in
         // the order the robot does — sticks, command, joints, loop rate.
-        let pad_height = if self.show_pad { PAD_HEIGHT } else { 0 };
+        let pad_height = self.pad_height();
         let tof_height = if self.show_tof { TOF_HEIGHT } else { 0 };
+        let camera_height = if self.show_camera { CAMERA_HEIGHT } else { 0 };
         let trace_height = area
             .height
-            .saturating_sub(HEADER_HEIGHT + pad_height + tof_height + rows as u16 + 3)
+            .saturating_sub(
+                HEADER_HEIGHT + pad_height + tof_height + camera_height + rows as u16 + 3,
+            )
             .clamp(3, 6);
-        let [header, pad, tof, joints, trace] = Layout::vertical([
+        let [header, pad, tof, camera, joints, trace] = Layout::vertical([
             Constraint::Length(HEADER_HEIGHT),
             Constraint::Length(pad_height),
             Constraint::Length(tof_height),
+            Constraint::Length(camera_height),
             Constraint::Min(4),
             Constraint::Length(trace_height),
         ])
@@ -1417,6 +1709,11 @@ impl View {
         if self.show_tof {
             self.render_tof(frame, tof);
         }
+        // Under the sensors and above the joints, still in the robot's own order: the camera is
+        // another thing it sees, and the joints below are what it did about all of them.
+        if self.show_camera {
+            self.render_camera(frame, camera);
+        }
         frame.render_stateful_widget(
             self.joints(state, rows, visible),
             joints,
@@ -1426,6 +1723,20 @@ impl View {
         if let Some(duck) = duck {
             self.render_duck(frame, duck);
         }
+    }
+
+    /// Rows the pad block takes: none while closed, [`PAD_HEIGHT`] open, and [`IMU_HEIGHT`] more
+    /// while the pad has an inertial unit to show.
+    fn pad_height(&self) -> u16 {
+        if !self.show_pad {
+            return 0;
+        }
+        PAD_HEIGHT
+            + if self.pad.imu.is_some() {
+                IMU_HEIGHT
+            } else {
+                0
+            }
     }
 
     /// Carve the robot view's column off the right, when it is wanted and fits.
@@ -1528,7 +1839,7 @@ impl View {
                 // The robot view is only named here while it is hidden: visible, it
                 // carries its own caption, and this title clips on a narrow terminal.
                 Line::from(format!(
-                    " q quits · ↑↓ scrolls · u {} · p {}{}{} ",
+                    " q quits · ↑↓ scrolls · u {} · p {}{}{}{} ",
                     self.units.toggled().name(),
                     if self.show_pad {
                         "hides the pad"
@@ -1539,6 +1850,11 @@ impl View {
                     // the same reason: open, the block carries its own title, and
                     // every character here is one the left-hand title loses.
                     if self.show_tof { "" } else { " · t the tof" },
+                    if self.show_camera {
+                        ""
+                    } else {
+                        " · c the camera"
+                    },
                     if self.show_duck {
                         ""
                     } else {
@@ -1902,6 +2218,32 @@ impl View {
             ));
         }
 
+        // A capped clock is said here rather than added to the temperatures below, and it takes
+        // the board temperature with it. Two reasons, and they are the same one twice.
+        //
+        // It cannot be trimmed. The temperatures are nice to have and get dropped on a narrow
+        // row; this explains a duck walking badly, and it is the wrong thing to lose to a
+        // terminal's width — a board at 408 MHz of 1800 has under a quarter of the CPU the
+        // gaits were tuned on.
+        //
+        // And it is coloured, which the temperatures deliberately are not. No threshold is being
+        // invented here: the kernel's own thermal governor has already decided and acted, and
+        // this is a report of that action rather than an opinion about a number.
+        let capped = health.cpu_throttle.filter(proto::CpuThrottle::throttled);
+        if let Some(t) = capped {
+            // The temperature rides along when there is one, so the pair still reads as one
+            // fact — and is simply left out when the kernel offers cpufreq but no thermal
+            // zone, rather than filled in with a zero that would read as a cold board.
+            let temp = match health.cpu_temp_c {
+                Some(c) => format!("{c:.0} °C "),
+                None => String::new(),
+            };
+            said.push(Span::styled(
+                format!(" · cpu {temp}throttled to {} MHz", t.khz / 1000),
+                Style::new().fg(Color::Yellow),
+            ));
+        }
+
         // Uncoloured, deliberately: nothing in this workspace defines a servo temperature that
         // is too high, and a threshold invented here would be one `robotctl health` does not
         // agree with. The number and the joint are what somebody acts on.
@@ -1915,7 +2257,9 @@ impl View {
         // Beside the servos rather than merged with them: a robot that has been walking has hot
         // motors, a board in an enclosure with a blocked vent has a hot SoC, and the two are
         // fixed differently — which is the reason `HealthResult` carries them separately.
-        if let Some(cpu) = health.cpu_temp_c {
+        if let Some(cpu) = health.cpu_temp_c
+            && capped.is_none()
+        {
             trimmings.push(Span::raw(format!(" · cpu {cpu:.0} °C")));
         }
 
@@ -2150,6 +2494,23 @@ impl View {
         frame.render_widget(Paragraph::new(lines), inner);
     }
 
+    /// The camera frame, drawn in half-blocks. See [`camera`] for what it costs and why it only
+    /// costs it while this block is open.
+    fn render_camera(&self, frame: &mut ratatui::Frame, area: ratatui::layout::Rect) {
+        let block = Block::bordered()
+            .title(Line::from(self.camera.title()))
+            .title_bottom(Line::from(" c hides ".to_owned()).dim())
+            .title_bottom(self.camera.caption().right_aligned());
+        let inner = block.inner(area);
+        let absence = self.camera.absence();
+        frame.render_widget(block, area);
+        if self.camera.has_picture() {
+            self.camera.draw(inner, frame.buffer_mut());
+        } else {
+            frame.render_widget(Paragraph::new(absence).dim(), inner);
+        }
+    }
+
     /// The frame's zones through the head FK, when both streams are up: which
     /// returns are floor, which are obstacles, and where each sits in the
     /// trunk frame. The joint indices are `JOINT_NAMES` order — neck_pitch,
@@ -2319,14 +2680,23 @@ impl View {
         };
 
         // Fixed rows, in the order the questions arrive: is it arriving, has it been arriving, and
-        // what is it saying.
-        let [cadence, gaps, axes, held] = Layout::vertical([
+        // what it is saying — and, when the pad has one, where the pad is in space.
+        let imu_height = if self.pad.imu.is_some() {
+            IMU_HEIGHT
+        } else {
+            0
+        };
+        let [cadence, gaps, axes, held, imu] = Layout::vertical([
             Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Length(AXIS_ROWS as u16),
             Constraint::Length(1),
+            Constraint::Length(imu_height),
         ])
-        .areas::<4>(inner);
+        .areas::<5>(inner);
+        if let Some(unit) = self.pad.imu.as_ref() {
+            render_imu(unit, frame, imu);
+        }
 
         frame.render_widget(self.pad_cadence(), cadence);
         // A label beside the trace rather than a title above it: a bordered block for one row of
@@ -2363,6 +2733,13 @@ impl View {
             title.push(Span::styled(
                 "· on USB, so there is no radio here ",
                 Style::new().fg(Color::Yellow),
+            ));
+        }
+        if self.pad.imu.is_some() {
+            // Loud on purpose: a pad with an IMU is news, and the block below has just grown.
+            title.push(Span::styled(
+                "· IMU ",
+                Style::new().fg(Color::Magenta).add_modifier(Modifier::BOLD),
             ));
         }
         title
@@ -3268,6 +3645,42 @@ mod tests {
         // And the two temperatures, which fail differently and are fixed differently.
         assert!(screen.contains("41 °C max (left_knee)"), "{screen}");
         assert!(screen.contains("cpu 52 °C"), "{screen}");
+        // Nothing capping the clock, so the row says nothing about it.
+        assert!(!screen.contains("throttled"), "{screen}");
+    }
+
+    /// A board wound down to 408 MHz says so on the row, short form. The temperature alone
+    /// reads as a warm robot, and the reason a duck on a hot board walks badly is that it is
+    /// running at under a quarter of its clock — which is a fact somebody watching the robot
+    /// move needs without leaving the screen.
+    #[test]
+    fn the_frame_says_when_the_clock_is_capped() {
+        let health = proto::HealthResult {
+            cpu_temp_c: Some(95.5),
+            cpu_throttle: Some(proto::CpuThrottle {
+                level: 6,
+                max_level: 6,
+                khz: 408_000,
+                max_khz: 1_800_000,
+            }),
+            ..a_health()
+        };
+        let screen = draw_with_health(110, 32, &a_state(), health);
+
+        assert!(
+            screen.contains("cpu 96 °C throttled to 408 MHz"),
+            "{screen}"
+        );
+        // The servo temperatures are trimmed off this row to make room, which is the right
+        // trade at this width: a capped clock explains a robot that is moving badly, and 41 °C
+        // on a knee does not. Asserted on the row rather than the frame — every joint is named
+        // again in the table below, so a search of the whole screen would find `left_knee`
+        // whatever this row did.
+        let power = screen
+            .lines()
+            .find(|line| line.contains(" power "))
+            .expect("the row is drawn");
+        assert!(!power.contains("motors"), "{screen}");
     }
 
     /// An unread battery says so. Rendered as `0.00 V, 0%` it would put a flat-pack warning in
@@ -3478,6 +3891,85 @@ mod tests {
         state
     }
 
+    /// A frame as `mediad` would answer with: flat grey, and the geometry in the header.
+    fn a_picture(rotate: u32) -> camera::Shot {
+        let (width, height) = (8u32, 4u32);
+        let data = [128u8, 180, 128, 180].repeat((width * height / 2) as usize);
+        camera::Shot {
+            header: proto::MediaFrameHeader {
+                width,
+                height,
+                format: "UYVY".to_owned(),
+                bytes: data.len(),
+                captured_at_unix_us: 1,
+                rotate,
+            },
+            data,
+            waited: Duration::from_millis(38),
+        }
+    }
+
+    /// The camera block is `c`'s, and nothing about it is on the frame until it is asked for —
+    /// including, out of this view's sight, the request that makes `mediad` copy a frame at all.
+    #[test]
+    fn the_camera_block_is_drawn_only_once_it_is_asked_for() {
+        let mut view = View::new(20, None);
+        feed(&mut view, Update::State(Box::new(a_state())));
+        feed(&mut view, Update::Camera(Box::new(a_picture(0))));
+        let screen = render_to(&mut view, 80, 40);
+        assert!(
+            !screen.contains("camera 8×4"),
+            "closed, it is not drawn: {screen}"
+        );
+        assert!(
+            screen.contains("c the camera"),
+            "and the key is named: {screen}"
+        );
+
+        view.toggle_camera();
+        let screen = render_to(&mut view, 80, 40);
+        assert!(screen.contains("camera 8×4"), "{screen}");
+        assert!(screen.contains("mount 0°"), "{screen}");
+        assert!(
+            screen.contains('▀'),
+            "the picture is half-block pixels: {screen}"
+        );
+    }
+
+    /// Closing it forgets the frame, because nothing refreshes it while it is shut and a picture
+    /// of a room minutes ago is indistinguishable from one of the room now.
+    #[test]
+    fn closing_the_camera_block_forgets_the_picture() {
+        let mut view = View::new(20, None);
+        view.toggle_camera();
+        feed(&mut view, Update::Camera(Box::new(a_picture(90))));
+        assert!(view.camera.has_picture());
+
+        view.toggle_camera();
+        assert!(!view.camera.has_picture());
+        view.toggle_camera();
+        let screen = render_to(&mut view, 80, 40);
+        assert!(screen.contains("asking mediad for a frame"), "{screen}");
+    }
+
+    /// A stopped `mediad` is a sentence in the block, not the end of the monitor — the same
+    /// treatment the pad tap and the depth stream get, and for the same reason.
+    #[test]
+    fn a_camera_that_does_not_answer_is_named_rather_than_fatal() {
+        let mut view = View::new(20, None);
+        view.toggle_camera();
+        assert!(
+            view.absorb(Update::CameraLost("mediad is not running".to_owned()))
+                .is_ok(),
+            "a camera that is not there is not a failure"
+        );
+        let screen = render_to(&mut view, 80, 40);
+        assert!(
+            screen.contains("no picture: mediad is not running"),
+            "{screen}"
+        );
+    }
+
     /// Feed the view one update.
     ///
     /// [`Failure`] carries no `Debug`, so `expect` is not available on an absorb — every test here
@@ -3644,6 +4136,145 @@ mod tests {
         view
     }
 
+    fn an_imu() -> proto::PadImuDevice {
+        proto::PadImuDevice {
+            name: "Nintendo Switch Pro Controller IMU".to_owned(),
+            node: "/dev/input/event6".to_owned(),
+            accel_per_g: 4096,
+            gyro_per_dps: 14247,
+            accel_max: 32767,
+            gyro_max: 32_767_000,
+        }
+    }
+
+    /// A pad without an IMU must not inherit the last pad's panel, on either of the two paths
+    /// no `ImuDetached` covers: a new device is a new measurement, and a lost tap's
+    /// `ImuDetached` died with the connection.
+    #[test]
+    fn a_pad_without_an_imu_never_shows_the_last_pads_panel() {
+        let imu_attached = || {
+            Update::Pad(Box::new(proto::PadReport::ImuAttached {
+                device: Box::new(an_imu()),
+            }))
+        };
+
+        // A pad swap with the tap alive: the new pad has no IMU, so no ImuAttached follows.
+        let mut view = watching_a_pad();
+        feed(&mut view, imu_attached());
+        assert!(view.pad.imu.is_some());
+        feed(
+            &mut view,
+            Update::Pad(Box::new(proto::PadReport::Attached {
+                device: Box::new(a_device()),
+            })),
+        );
+        assert!(view.pad.imu.is_none(), "a new device is a new measurement");
+
+        // The tap itself lost: no ImuDetached is coming — it died with the connection.
+        let mut view = watching_a_pad();
+        feed(&mut view, imu_attached());
+        feed(&mut view, Update::PadLost("the tap stopped".to_owned()));
+        assert!(
+            view.pad.imu.is_none(),
+            "the panel goes with the tap that fed it"
+        );
+    }
+
+    /// The pad block is what it always was for a pad without an IMU, and grows — with the
+    /// picture, the numbers and a loud tag in the title — the moment `padd` opens one. An Xbox
+    /// pad's owner must see no change; a Pro Controller's must not be able to miss it.
+    #[test]
+    fn the_pad_block_grows_an_imu_panel_only_when_the_pad_has_one() {
+        let mut view = watching_a_pad();
+        let without = render_to(&mut view, 100, 40);
+        assert!(
+            !without.contains("front edge"),
+            "no IMU, no panel:\n{without}"
+        );
+        assert!(!without.contains("· IMU"), "{without}");
+
+        feed(
+            &mut view,
+            Update::Pad(Box::new(proto::PadReport::ImuAttached {
+                device: Box::new(an_imu()),
+            })),
+        );
+        // Two hundred samples of a pad lying flat, a second's worth: level, bias learned.
+        for i in 1..=200u64 {
+            feed(
+                &mut view,
+                Update::Pad(Box::new(proto::PadReport::Imu(proto::PadImuBatch {
+                    samples: vec![proto::PadImuSample {
+                        seq: i,
+                        at_us: 1_000_000 + i * 5_000,
+                        accel: [-391, -35, 4270],
+                        gyro: [25_000, -9_000, 171_000],
+                    }],
+                    socket_dropped: 0,
+                }))),
+            );
+        }
+        let with = render_to(&mut view, 100, 40);
+        assert!(with.contains("· IMU"), "the title says so:\n{with}");
+        assert!(
+            with.contains("Nintendo Switch Pro Controller IMU"),
+            "the panel names the unit:\n{with}"
+        );
+        assert!(with.contains("pitch"), "and reads its attitude:\n{with}");
+        assert!(
+            with.contains("settled"),
+            "a second still learns the bias:\n{with}"
+        );
+        assert!(
+            with.contains('▀') || with.contains('▄'),
+            "and draws the pad:\n{with}"
+        );
+
+        feed(
+            &mut view,
+            Update::Pad(Box::new(proto::PadReport::ImuDetached {
+                why: "the pad changed".to_owned(),
+            })),
+        );
+        let gone = render_to(&mut view, 100, 40);
+        assert!(
+            !gone.contains("· IMU"),
+            "and it goes when the IMU does:\n{gone}"
+        );
+    }
+
+    /// Six hundred samples a second must not become six hundred repaints a second.
+    #[test]
+    fn imu_samples_repaint_at_most_thirty_times_a_second() {
+        let mut view = watching_a_pad();
+        feed(
+            &mut view,
+            Update::Pad(Box::new(proto::PadReport::ImuAttached {
+                device: Box::new(an_imu()),
+            })),
+        );
+        let repaints = (1..=100u64)
+            .filter(|i| {
+                view.absorb(Update::Pad(Box::new(proto::PadReport::Imu(
+                    proto::PadImuBatch {
+                        samples: vec![proto::PadImuSample {
+                            seq: *i,
+                            at_us: 1_000_000 + i * 1_667,
+                            accel: [0, 0, 4096],
+                            gyro: [0, 0, 0],
+                        }],
+                        socket_dropped: 0,
+                    },
+                ))))
+                .unwrap_or_else(|_| panic!("an update is not a failure"))
+            })
+            .count();
+        assert!(
+            repaints <= 2,
+            "a burst of samples earned {repaints} repaints"
+        );
+    }
+
     /// Stopping `tofd` must be an ordinary thing to do. The subscribe reports why
     /// it failed and the caller retries — nothing here may panic or give up, or
     /// `systemctl stop tofd` would take the monitor's other two streams with it.
@@ -3741,6 +4372,7 @@ mod tests {
         proto::TofFrame {
             seq: 7,
             at_us: 1_000_000,
+            t_ns: 0,
             rows: 8,
             cols: 8,
             distance_mm,
@@ -4209,6 +4841,10 @@ mod tests {
             odom: proto::OdomState::default(),
             theremin: None,
             chorale: None,
+            t_ns: 0,
+            imu: None,
+            frames: None,
+            skeleton: Vec::new(),
         }
     }
 }

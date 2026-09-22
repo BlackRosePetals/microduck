@@ -18,8 +18,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use duck_detect::{Detection, Turn, decode, letterbox_from_uyvy};
+use duck_detect::{Detection, decode};
 use tokio::sync::broadcast;
+use uyvy::{Turn, letterbox_from_uyvy};
 
 use crate::pipeline::Frames;
 
@@ -139,7 +140,9 @@ pub fn spawn_first(
         }
     }
     anyhow::bail!(
-        "no model would load ({}). For the NPU: sudo /usr/local/sbin/robot-setup-npu",
+        "no model would load ({}). A missing file means the set was never installed — \
+         `sudo robotctl duck-detector update` fetches it from the Hub; for the NPU: \
+         sudo /usr/local/sbin/robot-setup-npu",
         refused.join("; ")
     )
 }

@@ -20,39 +20,70 @@
 //! So: one session for the service's lifetime, one notify pump, and a write callback that pushes
 //! bytes into it.
 //!
-//! **Untested against hardware.** It type-checks for aarch64 and has never met a real central.
-//! Treat what follows as intent until someone connects a phone.
+//! **What the callback model costs is flow control**, and that bill came due the first time a
+//! reply was more than a few kilobytes. `notify` hands a D-Bus signal to the connection and
+//! returns; nothing here can ask BlueZ whether the radio has caught up, and nothing reports the
+//! notification MTU either. Both gaps are worked around rather than solved: the payload is taken
+//! from what BlueZ reports on inbound writes (one ATT MTU serves both directions, capped at the
+//! 512-byte limit on a characteristic value — see `framing::notification_payload`), and the pump
+//! pauses every [`NOTIFY_BURST`] chunks. The IO model has the readiness signal this wants and
+//! still cannot be used, for the reason above — it serves only the `Acquire*` paths.
 
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use bluer::adv::Advertisement;
+use bluer::adv::{Advertisement, Type};
 use bluer::agent::Agent;
 // Aliased: `bluer` has two error types called `ReqError`, one for the pairing agent and one for a
 // characteristic. Naming this one makes a mix-up a name error rather than a puzzling type error,
 // which is how it first presented.
 use bluer::gatt::local::ReqError as GattError;
 use bluer::gatt::local::{
-    Application, Characteristic, CharacteristicNotify, CharacteristicNotifyMethod,
-    CharacteristicRead, CharacteristicWrite, CharacteristicWriteMethod, Service,
+    Application, Characteristic, CharacteristicNotifier, CharacteristicNotify,
+    CharacteristicNotifyMethod, CharacteristicRead, CharacteristicWrite, CharacteristicWriteMethod,
+    Service,
 };
 use futures::FutureExt;
 use std::sync::Mutex as StdMutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use tokio::sync::mpsc;
 
-use crate::gatt::{RPC_UUID, SERVICE_UUID};
 use crate::link::Link;
 use crate::session;
 use crate::upstream::{NameChoice, Sockets};
+use duck_ble::framing::{FLOOR_MTU, notification_payload};
+use duck_ble::gatt::{RPC_UUID, SERVICE_UUID};
 
-/// Notification payload assumed for outbound chunks.
+/// How many notifications to queue before pausing to let the radio drain.
 ///
-/// The write side learns the negotiated MTU (BlueZ reports it per request); the notify side has no
-/// way to ask. So chunks are sized for 20 bytes — the payload every BLE link is required to
-/// support — which is slower than necessary on a good link and correct on every link.
-const FLOOR_MTU: usize = 20;
+/// **This is the only backpressure the callback model offers, and it has to exist.**
+/// `CharacteristicNotifier::notify` emits a D-Bus `PropertiesChanged` signal and returns as soon
+/// as the signal is queued on the connection — it does not wait for BlueZ, let alone for the
+/// controller — so an unpaced pump queues a whole reply in microseconds. Measured on the board:
+/// a ~5 KiB reply at the 20-byte floor (≈265 notifications) got through in 1.8 s, and a ~7 KiB one
+/// (≈350) killed the notification session 150 ms in, leaving the client waiting out its idle
+/// timeout against a robot that had already torn down the session. `bluer`'s IO model has a real
+/// readiness signal for this and cannot be used here — it serves only the `Acquire*` fd paths,
+/// which a CoreBluetooth central never drives (see this module's header).
+///
+/// Sixteen chunks is what a connection interval can plausibly carry, so a small reply — an
+/// authentication answer is four chunks — never pauses at all.
+const NOTIFY_BURST: usize = 16;
+
+/// How long to pause between bursts. Roughly one connection interval.
+const NOTIFY_PAUSE: Duration = Duration::from_millis(20);
+
+/// How many times to re-send a chunk the D-Bus connection would not take, and how long to wait
+/// between attempts.
+///
+/// A `notify` that fails while the session is *not* stopped is a queue that is momentarily full,
+/// which is recoverable and was being treated as the central having left — the session was torn
+/// down mid-reply and the client learned nothing at all. Only an exhausted budget, or a genuinely
+/// stopped session, ends the session now.
+const NOTIFY_RETRIES: u32 = 5;
+const NOTIFY_RETRY_BACKOFF: Duration = Duration::from_millis(20);
 
 /// How often to advertise, and this is the difference between a robot that is found and one that is
 /// not.
@@ -136,6 +167,34 @@ const ASK_TIMEOUT: Duration = Duration::from_secs(5);
 /// The robot has just been given a network at that moment, and the address is the thing whoever did
 /// it is waiting to read.
 const ADV_POLL: Duration = Duration::from_secs(5);
+
+/// How often the reconcile loop reads the session slot, which is faster than it asks `configd`.
+///
+/// The two questions have nothing in common but the loop that asks them. A name or an address
+/// costs a socket connect and a round trip to another daemon, and neither moves quickly enough to
+/// be worth asking about more often than [`ADV_POLL`]. Whether a central is being served is a
+/// mutex in this process, free to read — and it is the one that should be acted on promptly: it
+/// decides whether the robot is taking connections, so a tick spent not noticing that a client has
+/// left is a tick in which nobody else can get in.
+///
+/// A second, faster timer rather than simply lowering [`ADV_POLL`], because lowering that one
+/// would multiply the traffic to `configd` by five to buy nothing it answers.
+const SESSION_POLL: Duration = Duration::from_secs(1);
+
+/// The live session's inbound sender, or `None` when no central is subscribed.
+///
+/// Named because two places now read it for different reasons: the write callback, which needs
+/// somewhere to put a chunk, and [`reconcile_advertisement`], which needs to know whether the robot
+/// is busy. The second is not a new signal — it is the same slot, asked a different question.
+type SessionSlot = Arc<StdMutex<Option<mpsc::Sender<Vec<u8>>>>>;
+
+/// Whether a central is being served right now.
+///
+/// Nothing is held across an await: the lock is taken and released inside this call, because the
+/// callers that matter are a callback that may not block and a loop that must not stall the radio.
+fn serving(session: &SessionSlot) -> bool {
+    session.lock().expect("write slot poisoned").is_some()
+}
 
 /// Serve BLE for as long as this process lives, across an adapter that comes and goes.
 ///
@@ -240,7 +299,7 @@ async fn serve_on_an_adapter(
     // `bd_addr` rather than `address`, because the advertisement now carries an IPv4 one too and a
     // journal with both spelled `address` reads as one field contradicting itself.
     //
-    // `max_adv_len` is logged because it is the budget `crate::adv` is written against: the payload
+    // `max_adv_len` is logged because it is the budget `duck_ble::adv` is written against: the payload
     // fits 31 bytes, and a controller that reports less is the one place that assumption fails. It
     // is the first thing to read if a robot ever advertises its name but no address.
     tracing::warn!(
@@ -271,6 +330,8 @@ async fn serve_on_an_adapter(
         // robot that boots onto a network it already knows would otherwise broadcast `0.0.0.0` for
         // the first few seconds, and a listing cannot tell that from a robot with no wifi at all.
         address: ask_address(&sockets, None).await,
+        // Nothing has been served yet: the GATT application below is not even registered.
+        connectable: true,
     };
     let handle = Some(advertise(&adapter, &advertised).await?);
 
@@ -309,9 +370,16 @@ async fn serve_on_an_adapter(
     // A `std::sync::Mutex` rather than tokio's, deliberately: the write callback must read this
     // without awaiting, because a yield point there lets two chunks swap places. Nothing is held
     // across an await.
-    let current: Arc<StdMutex<Option<mpsc::Sender<Vec<u8>>>>> = Arc::new(StdMutex::new(None));
+    let current: SessionSlot = Arc::new(StdMutex::new(None));
     let for_write = current.clone();
     let for_notify = current.clone();
+
+    // The negotiated payload, written by the write callback and read by the session when it sizes
+    // a reply. An atomic rather than a channel or the mutex above, because the write callback may
+    // not await and may not block: a yield point there lets two chunks swap places. See
+    // [`crate::link::Link::mtu`].
+    let mtu = Arc::new(AtomicUsize::new(FLOOR_MTU));
+    let write_mtu = mtu.clone();
 
     // The notify callback below takes ownership of `sockets` for the sessions it spawns, and the
     // reconcile loop at the end outlives it.
@@ -364,6 +432,15 @@ async fn serve_on_an_adapter(
                             String::from_utf8_lossy(&value[..value.len().min(8)]).to_string();
                         let sender = for_write.lock().expect("write slot poisoned").clone();
 
+                        // What BlueZ says this link negotiated, minus the three bytes of ATT
+                        // header a notification cannot use. Stored on every write because it is
+                        // free to do so and a central may renegotiate; logged only when it moves,
+                        // because the value that matters is the one a reply gets chunked for and
+                        // that number had never appeared in the journal at all.
+                        let payload = notification_payload(req.mtu);
+                        let previous = write_mtu.swap(payload, Ordering::Relaxed);
+                        let learned = (previous != payload).then_some(payload);
+
                         let result = match sender {
                             None => {
                                 // Nowhere to send an answer, so accepting the request would be a
@@ -394,6 +471,12 @@ async fn serve_on_an_adapter(
                         };
 
                         async move {
+                            if let Some(payload) = learned {
+                                tracing::info!(
+                                    payload,
+                                    "negotiated notification payload; replies are sized for this"
+                                );
+                            }
                             // Eight bytes of the chunk, so a reordering is visible in the journal
                             // rather than inferred from a parse error three layers up. Truncated
                             // because a request may carry a wifi passphrase.
@@ -416,12 +499,17 @@ async fn serve_on_an_adapter(
                     method: CharacteristicNotifyMethod::Fun(Box::new(move |mut notifier| {
                         let slot = for_notify.clone();
                         let sockets = sockets.clone();
+                        let mtu = mtu.clone();
                         async move {
                             tokio::spawn(async move {
                                 // A fresh session, so nothing from a previous central can leak
                                 // into this one.
+                                // Back to the floor for a new central: the previous one's MTU is
+                                // not this one's, and the first write will report the real value
+                                // before any reply is chunked.
+                                mtu.store(FLOOR_MTU, Ordering::Relaxed);
                                 let (link, inbound, mut outbound) =
-                                    Link::pair(FLOOR_MTU, "central");
+                                    Link::pair_sharing_mtu(mtu.clone(), "central");
                                 let mine = inbound.clone();
                                 {
                                     let mut slot = slot.lock().expect("write slot poisoned");
@@ -438,6 +526,11 @@ async fn serve_on_an_adapter(
                                 let session = tokio::spawn(session::run(link, sockets));
                                 tracing::info!("central subscribed");
 
+                                // Notifications queued since the last pause. See `NOTIFY_BURST`
+                                // for why a pump with no readiness signal has to pace itself.
+                                let mut queued = 0usize;
+                                let mut gone = false;
+
                                 loop {
                                     tokio::select! {
                                         // Biased so a central that has gone away is noticed before
@@ -448,15 +541,21 @@ async fn serve_on_an_adapter(
                                         // when a notify fails — which needs a reply to send, so a
                                         // client that disconnects while idle would hold the slot
                                         // until the next request arrives for nobody.
-                                        () = notifier.stopped() => break,
+                                        () = notifier.stopped() => {
+                                            gone = true;
+                                            break;
+                                        }
                                         chunk = outbound.recv() => match chunk {
                                             None => break,
                                             Some(chunk) => {
-                                                if let Err(e) = notifier.notify(chunk).await {
-                                                    tracing::debug!(
-                                                        error = %e, "notify failed; central gone"
-                                                    );
+                                                if !notify_chunk(&mut notifier, chunk).await {
+                                                    gone = true;
                                                     break;
+                                                }
+                                                queued += 1;
+                                                if queued >= NOTIFY_BURST {
+                                                    queued = 0;
+                                                    tokio::time::sleep(NOTIFY_PAUSE).await;
                                                 }
                                             }
                                         },
@@ -474,7 +573,20 @@ async fn serve_on_an_adapter(
                                         // its reassembly buffer and its upstream connections.
                                         slot.take();
                                         session.abort();
-                                        tracing::info!("central unsubscribed; session discarded");
+                                        // Which of the two it was, because they need different
+                                        // next moves and the old line said "unsubscribed" for
+                                        // both — including for a reply this pump could not
+                                        // deliver, which is a robot problem wearing a client's
+                                        // clothes.
+                                        if gone {
+                                            tracing::info!(
+                                                "the central is gone; session discarded"
+                                            );
+                                        } else {
+                                            tracing::info!(
+                                                "the outbound queue closed; session discarded"
+                                            );
+                                        }
                                     } else {
                                         tracing::debug!(
                                             "a newer session holds the slot; leaving it alone"
@@ -526,31 +638,82 @@ async fn serve_on_an_adapter(
             advertised,
             name.pinned.is_some(),
             handle,
+            &current,
         ) => {}
     }
     Ok(())
 }
 
-/// What the advertisement says about the robot: what it is called, and where it is on the network.
+/// Send one chunk, retrying a queue that is momentarily full. `false` means give up on the session.
 ///
-/// One struct rather than two arguments threaded through the reconcile loop, so that "has anything
-/// moved" is one comparison. Adding a third field would otherwise mean finding every place that
-/// compares the pair — and `crate::adv` explains why there is no room for a third field anyway.
+/// **The distinction this function exists to draw**: `notify` returns the same error for "the
+/// central unsubscribed" and "the D-Bus connection would not take this signal", and the pump used
+/// to read both as the central having left. So a reply too big for one burst tore down the session
+/// mid-line, and the client — still connected, as far as CoreBluetooth was concerned — waited out
+/// its idle timeout with no error to report and half an answer in its reassembler. That was
+/// diagnosed from a board, not from the journal, because the only line it left was a `debug` one
+/// blaming the central.
+///
+/// `is_stopped` tells them apart: it is closed only when the notification session really has
+/// ended. Anything else is retried, and the chunk is cloned because `notify` consumes it and a
+/// dropped chunk corrupts the line rather than failing it.
+async fn notify_chunk(notifier: &mut CharacteristicNotifier, chunk: Vec<u8>) -> bool {
+    for attempt in 1..=NOTIFY_RETRIES {
+        match notifier.notify(chunk.clone()).await {
+            Ok(()) => return true,
+            Err(_) if notifier.is_stopped() => {
+                tracing::debug!("the notification session ended mid-reply");
+                return false;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    attempt,
+                    error = %e,
+                    "the notification queue would not take a chunk; retrying"
+                );
+                tokio::time::sleep(NOTIFY_RETRY_BACKOFF).await;
+            }
+        }
+    }
+    // A warning rather than a silence, which is the whole point: this ends a session, and
+    // whoever is holding the client deserves to find out why from the robot's own journal.
+    tracing::warn!(
+        retries = NOTIFY_RETRIES,
+        "gave up on a notification chunk; ending the session rather than sending a corrupt line"
+    );
+    false
+}
+
+/// What the advertisement says about the robot: what it is called, where it is on the network, and
+/// whether anyone may connect to it.
+///
+/// One struct rather than three arguments threaded through the reconcile loop, so that "has
+/// anything moved" is one comparison. `connectable` belongs here for exactly that reason: it moves
+/// on its own schedule, and keeping it beside the struct would be a second comparison to forget.
+/// It costs nothing in the advertisement's 31 bytes — it is the advertisement's *type* rather than
+/// a field in it, so `duck_ble::adv`'s budget is untouched.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Advertised {
     name: String,
-    /// `None` is a robot with no IPv4 address, which goes out as `0.0.0.0` — see [`crate::adv`] for
+    /// `None` is a robot with no IPv4 address, which goes out as `0.0.0.0` — see [`duck_ble::adv`] for
     /// why the field is broadcast either way.
     address: Option<Ipv4Addr>,
+    /// Whether a central may connect to this. False while one is already being served — see
+    /// [`advertise`] for what that changes and why it is not just politeness.
+    connectable: bool,
 }
 
 impl std::fmt::Display for Advertised {
     /// For the journal, where the interesting line is the one that says what changed.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self.address {
-            Some(address) => write!(f, "{} at {address}", self.name),
-            None => write!(f, "{} with no address", self.name),
+            Some(address) => write!(f, "{} at {address}", self.name)?,
+            None => write!(f, "{} with no address", self.name)?,
         }
+        if !self.connectable {
+            write!(f, ", not taking connections")?;
+        }
+        Ok(())
     }
 }
 
@@ -581,11 +744,43 @@ impl std::fmt::Display for Advertised {
 /// all, and returning an error here would take the advertisement down with it.
 ///
 /// **The address field is dropped rather than allowed to fail the registration.** The arithmetic in
-/// [`crate::adv`] says the payload fits, but the byte that overflows a legacy advertisement is the
+/// [`duck_ble::adv`] says the payload fits, but the byte that overflows a legacy advertisement is the
 /// controller's to count, not ours — and BlueZ refuses the whole registration when it does not fit.
 /// On a robot whose only front door may be BLE, that trade is not close: an advertisement with no
 /// address is a robot someone can still reach, and a refused one is a robot that has gone dark. Same
 /// reasoning as the alias above, one step further down.
+///
+/// ## Why a busy robot advertises a *broadcast*
+///
+/// [`Advertised::connectable`] is false while a central is being served, and then this registers
+/// the same payload as a non-connectable advertisement instead of a connectable one. Two separate
+/// things make that the right shape, and only one of them is about this hardware:
+///
+/// - **The daemon serves one central at a time.** `bluer` holds one notification state per
+///   characteristic (see this module's header), so a second subscriber does not get a second
+///   session — it *replaces* the first one. A connectable advertisement while a client is being
+///   served therefore invites something the robot cannot honour, and the client that accepts the
+///   invitation is the one that breaks the session someone else was using.
+/// - **The radio will not do it anyway.** A connection stops the advertising set that produced it,
+///   and Linux will not re-enable a connectable set while a peripheral-role connection is open
+///   unless the controller's LE Supported States say it can — `is_advertising_allowed` in
+///   `net/bluetooth/hci_sync.c`, which wants states 38 and 21. The board's controller has 20 and 21
+///   and not 38, measured: with a phone connected, a non-connectable set carrying this same service
+///   UUID was found by a scan from a laptop, and a connectable one registered without ever reaching
+///   the air.
+///
+/// So this is not a workaround dressed as a policy. Going non-connectable is the true statement —
+/// *here I am, not available* — and it is also the only statement the controller will broadcast.
+/// What it buys is everything a listing answers without connecting: `duckctl scan` finds the robot
+/// while the phone app holds it, and the address in the payload is what `duckctl ip`, `ssh`, `scp`
+/// and `open` need, none of which take the radio at all.
+///
+/// The swap back is the one that can fail quietly. BlueZ registers a connectable advertisement
+/// whether or not the kernel will enable it, so a central that unsubscribes without disconnecting
+/// leaves this holding a handle to an advertisement that is not on the air. That is exactly the
+/// state the robot was in before any of this existed, it resolves itself when the link drops — the
+/// kernel re-enables the instance on disconnect — and it is the reason [`reconcile_advertisement`]
+/// re-registers rather than assuming a handle means visibility.
 async fn advertise(
     adapter: &bluer::Adapter,
     advertised: &Advertised,
@@ -600,16 +795,25 @@ async fn advertise(
     let advertisement = |address: Option<Vec<u8>>| Advertisement {
         service_uuids: [SERVICE_UUID].into_iter().collect(),
         manufacturer_data: address
-            .map(|data| [(crate::adv::COMPANY_ID, data)].into_iter().collect())
+            .map(|data| [(duck_ble::adv::COMPANY_ID, data)].into_iter().collect())
             .unwrap_or_default(),
-        discoverable: Some(true),
+        advertisement_type: if advertised.connectable {
+            Type::Peripheral
+        } else {
+            Type::Broadcast
+        },
+        // Set only on the connectable variant, because `org.bluez.LEAdvertisement` says this
+        // property shall not be set when the type is `broadcast` and BlueZ refuses the whole
+        // registration when it is. No loss: the flag it sets is the general-discoverable one, and a
+        // scanner finds this by the service UUID, which is in the payload either way.
+        discoverable: advertised.connectable.then_some(true),
         local_name: Some(name.to_owned()),
         min_interval: Some(ADV_INTERVAL_MIN),
         max_interval: Some(ADV_INTERVAL_MAX),
         ..Default::default()
     };
 
-    let with_address = advertisement(Some(crate::adv::address_data(advertised.address)));
+    let with_address = advertisement(Some(duck_ble::adv::address_data(advertised.address)));
     match adapter.advertise(with_address).await {
         Ok(handle) => Ok(handle),
         Err(e) => {
@@ -623,31 +827,53 @@ async fn advertise(
     }
 }
 
-/// Keep the advertisement in step with what `configd` says — name and address. Never returns.
+/// Keep the advertisement in step with the robot — the name and address `configd` reports, and
+/// whether a central is being served. Never returns.
 ///
-/// Owns the advertisement handle, because changing either means deregistering one advertisement and
-/// registering another — nothing else may be holding it while that happens.
+/// Owns the advertisement handle, because changing any of the three means deregistering one
+/// advertisement and registering another — nothing else may be holding it while that happens.
 ///
 /// `pinned_name` is `--name`: the name is then this process's own and there is nobody to ask about
 /// it, so only the address is reconciled. The loop still runs, because a pinned name does not pin a
-/// DHCP lease.
+/// DHCP lease — nor a client arriving.
+///
+/// **Two cadences, one loop.** The tick is [`SESSION_POLL`] and `configd` is asked every
+/// [`ADV_POLL`]; the reasoning is on those two constants. Folding them into one loop rather than
+/// two tasks is not tidiness: both decide what is on the air, and the handle may only be held by
+/// one of them.
 async fn reconcile_advertisement(
     adapter: &bluer::Adapter,
     sockets: &Sockets,
     mut advertised: Advertised,
     pinned_name: bool,
     mut handle: Option<bluer::adv::AdvertisementHandle>,
+    session: &SessionSlot,
 ) {
+    let mut asked = tokio::time::Instant::now();
     loop {
-        tokio::time::sleep(ADV_POLL).await;
+        tokio::time::sleep(SESSION_POLL).await;
 
-        let current = Advertised {
-            name: if pinned_name {
+        let due = asked.elapsed() >= ADV_POLL;
+        let (name, address) = if due {
+            let name = if pinned_name {
                 advertised.name.clone()
             } else {
                 ask_name(sockets, &advertised.name).await
-            },
-            address: ask_address(sockets, advertised.address).await,
+            };
+            let address = ask_address(sockets, advertised.address).await;
+            // After the asks rather than before: `ASK_TIMEOUT` is as long as [`ADV_POLL`], so a
+            // `configd` that is not answering would otherwise be asked again the moment it timed
+            // out, on every tick, for as long as the outage lasted.
+            asked = tokio::time::Instant::now();
+            (name, address)
+        } else {
+            (advertised.name.clone(), advertised.address)
+        };
+
+        let current = Advertised {
+            name,
+            address,
+            connectable: !serving(session),
         };
         // `handle` is `None` only after a failed re-advertise, and then the robot is invisible —
         // so retry regardless of whether anything moved.
@@ -715,7 +941,7 @@ async fn ask_name(sockets: &Sockets, fallback: &str) -> String {
 /// watching the address blink. So an outage keeps the last known address, exactly as [`ask_name`]
 /// keeps the last known name.
 ///
-/// Only IPv4, because only IPv4 fits — see [`crate::adv`].
+/// Only IPv4, because only IPv4 fits — see [`duck_ble::adv`].
 ///
 /// `debug` rather than `warn` for the same reason as [`ask_name`]: this runs every few seconds.
 async fn ask_address(sockets: &Sockets, last: Option<Ipv4Addr>) -> Option<Ipv4Addr> {

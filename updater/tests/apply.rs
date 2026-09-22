@@ -2730,3 +2730,48 @@ async fn a_degraded_commit_says_so_rather_than_reporting_healthy() {
     assert!(detail.contains("motor bus"), "{detail}");
     assert!(detail.contains("cannot have caused"), "{detail}");
 }
+
+/// The same distinction, one route further out: what anyone asking for status is told.
+///
+/// The transcript learned to say "degraded" where it used to say "healthy"; `status` kept
+/// answering a three-way question with a boolean, so the board above -- a release the gate had
+/// just deliberately committed onto it -- was indistinguishable from a robot whose control loop
+/// was dead. `robotctl` printed `UNHEALTHY`, and a rollback with an unrelated cause was read as
+/// this robot's fault for an afternoon.
+#[tokio::test]
+async fn status_reports_a_degraded_robot_as_degraded() {
+    let fx = Fixture::new();
+    fx.publish("1.0.0", None);
+    let mut engine = fx.engine(Box::new(DegradedRobot), Faults::none(), "");
+    apply_latest(&mut engine).await.unwrap();
+
+    let status = engine.status().await.unwrap();
+    let daemon = &status[0];
+
+    assert_eq!(daemon.healthy, Some(false), "degraded is not healthy");
+    assert!(daemon.degraded, "and the fault belongs to the board");
+    assert!(
+        daemon
+            .reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("motor bus"),
+        "{:?}",
+        daemon.reason
+    );
+}
+
+/// And the healthy robot every other test in this file uses must stay unadorned: no `degraded`
+/// flag to explain away, and no reason string to read.
+#[tokio::test]
+async fn status_reports_a_healthy_robot_with_nothing_to_explain() {
+    let fx = Fixture::new();
+    fx.publish("1.0.0", None);
+    let engine = fx.engine_healthy();
+
+    let daemon = &engine.status().await.unwrap()[0];
+
+    assert_eq!(daemon.healthy, Some(true));
+    assert!(!daemon.degraded);
+    assert_eq!(daemon.reason, None);
+}

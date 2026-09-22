@@ -136,6 +136,24 @@ impl Server {
 
     /// As [`Self::new`], with uids/gids permitted to mutate beyond the owning uid.
     pub fn with_policy(engine: Engine, allow_uids: Vec<u32>, allow_gids: Vec<u32>) -> Self {
+        Self::with_policy_at(
+            engine,
+            allow_uids,
+            allow_gids,
+            PathBuf::from(crate::account::DEFAULT_PATH),
+        )
+    }
+
+    /// [`Self::with_policy`], with the account credential somewhere other than a robot's.
+    ///
+    /// The simulator, where the daemons run as a person and `/etc/robot` is not writable. See
+    /// [`crate::account::account_at`].
+    pub fn with_policy_at(
+        engine: Engine,
+        allow_uids: Vec<u32>,
+        allow_gids: Vec<u32>,
+        token_path: PathBuf,
+    ) -> Self {
         let (progress_tx, _) = broadcast::channel(PROGRESS_BUFFER);
         Self {
             engine: Arc::new(Mutex::new(engine)),
@@ -146,9 +164,7 @@ impl Server {
             allow_uids,
             allow_gids,
             forced_owner_uid: None,
-            account: Arc::new(crate::account::Account::new(crate::account::Store::new(
-                crate::account::DEFAULT_PATH,
-            ))),
+            account: Arc::new(crate::account::account_at(token_path)),
         }
     }
 
@@ -159,10 +175,7 @@ impl Server {
     /// developer's machine try to write — the real robot's credential.
     #[doc(hidden)]
     pub fn with_account_for_test(mut self, token_path: PathBuf, endpoint: String) -> Self {
-        self.account = Arc::new(crate::account::Account::with_endpoint(
-            crate::account::Store::new(token_path),
-            endpoint,
-        ));
+        self.account = Arc::new(crate::account::account_for_test(token_path, endpoint));
         self
     }
 
@@ -635,6 +648,32 @@ impl Server {
                     Err(e) => Response::err(Some(id), e.to_rpc_error()),
                 }
             }
+            // The detector's set: the same two questions against the other root, and the same
+            // locking — a read that takes no lock, an install that must not run beside a release
+            // install because both would be restarting daemons at once.
+            Call::DetectorCheck => {
+                Response::ok(Some(id), &crate::policy::check(
+                    std::path::Path::new(crate::policy::DETECTOR_ROOT),
+                ).await)
+            }
+            Call::DetectorInstall(params) => {
+                let engine = match self.engine.try_lock() {
+                    Ok(engine) => engine,
+                    Err(_) => {
+                        return Response::err(
+                            Some(id),
+                            proto::Error::new(
+                                proto::code::BUSY,
+                                "an update is in progress; retry shortly",
+                            ),
+                        );
+                    }
+                };
+                match engine.install_detector(params.version.as_deref()).await {
+                    Ok(result) => Response::ok(Some(id), &result),
+                    Err(e) => Response::err(Some(id), e.to_rpc_error()),
+                }
+            }
             // ── account.* ───────────────────────────────────────────────────────
             //
             // None of the three touches the engine, so none takes its lock: a login is an HTTP
@@ -642,14 +681,17 @@ impl Server {
             // what makes `status` answerable during an update, which it has to be.
             Call::AccountLogin(params) => {
                 match Arc::clone(&self.account).login(params.force).await {
-                    Ok(login) => Response::ok(Some(id), &login),
-                    Err(e) => Response::err(Some(id), e.to_rpc_error()),
+                    Ok(code) => Response::ok(Some(id), &crate::account::login_result(code)),
+                    Err(e) => Response::err(Some(id), crate::Error::from(e).to_rpc_error()),
                 }
             }
-            Call::AccountStatus => Response::ok(Some(id), &self.account.status().await),
+            Call::AccountStatus => Response::ok(
+                Some(id),
+                &crate::account::status_result(self.account.status().await),
+            ),
             Call::AccountLogout => match self.account.logout().await {
-                Ok(result) => Response::ok(Some(id), &result),
-                Err(e) => Response::err(Some(id), e.to_rpc_error()),
+                Ok(was) => Response::ok(Some(id), &crate::account::logout_result(was)),
+                Err(e) => Response::err(Some(id), crate::Error::from(e).to_rpc_error()),
             },
 
             // Read-only and no engine lock: asking the Hub what exists changes nothing here.
@@ -745,6 +787,7 @@ impl Server {
             | Call::RobotEnable(_)
             | Call::RobotInit
             | Call::RobotRelax
+            | Call::RobotRebootMotors(_)
             | Call::RobotDo(_)
             | Call::RobotSound(_)
             | Call::RobotPose(_)
@@ -758,6 +801,7 @@ impl Server {
             | Call::RobotMode
             | Call::RobotSetMode(_)
             | Call::RobotPolicies
+            | Call::RobotModel
             | Call::RobotLoadPolicy(_)
             | Call::RobotReloadPolicies
             | Call::RobotSubscribe(_) => Response::err(
@@ -777,6 +821,7 @@ impl Server {
             | Call::NetForget(_)
             | Call::SystemInfo
             | Call::SystemServices
+            | Call::SystemLogs(_)
             | Call::SystemSetName(_)
             | Call::SystemReboot
             | Call::SystemPairingPin
@@ -815,11 +860,11 @@ impl Server {
             ),
 
             // Same story one namespace over: `tofd` owns the sensor and answers for it.
-            Call::TofStream => Response::err(
+            Call::TofStream | Call::HeadImuStream => Response::err(
                 Some(id),
                 proto::Error::new(
                     proto::code::METHOD_NOT_FOUND,
-                    "tof.stream is served by tofd itself, on /run/tofd/tof.sock",
+                    "tof.stream and head_imu.stream are served by tofd itself, on /run/tofd/tof.sock",
                 ),
             ),
 

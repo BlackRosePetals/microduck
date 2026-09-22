@@ -1,6 +1,6 @@
 //! The page, served by the daemon it drives.
 //!
-//! One route, one file, no build step. `http://<robot>:8080/` and there is nothing else to run —
+//! An embedded console and an on-demand PNG snapshot, with no frontend build step. `http://<robot>:8080/` and there is nothing else to run —
 //! which is the whole of it, and `webrtc-console.md` §1 is why it is worth a dependency and a
 //! second port.
 //!
@@ -38,6 +38,8 @@
 //! and say nothing about why.
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use axum::Router;
@@ -72,7 +74,7 @@ pub fn page(signalling_port: u32) -> String {
 /// Returns only on failure — a bind that was refused, or a listener that died. The caller decides
 /// what that costs; in `mediad` it costs the page and not the video, because a robot that streams
 /// and answers control calls with no console is a great deal better than one that does neither.
-pub async fn serve(host: &str, port: u16, page: String) -> Result<()> {
+pub async fn serve(host: &str, port: u16, page: String, frame_socket: PathBuf) -> Result<()> {
     let address: SocketAddr = format!("{host}:{port}")
         .parse()
         .with_context(|| format!("{host}:{port} is not an address to listen on"))?;
@@ -81,19 +83,150 @@ pub async fn serve(host: &str, port: u16, page: String) -> Result<()> {
         .with_context(|| format!("could not listen on {address}"))?;
 
     tracing::info!(%address, "serving the console");
-    axum::serve(listener, router(page))
+    axum::serve(listener, router(page, frame_socket))
         .await
         .context("the console's listener stopped")
 }
 
-/// One route, returning `page`.
-fn router(page: String) -> Router {
-    Router::new().route("/", get(move || std::future::ready(Html(page))))
+/// The console and its bounded, uncached snapshot endpoint.
+fn router(page: String, frame_socket: PathBuf) -> Router {
+    let slots = Arc::new(tokio::sync::Semaphore::new(4));
+    Router::new()
+        .route("/", get(move || std::future::ready(Html(page))))
+        .route(
+            "/frame",
+            get(move || snapshot(frame_socket.clone(), slots.clone())),
+        )
+}
+
+async fn snapshot(socket: PathBuf, slots: Arc<tokio::sync::Semaphore>) -> axum::response::Response {
+    use axum::http::{StatusCode, header};
+    use axum::response::IntoResponse;
+    let result: Result<Vec<u8>> = async {
+        let permit = slots
+            .try_acquire_owned()
+            .context("snapshot capacity reached")?;
+        let (metadata, pixels) = crate::snapshot::fetch(&socket).await?;
+        tokio::task::spawn_blocking(move || {
+            // The permit belongs to the encoder, even if the HTTP client disconnects.
+            let _permit = permit;
+            crate::snapshot::png(metadata, pixels)
+        })
+        .await?
+    }
+    .await;
+    let mut response = match result {
+        Ok(png) => ([(header::CONTENT_TYPE, "image/png")], png).into_response(),
+        Err(error) => {
+            tracing::debug!(%error, "snapshot unavailable");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Camera snapshot unavailable; retry when capture is running.\n",
+            )
+                .into_response()
+        }
+    };
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
+    response
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The PNG comes out upright, because a picture is the one reply with nowhere to carry the
+    /// mount angle. A quarter turn swaps the axes and moves the bright pixel; an upright mount
+    /// leaves both alone, and the same route has to do each.
+    #[tokio::test]
+    async fn frame_route_handshakes_and_returns_a_decodable_uncached_upright_png() {
+        for (rotate, size, bright) in [(0, (2, 1), (1, 0)), (90, (1, 2), (0, 1))] {
+            frame_route_returns(rotate, size, bright).await;
+        }
+    }
+
+    async fn frame_route_returns(rotate: u32, size: (u32, u32), bright: (u32, u32)) {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("media.sock");
+        let camera = tokio::net::UnixListener::bind(&socket).unwrap();
+        let producer = tokio::spawn(async move {
+            let (stream, _) = camera.accept().await.unwrap();
+            let (read, mut write) = stream.into_split();
+            let mut reader = BufReader::new(read);
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+            let hello: proto::Request = serde_json::from_str(&line).unwrap();
+            assert_eq!(hello.method, proto::method::HELLO);
+            assert_eq!(hello.params.unwrap()["api_version"], proto::API_VERSION);
+            let response = proto::Response::ok(
+                hello.id,
+                &proto::HelloResult {
+                    api_version: proto::API_VERSION,
+                    daemon_version: None,
+                    revision: None,
+                },
+            );
+            write
+                .write_all(format!("{}\n", serde_json::to_string(&response).unwrap()).as_bytes())
+                .await
+                .unwrap();
+            line.clear();
+            reader.read_line(&mut line).await.unwrap();
+            let request: proto::Request = serde_json::from_str(&line).unwrap();
+            assert_eq!(request.method, proto::method::MEDIA_FRAME);
+            let header = proto::MediaFrameHeader {
+                width: 2,
+                height: 1,
+                format: "UYVY".into(),
+                bytes: 4,
+                captured_at_unix_us: 1,
+                rotate,
+            };
+            let mut reply = serde_json::to_vec(&proto::Response::ok(request.id, &header)).unwrap();
+            reply.push(b'\n');
+            reply.extend([128, 16, 128, 235]);
+            write.write_all(&reply).await.unwrap();
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router(page(8443), socket))
+                .await
+                .unwrap();
+        });
+        let response = reqwest::get(format!("http://{address}/frame"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.headers()["content-type"], "image/png");
+        assert_eq!(response.headers()["cache-control"], "no-store");
+        let decoded = image::load_from_memory(&response.bytes().await.unwrap())
+            .unwrap()
+            .to_rgb8();
+        assert_eq!(decoded.dimensions(), size);
+        assert!(decoded.get_pixel(bright.0, bright.1)[0] > 250);
+        // The dark pixel is the frame's first either way round: a clockwise turn takes source
+        // (0, 0) to upright (0, 0), so only the bright one has to move for the turn to be real.
+        assert!(decoded.get_pixel(0, 0)[0] < 5);
+        producer.await.unwrap();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn unavailable_and_busy_camera_fail_without_caching() {
+        let dir = tempfile::tempdir().unwrap();
+        for slots in [0, 1] {
+            let response = snapshot(
+                dir.path().join("missing.sock"),
+                Arc::new(tokio::sync::Semaphore::new(slots)),
+            )
+            .await;
+            assert_eq!(response.status(), 503);
+            assert_eq!(response.headers()["cache-control"], "no-store");
+        }
+    }
 
     /// The whole of what this module does to the page.
     #[test]
@@ -121,6 +254,27 @@ mod tests {
         );
     }
 
+    /// **The page the robot serves must be in LAN mode, and the page in the repository must not
+    /// be.**
+    ///
+    /// One file serves two hosts: substituting the port is what tells it a robot served it, and
+    /// the copy pushed to the Space keeps the token so the page reaches for the rendezvous
+    /// instead — a browser on an https page cannot open a `ws://` at all, so getting this
+    /// backwards produces a console that connects to nothing and says nothing.
+    /// `scripts/publish-console.sh` asserts the other half of it at deploy time.
+    #[test]
+    fn the_unsubstituted_page_is_the_remote_one() {
+        assert!(
+            PAGE.contains(PORT_TOKEN),
+            "the page in the repository must carry the port token: it is what the Space copy \
+             reads as `no robot served me`"
+        );
+        assert!(
+            !page(8443).contains(PORT_TOKEN),
+            "and the served page must not, or the robot would serve a page that ignores it"
+        );
+    }
+
     /// A non-default `--port` reaches the page, which is the reason the substitution exists at all:
     /// a page carrying a constant would still be dialling 8443.
     #[test]
@@ -140,7 +294,11 @@ mod tests {
             .expect("a loopback port");
         let address = listener.local_addr().expect("the port it took");
         tokio::spawn(async move {
-            let _ = axum::serve(listener, router(page(8443))).await;
+            let _ = axum::serve(
+                listener,
+                router(page(8443), PathBuf::from(proto::socket::MEDIA)),
+            )
+            .await;
         });
 
         let mut stream = tokio::net::TcpStream::connect(address)

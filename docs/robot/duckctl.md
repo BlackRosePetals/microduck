@@ -74,6 +74,46 @@ ssh radxa@$(duckctl ip)
 connects to nothing, needs no PIN, and takes about a second — and the answer is not stale: `btd`
 re-reads the address every five seconds and re-advertises when it moves.
 
+Or skip the substitution:
+
+```bash
+duckctl ssh
+```
+
+```bash
+duckctl ssh -- sudo robotctl pad pair
+```
+
+`ssh` finds the address the way `ip` does and then becomes `ssh`, so the prompts, the terminal and
+the exit status are ssh's own. The account is `--user`, else `DUCK_BOARD_USER` from the environment
+— the variable [`dev-push.sh`](dev-push.md) reads, so a laptop set up for pushing is set up for this
+— else `radxa`. Words after `--` run on the robot instead of opening a shell.
+
+Files go the same way:
+
+```bash
+duckctl scp report.md :/tmp/
+```
+
+```bash
+duckctl scp :/var/log/robotd.log .
+```
+
+A path starting with `:` is on the robot — `scp`'s own `host:path` with the host left out, since the
+host is the part this finds for you. Everything else reaches `scp` as typed, `-r` and the rest of
+its flags included, and the progress meter and the exit status are `scp`'s own. The account resolves
+the way `ssh`'s does.
+
+This tool's own flags come first, before the paths:
+
+```bash
+duckctl --name ducky scp -r logs/ :/tmp/
+```
+
+A copy with no `:` anywhere in it is refused before the scan, because it is a local-to-local copy
+that no robot is party to and nothing in `scp`'s output would say so. A local file that really is
+named `:foo` is `./:foo`.
+
 A robot bonded to this machine often stops advertising the service to it, and then `ip` connects and
 asks `net.status` instead. That is slower and needs the PIN, and it always answers. `--verbose` says
 which of the two happened.
@@ -234,6 +274,22 @@ duckctl --name <robot-name> health
 Whether the control loop is healthy.
 
 ```bash
+duckctl --name <robot-name> reboot-motors
+```
+
+The way back from a servo in hardware error — overload, overheating, electrical shock — which
+otherwise holds torque off until the battery is pulled. `health` names the joint. Add ids to reboot
+only those:
+
+```bash
+duckctl --name <robot-name> reboot-motors 3 11
+```
+
+**Torque goes off on every joint first**, so hold the robot or have it lying down. It stays limp
+afterwards, with the gains restored on the next write — press Start on the pad, or
+`duckctl call robot.init`, to stand it back up.
+
+```bash
 duckctl --name <robot-name> status
 ```
 
@@ -247,6 +303,50 @@ duckctl --name <robot-name> version
 
 The API version, the release, and the git revision it was built from. A `revision` of `null` means
 the release was built on somebody's laptop rather than by CI.
+
+## Logs
+
+```bash
+duckctl --name <robot-name> logs robotd
+```
+
+The last 40 lines of that daemon's journal, this boot. For more, and for the boot before this one:
+
+```bash
+duckctl --name <robot-name> logs robotd -n 200
+```
+
+```bash
+duckctl --name <robot-name> logs btd --boot -1
+```
+
+Readable units: `updaterd`, `robotd`, `configd`, `btd`, `padd`, `mediad`, `tofd`, plus
+`bluetooth` and `NetworkManager`. The `.service` suffix is optional, and anything else comes back
+refused with that list.
+
+Lines go to stdout and everything else to stderr, so `logs robotd -n 200 | grep -i panic` works.
+A long tail is trimmed to what the radio can carry, oldest lines first, with a note saying so.
+
+A tail that spans a restart says where:
+
+```
+2026-09-09T12:27:20+00:00 systemd[1]: Starting robotd.service - Robot control daemon...
+-- new robotd process, pid 3227 --
+2026-09-09T12:27:21+00:00 robotd[3227]: control loop running joints=15 hz=50.0 driving=true
+```
+
+Which matters after an update, when forty lines carry two different builds' output. Anything in
+`-- … --` comes from the robot rather than the journal.
+
+There is no `-f`, no `--since` and no search. For those, ssh in:
+
+```bash
+ssh radxa@$(duckctl --name <robot-name> ip)
+```
+
+```bash
+journalctl -u robotd -f
+```
 
 ## Updates
 
@@ -549,7 +649,8 @@ minutes with nothing arriving at all — which is why they are the way to run an
 ## What it prints
 
 Replies go to stdout as pretty JSON, and everything else — progress, diagnosis, what the radio
-saw — to stderr. So `duckctl ... info > reply.json` keeps the two apart, and a JSON-RPC error
+saw — to stderr. `logs` is the exception and prints its lines as lines, since a journal tail in
+escaped JSON is unreadable; a refusal from it still prints as JSON. So `duckctl ... info > reply.json` keeps the two apart, and a JSON-RPC error
 from the robot still exits non-zero. Progress lines start with `·` and are one line each, so
 `update apply > outcome.json` leaves them on screen and keeps the outcome in the file.
 
@@ -564,15 +665,17 @@ watching, and `update status` afterwards says how it went.
 
 ## What is refused
 
-Teleop (`robot.move`, `robot.head`, `robot.enable`, `robot.stop`, `robot.init`, `robot.relax`),
-high-rate telemetry (`robot.subscribe`), the two update commands a person has to mean
-(`update.pin`, `update.resetToGolden`) and the pairing PIN (`system.pairingPin`,
-`system.setPairingPin`) are refused by `btd` itself and never reach a daemon.
+Teleop (`robot.move`, `robot.head`, `robot.look`, `robot.pose`, `robot.mouth`), the emergency stop
+(`robot.stop`), letting the joints go (`robot.relax`), high-rate telemetry (`robot.subscribe`), the
+two update commands a person has to mean (`update.pin`, `update.resetToGolden`) and the pairing PIN
+(`system.pairingPin`, `system.setPairingPin`) are refused by `btd` itself and never reach a daemon.
+They come back as error code 14, "not available over Bluetooth".
 
-`robot.do` is **not** in that list, though it moves the robot: teleop is a stream of fifty small
-updates a second, which is what a 20-byte notification budget cannot carry, and a skill is one
-request. They come back as
-error code 14, "not available over Bluetooth".
+`robot.do`, `robot.init`, `robot.enable` and `robot.rebootMotors` are **not** in that list, though
+all four move the robot: teleop is a stream of fifty small updates a second, which is what a
+20-byte notification budget cannot carry, and each of these is one request. `robot.relax` is the
+one that stays refused on grounds other than rate — its only outcome is a robot that was holding
+itself up and now is not.
 
 That is a security boundary rather than a missing feature, and each refusal has its reason next
 to it in `btd/src/route.rs` — [`app-path-design.md`](../design/app-path-design.md) §3.1 is the

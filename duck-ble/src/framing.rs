@@ -21,20 +21,84 @@
 /// and it is reachable by anyone in radio range. Generous next to any real request — the
 /// largest is an `update.apply` with a long ref — and far below `updaterd`'s own 1 MiB line
 /// limit, because nothing that big has any business arriving over BLE.
+///
+/// **This bounds what a peer may send, not what the robot may answer.** The two are not the
+/// same size and were one constant until a reply outgrew it: see [`MAX_REPLY_LINE`].
 pub const MAX_LINE: usize = 8 * 1024;
 
+/// Longest line a *client* will reassemble from the robot.
+///
+/// The other direction, and it needs its own number. [`MAX_LINE`] is a security bound — the
+/// peer it limits is anyone in radio range, so it is deliberately tight — whereas this limits
+/// the robot a client chose to connect to and already trusts. Reusing the tight one here made
+/// every reply over 8 KiB unreadable, which quietly took `update.show` (kilobytes for an
+/// ordinary run) and `system.logs` (a screenful of journal) out of reach of `duckctl` while
+/// `btd` served both correctly.
+///
+/// 64 KiB, and the real limit on a reply is smaller still and lives elsewhere: `proto`'s
+/// `MAX_LOG_BYTES` keeps the journal tail well inside this, because at a typical ATT MTU
+/// 64 KiB is a minute on the air and no answer should take that long.
+pub const MAX_REPLY_LINE: usize = 64 * 1024;
+
+/// Notification payload a session starts with, before any write has reported the negotiated one.
+///
+/// 20 bytes is what every BLE link is required to support, so it is the only safe *first* guess.
+pub const FLOOR_MTU: usize = 20;
+
+/// The largest a GATT characteristic value may be, whatever the MTU says.
+///
+/// **512 octets, from the Core specification** (Vol 3, Part F, §3.2.9), and it is not the same
+/// number as the ATT MTU. An MTU of 517 *is* this limit — 512 bytes of value plus five bytes of
+/// ATT overhead — which is why 517 is the figure every stack converges on, and why subtracting
+/// only the three-byte notification header from it overshoots by two.
+pub const MAX_ATTRIBUTE_VALUE: usize = 512;
+
+/// How large a notification this link will actually carry.
+///
+/// `mtu - 3` is the ATT arithmetic and it is not sufficient on its own: against the 517-byte MTU
+/// a CoreBluetooth central negotiates it yields 514, and a central handed a 514-byte value keeps
+/// the first 512 and discards the rest. **Silently** — no error on either side.
+///
+/// What that looked like before it was understood: two bytes disappearing from the middle of
+/// every reply longer than one chunk, so `{"security":"wpa_psk"}` arrived as
+/// `{"serity":"wpa_psk"}` and a client failed to parse a field the robot had sent correctly.
+/// Worse when the missing pair happened to include the newline, because then the line never
+/// completed and the call waited out its budget against a robot that had already answered. Single
+/// chunk replies — `net.status`, `system.info`, `hello` — were fine throughout, which is what
+/// made it look like a problem with the larger methods rather than with every boundary.
+pub fn notification_payload(mtu: u16) -> usize {
+    // `clamp` rather than `min` then `max`: the two constants are ordered by construction, and
+    // clippy is right that spelling it out this way says so.
+    usize::from(mtu)
+        .saturating_sub(3)
+        .clamp(FLOOR_MTU, MAX_ATTRIBUTE_VALUE)
+}
+
 /// Reassembles inbound chunks into whole lines.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Reassembler {
     buf: Vec<u8>,
+    /// What "too long" means for this direction. See [`MAX_LINE`] and [`MAX_REPLY_LINE`].
+    limit: usize,
+}
+
+/// The robot's side: [`MAX_LINE`], the tight bound, because the default must be the safe one.
+impl Default for Reassembler {
+    fn default() -> Self {
+        Self {
+            buf: Vec::new(),
+            limit: MAX_LINE,
+        }
+    }
 }
 
 /// Why a peer's bytes were rejected. Both cases mean "drop the connection", but they are
 /// logged differently: one is a client that cannot frame, the other may be an attack.
 #[derive(Debug, PartialEq, Eq)]
 pub enum FramingError {
-    /// No newline within [`MAX_LINE`].
-    LineTooLong,
+    /// No newline within this reassembler's limit, which the variant carries because the two
+    /// directions have different ones and the message must say which was hit.
+    LineTooLong { limit: usize },
     /// Not valid UTF-8, so it cannot be JSON either.
     NotUtf8,
 }
@@ -42,7 +106,7 @@ pub enum FramingError {
 impl std::fmt::Display for FramingError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::LineTooLong => write!(f, "no newline within {MAX_LINE} bytes"),
+            Self::LineTooLong { limit } => write!(f, "no newline within {limit} bytes"),
             Self::NotUtf8 => write!(f, "not valid UTF-8"),
         }
     }
@@ -57,17 +121,28 @@ impl Reassembler {
         Self::default()
     }
 
+    /// A reassembler for the answers coming *back*, bounded by [`MAX_REPLY_LINE`].
+    ///
+    /// Named for the direction rather than taking a number, so that a client reading replies
+    /// cannot pick the wrong bound and `btd` cannot accidentally be given the loose one.
+    pub fn for_replies() -> Self {
+        Self {
+            buf: Vec::new(),
+            limit: MAX_REPLY_LINE,
+        }
+    }
+
     /// Feed one chunk; get back every complete line it completed.
     ///
     /// Returns a `Vec` because one write can legitimately carry several short lines — a
     /// client that batches `hello` and `update.status` into one 40-byte write is being
     /// efficient, not wrong.
     pub fn push(&mut self, chunk: &[u8]) -> Result<Vec<String>, FramingError> {
-        if self.buf.len() + chunk.len() > MAX_LINE {
+        if self.buf.len() + chunk.len() > self.limit {
             // Clear rather than keep the partial line: whatever follows is unparseable
             // anyway, and holding it would let a peer pin the memory.
             self.buf.clear();
-            return Err(FramingError::LineTooLong);
+            return Err(FramingError::LineTooLong { limit: self.limit });
         }
         self.buf.extend_from_slice(chunk);
 
@@ -104,9 +179,8 @@ impl Reassembler {
 /// reassembles until newline then needs no notion of "end of message" beyond the one it
 /// already has.
 pub fn chunks(line: &str, mtu: usize) -> Vec<Vec<u8>> {
-    // A zero or absurd MTU would divide by zero or emit one chunk per byte. 20 is the
-    // floor BLE guarantees before any negotiation.
-    let mtu = mtu.max(20);
+    // A zero or absurd MTU would divide by zero or emit one chunk per byte.
+    let mtu = mtu.max(FLOOR_MTU);
 
     let mut bytes = line.as_bytes().to_vec();
     if !bytes.ends_with(b"\n") {
@@ -165,9 +239,33 @@ mod tests {
     fn a_line_without_a_newline_is_refused_at_the_cap() {
         let mut r = Reassembler::new();
         let big = vec![b'x'; MAX_LINE + 1];
-        assert_eq!(r.push(&big), Err(FramingError::LineTooLong));
+        assert_eq!(
+            r.push(&big),
+            Err(FramingError::LineTooLong { limit: MAX_LINE })
+        );
         // And the buffer was released, so the peer cannot pin memory by retrying.
         assert_eq!(r.pending(), 0);
+    }
+
+    /// A reply larger than the request cap must reassemble on the client side.
+    ///
+    /// The regression this pins is one constant serving both directions: with a single 8 KiB
+    /// cap, a `system.logs` answer arrived intact from the robot and died in `duckctl` as
+    /// "no newline within 8192 bytes", which reads like a broken robot and is not one.
+    #[test]
+    fn a_reply_bigger_than_the_request_cap_is_accepted_by_a_client() {
+        let reply = format!("{{\"result\":\"{}\"}}\n", "x".repeat(32 * 1024));
+
+        let mut robot_side = Reassembler::new();
+        assert!(matches!(
+            robot_side.push(reply.as_bytes()),
+            Err(FramingError::LineTooLong { limit: MAX_LINE })
+        ));
+
+        let mut client_side = Reassembler::for_replies();
+        let lines = client_side.push(reply.as_bytes()).expect("under the cap");
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].len(), reply.len() - 1);
     }
 
     #[test]
@@ -211,5 +309,40 @@ mod tests {
     #[test]
     fn an_absurd_mtu_falls_back_to_the_ble_floor() {
         assert_eq!(chunks(&"z".repeat(40), 0).len(), 3); // 41 bytes over 20-byte chunks
+    }
+}
+
+#[cfg(test)]
+mod payload_tests {
+    use super::{FLOOR_MTU, MAX_ATTRIBUTE_VALUE, notification_payload};
+
+    /// The regression this exists for. 517 is what a CoreBluetooth central negotiates, and
+    /// `mtu - 3` alone gives 514 — two bytes more than a characteristic value may hold, which
+    /// the central drops without telling anybody.
+    #[test]
+    fn a_corebluetooth_mtu_does_not_exceed_the_value_limit() {
+        assert_eq!(notification_payload(517), MAX_ATTRIBUTE_VALUE);
+    }
+
+    /// Below the cap the ATT arithmetic is the whole answer, and the common small MTUs must not
+    /// be rounded up to it.
+    #[test]
+    fn a_smaller_link_gets_what_its_mtu_allows() {
+        assert_eq!(notification_payload(23), 20);
+        assert_eq!(notification_payload(185), 182);
+        assert_eq!(notification_payload(247), 244);
+    }
+
+    /// A link reporting a huge MTU is still bounded by the value limit.
+    #[test]
+    fn nothing_above_the_cap_gets_through_it() {
+        assert_eq!(notification_payload(u16::MAX), MAX_ATTRIBUTE_VALUE);
+    }
+
+    /// Never below the floor every BLE link is required to carry, whatever is reported.
+    #[test]
+    fn a_nonsense_mtu_falls_back_to_the_floor() {
+        assert_eq!(notification_payload(0), FLOOR_MTU);
+        assert_eq!(notification_payload(3), FLOOR_MTU);
     }
 }

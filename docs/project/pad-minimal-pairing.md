@@ -245,3 +245,56 @@ worked was never read, so it is a candidate and not a finding.
 ```bash
 iw dev wlan0 get power_save
 ```
+
+## Fault 3: a bonded pad cannot reconnect while a phone is connected  · **measured** (2026-09-17)
+
+The two faults above are about *bonding*. This one is about coming back, it is separate, and it is
+what somebody using the phone app meets first.
+
+On `lavandiere` — provisioned `--weird-ble`, so `Privacy = device` — with an Xbox pad already
+bonded and trusted:
+
+| | |
+|---|---|
+| app connected, pad switched on | the pad never connects |
+| app quit, pad switched on | connects immediately |
+| pad connected first, then the app | **both work** |
+
+So it is not the bond, and it is not the pad. Whichever link is established first is kept, and the
+second one can be added to it — but a *new* central connection cannot be started while `btd` holds
+a peripheral one.
+
+An explicit connect from the board says so rather than merely timing out:
+
+```
+Failed to connect: org.bluez.Error.Failed le-connection-abort-by-local
+```
+
+That is the local host giving up, not the pad refusing. BlueZ's background auto-connect for a
+trusted device is the thing normally doing this, and it fails the same way — which is why the pad
+simply sits there.
+
+**`btd` is not advertising at the time.** It stops while a central is connected, which is why
+`duckctl scan` cannot see a robot somebody's phone is talking to. So this is not fault 2 in another
+costume: advertising is off and initiating still fails, which points at the controller refusing to
+be an initiator while it is a peripheral rather than at anything either daemon chose.
+
+### What is not worth building
+
+The obvious fix — `configd` or `padd` polling for a trusted-but-disconnected pad and connecting it
+— **does not work**, because that is exactly the call that returns the error above.
+
+The two that would work are both bad trades on this radio. `btd` could drop its link whenever a pad
+wants one, which makes the phone the thing that disconnects at random and needs `btd` to know a pad
+is asking, which it has no way to learn. Or pairing and reconnection could be moved behind a
+sequence the app drives across a deliberate disconnect, which is real work against a chip the rest
+of this page is about replacing.
+
+### What to do instead
+
+**Turn the pad on before opening the app.** Both then work, and the order is the whole of the
+workaround. `pad.status` reports `paired` and `connected` separately, so a client can see the state
+this produces — bonded, trusted, not connected — and say so rather than leaving somebody pressing
+the Xbox button at a robot that is ignoring it.
+
+Like the other two, this goes when the aic8800 does.

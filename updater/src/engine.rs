@@ -468,15 +468,35 @@ impl Engine {
         let mut out = Vec::new();
         for (name, cfg) in &self.config.components {
             let store = Store::new(cfg.install_dir.clone());
-            let healthy = match cfg.health {
+            // The verdict, not a boolean summary of it: `healthy` alone cannot tell a board
+            // with no servo power — which the gate commits onto — from a dead control loop.
+            let report = match cfg.health {
                 HealthCheck::None => None,
                 // Only a socket probe means "ask robotd". A command probe is a
                 // different question entirely; reporting robotd's health for it would
                 // be plainly wrong, so run the probe we were configured with.
                 HealthCheck::Socket { .. } => {
-                    Some(self.robot.health(ROBOT_QUERY_TIMEOUT).await.is_healthy())
+                    Some(self.robot.health(ROBOT_QUERY_TIMEOUT).await.report())
                 }
-                HealthCheck::Command { .. } => Some(self.health_gate(cfg).await.is_ok()),
+                // An exec probe has no way to say "degraded": pass, or fail with what it
+                // printed. The error is the only reason anyone will get, so pass it on.
+                HealthCheck::Command { .. } => Some(match self.health_gate(cfg).await {
+                    Ok(GatePassed::Healthy) => crate::robot::HealthReport {
+                        healthy: true,
+                        degraded: false,
+                        reason: None,
+                    },
+                    Ok(GatePassed::Degraded(reason)) => crate::robot::HealthReport {
+                        healthy: false,
+                        degraded: true,
+                        reason: Some(reason),
+                    },
+                    Err(e) => crate::robot::HealthReport {
+                        healthy: false,
+                        degraded: false,
+                        reason: Some(e.to_string()),
+                    },
+                }),
             };
             out.push(ComponentStatus {
                 component: ComponentId::new(name.clone()),
@@ -485,7 +505,9 @@ impl Engine {
                 // while an in-flight update holds it. A caller wanting live phase
                 // should subscribe to progress notifications instead.
                 phase: Phase::Idle,
-                healthy,
+                healthy: report.as_ref().map(|r| r.healthy),
+                degraded: report.as_ref().is_some_and(|r| r.degraded),
+                reason: report.and_then(|r| r.reason),
                 pinned: self.effective_pin(name),
                 last_attempt: self.journal.last_for(name)?,
             });
@@ -1302,6 +1324,42 @@ impl Engine {
         })
     }
 
+    /// Install a duck detector from the Hub, and restart `mediad` onto it.
+    ///
+    /// `mediad` loads the model once, at startup, so a swapped set is invisible to it until it
+    /// restarts — and unlike `robotd`'s policies there is no live reload to ask for, because the
+    /// detector is a thread holding an NPU context and the honest way to replace it is to start
+    /// again. The restart drops every video session, which is why `detector.install` is gated
+    /// like `policy.install`. `reloaded` is whether the restart took; a `mediad` this board does
+    /// not have (a bench) counts as taken, since there is nothing running the old one.
+    pub async fn install_detector(
+        &self,
+        version: Option<&str>,
+    ) -> Result<crate::proto::PolicyInstallResult, Error> {
+        let root = std::path::Path::new(crate::policy::DETECTOR_ROOT);
+        let (installed, previous) = crate::policy::install_set(
+            root,
+            version,
+            crate::policy::Contents::Fixed(&crate::policy::DETECTOR_FILES),
+        )
+        .await?;
+        let reloaded = match &previous {
+            None => true,
+            Some(_) => match restart_one(SYSTEMCTL, MEDIAD_UNIT).await {
+                Ok(()) => true,
+                Err(e) => {
+                    tracing::warn!(error = %e, "mediad did not restart onto the new detector");
+                    false
+                }
+            },
+        };
+        Ok(crate::proto::PolicyInstallResult {
+            installed,
+            previous,
+            reloaded,
+        })
+    }
+
     /// Fetch one policy from any Hub repo into this robot's library.
     ///
     /// The model API comes from the running `robotd` rather than from a constant here, because it
@@ -1318,7 +1376,7 @@ impl Engine {
         // out from under it. `None` — a robot that did not answer — prunes nothing at all.
         let in_use = self.robot.policy_paths(ROBOT_QUERY_TIMEOUT).await;
         crate::policy::fetch(
-            std::path::Path::new(crate::policy::LIBRARY_ROOT),
+            &self.config.policy_library,
             repo,
             revision,
             file,
@@ -2430,6 +2488,9 @@ const SYSTEMCTL: &str = "systemctl";
 
 /// Where `hooks/postinstall` installs unit files, and so where the orphan check reads them.
 const UNIT_DIR: &str = "/etc/systemd/system";
+
+/// The daemon that loads the duck detector, restarted by [`Engine::install_detector`].
+const MEDIAD_UNIT: &str = "mediad";
 
 /// This process's own unit, which the reconciliation must recognise and never restart.
 ///
