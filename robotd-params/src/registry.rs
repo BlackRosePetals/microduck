@@ -122,6 +122,11 @@ pub const REGISTRY: &[Entry] = &[
         Kind::Float,
         "EMA smoothing on head targets, 1.0 = pass-through",
     ),
+    entry(
+        "control.publish_velocity_and_load",
+        Kind::Bool,
+        "Put measured joint velocity and load on the state stream",
+    ),
     // ── [update_gate] ────────────────────────────────────────────────────────
     entry(
         "update_gate.min_achieved_hz",

@@ -1819,6 +1819,20 @@ pub struct Control {
     pub cmd_alpha: f64,
     /// Same, for head targets and the body pose.
     pub head_alpha: f64,
+    /// Whether the state stream carries measured joint velocity and load
+    /// (`RobotState::velocities`, `RobotState::currents_ma`).
+    ///
+    /// On. The servos report both in the same twelve-byte read as position, so the robot pays
+    /// nothing on the bus for them, and present current is its only measure of external force —
+    /// a foot taking weight, a hand on the beak, a servo on its way to an overload shutdown.
+    ///
+    /// Here, on the control loop, because the control loop is what assembles the frame. What it
+    /// costs is frame size: about 10–12 % of a full frame, which is +15 to +19 KB/s at 50 Hz to
+    /// each subscriber that asked for every tick. Off is the way out if that turns out to matter
+    /// on a particular robot, or if a consumer turns out to mishandle the fields — and off means
+    /// *absent*, the same thing an older daemon sends, not zeros. Nothing in this daemon reads
+    /// them back, so turning it off costs the robot nothing but the information.
+    pub publish_velocity_and_load: bool,
 }
 
 /// Thresholds that decide `healthy` — and therefore whether an update is kept.
@@ -1871,6 +1885,7 @@ impl Default for Control {
             hz: 50,
             cmd_alpha: 0.2,
             head_alpha: 0.2,
+            publish_velocity_and_load: true,
         }
     }
 }
@@ -3059,6 +3074,10 @@ mod tests {
         assert_eq!(from_file.control.hz, built_in.control.hz);
         assert_eq!(from_file.control.cmd_alpha, built_in.control.cmd_alpha);
         assert_eq!(from_file.control.head_alpha, built_in.control.head_alpha);
+        assert_eq!(
+            from_file.control.publish_velocity_and_load,
+            built_in.control.publish_velocity_and_load
+        );
         assert_eq!(from_file.policy.resolved(), built_in.policy.resolved());
         assert_eq!(from_file.safety.limp_fall, built_in.safety.limp_fall);
         assert_eq!(

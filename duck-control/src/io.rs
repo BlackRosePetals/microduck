@@ -18,8 +18,10 @@ pub struct Sensors {
     pub positions: [f64; NUM_JOINTS],
     /// Joint velocities, rad/s.
     pub velocities: [f64; NUM_JOINTS],
-    /// Present current magnitude, mA. Sign is dropped — direction is inferable from
-    /// velocity, and every consumer so far wants load, not direction.
+    /// Present current magnitude, mA. The sign is dropped by whichever driver fills this —
+    /// [`crate::bus`] takes the absolute value as it unpacks the word — because what every
+    /// consumer so far wants is load. It is not recoverable from `velocities`: a joint holding
+    /// a squat or a foot taking weight is near-zero velocity at non-zero current.
     pub currents_ma: [f64; NUM_JOINTS],
     pub imu: ImuData,
 }
@@ -115,6 +117,25 @@ pub trait RobotIo {
     fn read(&mut self) -> Result<Sensors>;
     fn write(&mut self, targets: &JointTargets) -> Result<()>;
 
+    /// Whether [`Sensors::velocities`] from this backend is a measurement.
+    ///
+    /// [`Sensors`] is fixed-size arrays, so a backend with nothing to report has no way to say
+    /// so in the sample itself — it reports zeros, which is what a robot standing perfectly
+    /// still reports. The wire draws that distinction (`RobotState::velocities` is absent
+    /// rather than zero when nothing measured it), and this is how it learns which it has:
+    /// a real bus answers yes, `FakeIo` answers no until a test states what the servos report.
+    ///
+    /// Defaulted true because a backend that reads real servos has nothing to declare.
+    fn measures_velocity(&self) -> bool {
+        true
+    }
+
+    /// The same question for [`Sensors::currents_ma`], separately: the simulator reports
+    /// velocity from the physics and may have no load to report at all.
+    fn measures_load(&self) -> bool {
+        true
+    }
+
     /// Set the position P gain on every joint.
     ///
     /// Here rather than in the bus layer alone because it is what makes "go limp" mean
@@ -193,6 +214,11 @@ pub struct FakeIo {
     pub slow: Option<SlowSensors>,
     /// When true, `read` reports the last written targets as the present positions.
     track_targets: bool,
+    /// Whether a test has stated what the servos report for velocity and load. Until one has,
+    /// this fake declares it measures neither — a `--fake` robot is not a robot standing still
+    /// under no load, and a dashboard must be able to tell those apart.
+    velocity_stated: bool,
+    load_stated: bool,
     /// Last torque state commanded, or `None` if nothing ever asked. `None` is the assertion that
     /// matters most: it is what "a restart did not move the robot" looks like.
     pub torque: Option<bool>,
@@ -225,6 +251,8 @@ impl FakeIo {
                 temps_c: [32.0; NUM_JOINTS],
             }),
             track_targets: true,
+            velocity_stated: false,
+            load_stated: false,
             torque: None,
             torque_writes: 0,
             reboots: Vec::new(),
@@ -254,6 +282,23 @@ impl FakeIo {
 
     pub fn set_imu(&mut self, imu: ImuData) {
         self.sensors.imu = imu;
+    }
+
+    /// Joint velocities the next [`RobotIo::read`] will report.
+    ///
+    /// Unlike positions these are never derived from what was written — a fake that echoed
+    /// its own targets back as velocity would make any test of the velocity path pass
+    /// vacuously.
+    pub fn set_velocities(&mut self, velocities: [f64; NUM_JOINTS]) {
+        self.sensors.velocities = velocities;
+        self.velocity_stated = true;
+    }
+
+    /// Present current per joint, mA. Same rule as [`Self::set_velocities`]: nothing derives
+    /// this, so a test has to state what the servos are supposed to be reporting.
+    pub fn set_currents_ma(&mut self, currents_ma: [f64; NUM_JOINTS]) {
+        self.sensors.currents_ma = currents_ma;
+        self.load_stated = true;
     }
 
     pub fn positions(&self) -> [f64; NUM_JOINTS] {
@@ -298,6 +343,14 @@ impl RobotIo for FakeIo {
     fn reboot(&mut self, id: u8) -> Result<()> {
         self.reboots.push(id);
         Ok(())
+    }
+
+    fn measures_velocity(&self) -> bool {
+        self.velocity_stated
+    }
+
+    fn measures_load(&self) -> bool {
+        self.load_stated
     }
 
     fn imu_ready(&self) -> bool {

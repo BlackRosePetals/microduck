@@ -54,6 +54,16 @@ hz = 50
 # cmd_alpha = 0.2
 # head_alpha = 0.2
 
+# Whether the state stream carries measured joint velocity and load — `velocities` and
+# `currents_ma` on `robot.state`. The servos report both in the same twelve-byte read as
+# position, so the bus cost is zero; what it costs is frame size, about 10-12%, or +15 to
+# +19 KB/s at 50 Hz to a subscriber taking every tick.
+#
+# Turn it off and both blocks are absent from the frame — which is exactly what a daemon
+# predating them sends, and is not the same as reporting zero. Nothing in this daemon reads
+# them back, so off costs the robot nothing but the information.
+# publish_velocity_and_load = true
+
 [update_gate]
 # What decides `healthy`, and therefore what the update system rolls back on.
 #
