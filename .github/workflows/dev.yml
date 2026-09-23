@@ -34,6 +34,10 @@ env:
 
 jobs:
   publish:
+    # Not in a fork. A contributor's push runs this in their fork, where the dev key does not
+    # exist, so every run ended red at the signing step — a failure that says nothing about the
+    # change and hides one that does. `ci.yml` on the pull request is what checks their work.
+    if: ${{ !github.event.repository.fork }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
