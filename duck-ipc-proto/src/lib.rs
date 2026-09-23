@@ -393,7 +393,17 @@ pub const JSONRPC_VERSION: &str = "2.0";
 ///
 /// Both are absent from an older `updaterd` and neither needs a fallback: a client with no
 /// description shows the id, which is what it showed before.
-pub const API_VERSION: u32 = 34;
+///
+/// # v35 — when the update source last answered
+///
+/// One `Option<i64>` on [`ComponentStatus`]. `update.status` says when each component's update
+/// source last answered with a manifest that verified, so a robot that has stopped reaching its
+/// source stops looking up to date: a failed check left the installed release and no error, which
+/// is what a robot with nothing to install looks like.
+///
+/// Absent is "it has not answered since this robot started recording", which is what an older
+/// `updaterd` sends and what a client must not read as a fresh check.
+pub const API_VERSION: u32 = 35;
 
 /// The observation width every policy this robot family runs is built against.
 ///
@@ -3116,7 +3126,24 @@ pub struct ComponentStatus {
     pub reason: Option<String>,
     pub pinned: Option<semver::Version>,
     pub last_attempt: Option<LogEntry>,
+    /// When this component's update source last answered with a manifest that verified, unix
+    /// seconds. `None` on a board where it never has, and from an `updaterd` older than v35.
+    ///
+    /// A robot that cannot reach its source reads exactly like one with nothing to install: the
+    /// scheduled check fails and every other field here stays the same. How long ago the source
+    /// last answered is what shows it. A source replaying an old signed manifest still answers,
+    /// so this does not catch that one; `updater-design.md` §8.4.2 has what would.
+    pub last_checked: Option<i64>,
 }
+
+/// The API version [`ComponentStatus::last_checked`] arrived in.
+///
+/// A client needs it to read the absent field, because absent means two opposite things: an
+/// `updaterd` older than this cannot say, and a newer one saying nothing means the source has
+/// never answered on this board — which is the state a robot blocked since first boot is in, and
+/// the one worth warning about. Without the version they are the same silence, and the case the
+/// report exists for is the one that reads as "fine".
+pub const API_LAST_CHECKED: u32 = 35;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InstalledRelease {
