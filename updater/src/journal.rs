@@ -286,7 +286,7 @@ impl Checked {
     /// board, or the record cannot be read: this is a report riding on `update.status`, and a
     /// report that failed the call it rides on would be worse than a missing one.
     pub fn get(&self, component: &str) -> Option<i64> {
-        self.read_all().remove(component)
+        self.read_all().unwrap_or_default().remove(component)
     }
 
     /// Record that `component`'s source answered now.
@@ -297,22 +297,48 @@ impl Checked {
     /// A clock before the preflight floor is not written down. A board with no RTC boots in 1970,
     /// a `local_dir` source needs no TLS to answer, and a time from then would report the source as
     /// fifty years quiet the moment the clock caught up.
+    ///
+    /// Said out loud, at debug, because the board it happens on is one where every check succeeds
+    /// and nothing is ever recorded — and the report staying empty forever is otherwise
+    /// indistinguishable from a source that has gone quiet.
     fn record_at(&self, component: &str, at: i64) -> Result<(), Error> {
         if at < crate::preflight::CLOCK_FLOOR_UNIX {
+            tracing::debug!(
+                component,
+                at,
+                floor = crate::preflight::CLOCK_FLOOR_UNIX,
+                "source answered, but the clock is before the preflight floor: not recorded"
+            );
             return Ok(());
         }
-        let mut all = self.read_all();
+        let mut all = self.read_all()?;
         all.insert(component.to_owned(), at);
         let bytes = serde_json::to_vec(&all)
             .map_err(|e| Error::Internal(format!("serialising check times: {e}")))?;
         write_atomic(&self.path, &bytes)
     }
 
-    fn read_all(&self) -> BTreeMap<String, i64> {
-        std::fs::read(&self.path)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-            .unwrap_or_default()
+    /// Absent is empty; unreadable is an error, because the caller is about to write the whole
+    /// map back. Swallowing an IO error here would replace every other component's time with a
+    /// map holding only the one being recorded — losing, on a transient failure, exactly the
+    /// record this exists to keep. Damaged JSON is different: nothing can read any entry in it,
+    /// so starting over loses nothing that was still there.
+    fn read_all(&self) -> Result<BTreeMap<String, i64>, Error> {
+        match std::fs::read(&self.path) {
+            Ok(bytes) => Ok(serde_json::from_slice(&bytes).unwrap_or_else(|e| {
+                tracing::warn!(
+                    path = %self.path.display(),
+                    error = %e,
+                    "check times unreadable: starting the record again"
+                );
+                BTreeMap::new()
+            })),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(BTreeMap::new()),
+            Err(e) => Err(Error::Io {
+                path: self.path.clone(),
+                source: e,
+            }),
+        }
     }
 }
 
@@ -851,5 +877,21 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("checked.json"), b"{not json").unwrap();
         assert_eq!(Checked::open(dir.path()).get("daemon"), None);
+    }
+
+    /// A record that cannot be read for a reason that is not "it is not there" refuses the write
+    /// rather than replacing the file with the one component being recorded. The engine logs the
+    /// failure; what it must not do is quietly forget when every other component last checked.
+    #[test]
+    fn an_unreadable_record_is_not_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        // A directory where the file goes: `read` fails with something other than `NotFound`,
+        // which is what a permission change or a failing disk looks like from here.
+        std::fs::create_dir(dir.path().join("checked.json")).unwrap();
+        let checked = Checked::open(dir.path());
+        assert!(matches!(
+            checked.record_at("daemon", 1_800_000_000),
+            Err(Error::Io { .. })
+        ));
     }
 }

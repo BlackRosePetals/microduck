@@ -907,6 +907,21 @@ not verify and a `--from` directory all leave it where it was. As the option say
 that cannot reach its source visible, and not one being fed an old signed manifest; that is still
 (1).
 
+**A source that has never answered is the warning, not the silence.** A board that has been
+blocked since it was provisioned has nothing recorded — which is also what an `updaterd` older
+than `API_LAST_CHECKED` sends. `robotctl health` tells the two apart by the API version in the
+`hello` it already has, and warns on the first: a robot that has never reached its source is the
+worst case this report exists for, and reading it as "no news" prints what a healthy robot prints.
+
+**It does depend on the clock**, unlike the option as listed above — a recorded time is only
+meaningful against the one reading it. Both directions are handled where they land rather than
+trusted: a time below §7.2's clock floor is not recorded at all (a board with no RTC, on a
+`local_dir` source that needs no TLS to answer, would otherwise report fifty years of silence the
+moment NTP arrives), and a time *ahead* of the reader's clock is reported as unknown and warned
+about rather than clamped to "just now" — a board whose clock was corrected backwards after a
+check would otherwise read as freshly checked for good, since only a successful check replaces the
+record.
+
 **Explicitly accepted for v1:** a robot whose network is hostile can be prevented
 from updating. It cannot be made to *downgrade*, install an artifact we did not
 sign, or install one that fails its health gate. Those are the properties we
