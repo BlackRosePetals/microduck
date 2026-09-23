@@ -49,6 +49,20 @@ pub fn account() -> Account {
     Account::new(store(DEFAULT_PATH), Config::from_env())
 }
 
+/// As [`account`], with the credential somewhere other than a robot's.
+///
+/// **For a duck in MuJoCo, and it is what makes one signable-in at all.** The device flow, the
+/// refresh and the file `mediad` reads are the same code on a laptop as on a board; the one thing
+/// a laptop cannot do is write `/etc/robot/hf-token`. So the path moves and nothing else does — a
+/// simulated duck signs in to a Hugging Face account by typing a code exactly as a real one does,
+/// and appears in the same listing afterwards. `docs/robot/simulation.md` has the walkthrough.
+///
+/// Distinct from [`account_for_test`], which also redirects the *endpoint*: this one still talks to
+/// Hugging Face, because a simulated duck's account is a real account.
+pub fn account_at(path: impl Into<std::path::PathBuf>) -> Account {
+    Account::new(store(path), Config::from_env())
+}
+
 /// As [`account`], against a token file and a Hugging Face of your choosing.
 ///
 /// Only for tests, and it is not optional there: the real path is a robot's real credential, and

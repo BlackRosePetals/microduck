@@ -4,7 +4,7 @@
 # docs/design/architecture.md §1. `robotd`, `btd` and `mediad` are all siblings now.
 [workspace]
 resolver = "3"
-members = ["btd", "configd", "duck-control", "duck-detect", "duck-ether", "duck-ipc-proto", "duckctl", "kinematics", "mediad", "odometry", "pad-imu", "padd", "pet-detect", "sounds", "tof", "updater", "robotctl", "robotd", "robotd-params", "test-support", "xtask"]
+members = ["btd", "configd", "duck-ble", "duck-control", "duck-detect", "duck-ether", "duck-ipc-proto", "duckctl", "kinematics", "mediad", "odometry", "pad-imu", "padd", "pet-detect", "sounds", "tof", "updater", "robotctl", "robotd", "robotd-params", "test-support", "uyvy", "xtask"]
 
 # Everything except `duckctl`, and that exception is the whole reason this key exists.
 #
@@ -18,7 +18,7 @@ members = ["btd", "configd", "duck-control", "duck-detect", "duck-ether", "duck-
 # writing down. One list here, and a new daemon is picked up by both without anybody remembering.
 #
 # `--workspace` is unaffected, so CI still lints and tests `duckctl` exactly as before.
-default-members = ["btd", "configd", "duck-control", "duck-detect", "duck-ipc-proto", "kinematics", "mediad", "odometry", "pad-imu", "padd", "pet-detect", "sounds", "tof", "updater", "robotctl", "robotd", "robotd-params", "test-support", "xtask"]
+default-members = ["btd", "configd", "duck-ble", "duck-ble", "duck-control", "duck-detect", "duck-ipc-proto", "kinematics", "mediad", "odometry", "pad-imu", "padd", "pet-detect", "sounds", "tof", "updater", "robotctl", "robotd", "robotd-params", "test-support", "uyvy", "xtask"]
 
 # ONNX Runtime, which robotd dlopens to run a policy. One source of truth: `xtask package`
 # bakes these into the release's preinstall hook, and a test asserts scripts/setup-board.sh
@@ -49,12 +49,23 @@ runtime = "v2.3.2"
 # inside a release and cannot read this file, so it carries the literals and a test asserts the
 # two agree.
 #
-# `version` is a tag in the Hub repo, and it is a *floor*: it decides what a freshly provisioned
-# board installs, not what every board runs. Moving past it is `robotctl policy update`, which
-# needs no daemon release — bumping this does, since it ships inside one.
+# `version` is a tag in the Hub repo, and it is a *minimum*: what a freshly provisioned board
+# installs, and the oldest official set this daemon's defaults load — a board below it is moved
+# up to it by the post-install hook, one past it is left alone. Moving past it is `robotctl
+# policy update`, which needs no daemon release — bumping this does, since it ships inside one,
+# and it is bumped when a slot's default names a file only the new set carries.
 [workspace.metadata.policies]
 repo    = "pollen-robotics/microduck-policies"
-version = "v1"
+version = "v5"
+
+# The duck detector, the same way: trained in pollen-robotics/duck_detector, published on the Hub,
+# and seeded onto a board by `scripts/seed-detector.sh` from this pin — a floor, moved past with
+# `robotctl duck-detector update`. The model repo shares its name with the *dataset* repo; the robot only
+# ever addresses the model (`huggingface.co/<repo>/resolve/…`, `api/models/<repo>`), and the
+# dataset lives under `datasets/`, so the shared name cannot be confused on the wire.
+[workspace.metadata.detector]
+repo    = "pollen-robotics/microduck-duck-detector"
+version = "duck-v1"
 
 # The prebuilt GStreamer plugins `mediad` needs, built in CI from pinned upstream sources at
 # https://github.com/pollen-robotics/microduck-gst-plugins — `mpph264enc` (hardware H.264 through
@@ -69,7 +80,7 @@ repo    = "pollen-robotics/microduck-gst-plugins"
 version = "v3"
 
 [workspace.package]
-version = "0.12.0"
+version = "0.14.4"
 edition = "2024"
 # 1.89 for `std::fs::File::try_lock`, which is how the single-flight update lock works
 # without a dependency (updater/src/journal.rs). Edition 2024 needs 1.85, so this covers
@@ -90,6 +101,7 @@ tracing = "0.1"
 tracing-subscriber = "0.3"
 tokio-util = "0.7"
 async-trait = "0.1"
+url = "2"
 
 # No custom [profile.release]. Binary size is not worth optimising for: model artifacts
 # will dwarf a few MB of binary, and the tuning cost more than it bought —

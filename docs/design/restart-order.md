@@ -276,7 +276,12 @@ adapter rather than failing.
    - `refresh_golden_links`: publish each component's configured golden as a `golden` symlink beside
      `current`, so the rescue can find it with one `readlink` and no parser.
    - `record_boot`: increment `boots` on every armed trial in `pending.json`.
-   - For each trial with `boots >= 2` (`MAX_BOOT_ATTEMPTS`): revert to `previous`, escalating to
+   - For each trial with `boots >= 2` (`MAX_BOOT_ATTEMPTS`): ask `robotd`, and revert only if the
+     answer is neither healthy nor degraded. The ask **polls, for the component's `health.timeout`**
+     — `updater-design.md` §8 owns why, and the consequence belongs here: this step can sit for that
+     timeout, 30s with the shipped config, before the socket is served. It does so only on the boot
+     that reverts, and only when `robotd` never answers at all.
+   - Reverting means going to `previous`, escalating to
      `golden` when `previous` is absent, missing from disk, or itself recorded as rolled back. That
      means swap the symlink, confirm the trial, and re-run `on_apply` — **so a boot-counter revert
      restarts `configd`, `padd` and `robotd`.** It runs no hooks and schedules nothing, so the

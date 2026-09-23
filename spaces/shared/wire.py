@@ -1,10 +1,11 @@
 """JSON-RPC to a duck over the rendezvous, with no WebRTC in the path at all.
 
 The other two transports negotiate: they exchange SDP and ICE so the two ends can find a route
-between them, and then speak WebRTC over it. That works on one network and it works across NATs
-*when a relay candidate exists* — which right now it does not, because `turn.fastrtc.org` has no A
-record and its zone has no NS records (`remote-access-design.md` §6). Signalling crosses, media
-does not, and the control channel goes with it because SCTP rides the same candidate pair.
+between them, and then speak WebRTC over it. That works on one network, and across NATs it works
+*when a relay candidate exists* — which now it does (`remote-access-design.md` §6), but the
+control channel is hostage to it either way, because SCTP rides the same candidate pair as the
+media. A relay that is rate-limited, metered out, or briefly not answering takes the click with
+it, for a call whose whole payload is a few hundred bytes.
 
 This needs none of it. The rendezvous already relays what is wanted: `handle_peer_message` in its
 `app.py` forwards **every key of a `peer` envelope except `type` and `sessionId`** verbatim to the
@@ -45,7 +46,7 @@ from typing import Any
 
 import requests
 
-from rendezvous import DEFAULT_CENTRAL_URL
+from rendezvous import DEFAULT_CENTRAL_URL, USER_AGENT
 
 logger = logging.getLogger(__name__)
 
@@ -71,7 +72,7 @@ class WsConsumer:
     """
 
     def __init__(self, token: str, peer_id: str, rpc: Any, base: str = DEFAULT_CENTRAL_URL,
-                 label: str = "microduck-policy-shop"):
+                 label: str = "microduck-policy-playground"):
         self._token = token
         self._peer_id = peer_id
         self._rpc = rpc
@@ -85,6 +86,10 @@ class WsConsumer:
         # `startSession` the far end never sees.
         self._streaming = requests.Session()
         self._posting = requests.Session()
+        # Both sessions, once: every call on this lane goes out named. See `rendezvous.USER_AGENT`
+        # for what an unnamed one gets — an `awselb/2.0` 429 that the rendezvous never sees.
+        for session in (self._streaming, self._posting):
+            session.headers["User-Agent"] = USER_AGENT
         self._stream: requests.Response | None = None
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
@@ -377,7 +382,9 @@ if __name__ == "__main__":
 
     # Shorter than the page's, because a person is watching this one.
     rpc = Rpc(timeout=15)
-    consumer = WsConsumer(credential, duck.peer_id, rpc, label="microduck-policy-shop/wire-check")
+    consumer = WsConsumer(
+        credential, duck.peer_id, rpc, label="microduck-policy-playground/wire-check"
+    )
     try:
         consumer.start()
     except WireError as e:

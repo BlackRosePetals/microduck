@@ -239,7 +239,73 @@ auto-exposure loop that converges once and stops; an INT8 head whose score chann
 values; a servo bus dropping reads. The twin would have caught **none** of them. That is not a flaw
 in the design, it is the boundary of it — and hardware stays the only place the drivers are real.
 
-## 8. The harness
+## 8. A simulated duck is a duck, and says so once
+
+A duck in MuJoCo registers with the rendezvous and appears in its owner's Hugging Face robot list
+next to the real ones. That is worth having — it is the whole remote-access path, exercisable
+without hardware — and it is worth being unmistakable about, because a client that cannot tell the
+two apart ends with somebody driving a simulation and wondering why the robot on the shelf is still.
+
+**One fact, declared once.** `configd --simulated <serial>` is the only place it is stated.
+`system.info` carries it, `mediad` learns it there — it already asks that question at startup for
+the name — and puts `simulated: true` in the `meta` it registers with. `robotctl system info` prints
+it. Nothing else infers it, and in particular no client keys on a serial beginning `sim-`: that is a
+convention three places would have to agree on and one of them would get wrong.
+
+`mediad --sim-camera` sets it too. Not a second source of truth — a backstop for the one case that
+would be wrong: `configd` is asked once, with a timeout, on a machine where every daemon starts at
+the same instant, and a late answer would register a simulated duck as hardware. The two cannot
+disagree, because there is no arrangement in which the frames come from a simulator and the robot
+they belong to is real.
+
+**Identity is why the flag takes a value.** A simulated duck has no SoC serial and no per-duck
+`/etc/machine-id` — four ducks in one scene share their laptop's, so they would evict each other
+from the listing one at a time, and macOS has no such file at all, so none of them would register.
+`sim-duck-a` is stable per duck and across restarts, which is what `hardware_id` has to be
+(`remote-access-design.md` §3.7). The robot's name derives from it exactly as a real one's does, so a
+duck in the twin is `duck-eb55` rather than the hostname of the machine running it.
+
+**The account is the robot's own flow, not a credential handed to it.** `updaterd` runs in the
+simulator with `--token` pointing into the state directory, and `robotctl account login` is RFC 8628
+against Hugging Face: a code, typed on a phone or a browser, exactly as on a robot. `mediad` polls
+that file and registers when it appears, so a duck signed in mid-session needs no restart. Nothing
+about the credential path is simulated, which is the point — it is the half of remote access that is
+easiest to get subtly wrong and hardest to test on a board.
+
+The consequence to know is the rendezvous's, not ours: peers are keyed by token, so one duck per
+account is listed at a time. Each duck runs its own device flow, so that is a rule about accounts
+rather than a limit of the simulator.
+
+## 9. GStreamer is not the Linux part
+
+`mediad`'s pipeline was gated `#[cfg(target_os = "linux")]` whole, which was true of the daemon when
+the only source was a board camera and stopped being true when `Source::Sim` arrived. About 230
+lines of `pipeline.rs` are genuinely hardware: `v4l2src`, the driver's buffer pool and the
+`GstVideoMeta` allocation query, and the sensor mode read out of the media topology. The rest —
+appsrc, the tee, the appsink, `webrtcsink`, the encoder-setup signal — is GStreamer, and runs
+wherever GStreamer does.
+
+So the gate is `any(target_os = "linux", feature = "gstreamer")`: assumed on the robot's OS, opt-in
+elsewhere. A developer's machine gets the real daemon, the real console and real WebRTC against a
+simulated camera for two Homebrew formulae, and `Source::Camera` off Linux is a clear error rather
+than a missing arm.
+
+Two, not one, and the second is a trap worth writing down: Homebrew's `gstreamer` links
+`libgstnice.dylib` into a separate `libnice-gstreamer` formula that it does not depend on. Without
+that formula the link dangles, `webrtcbin` has no ICE agent, and everything works — the pipeline,
+the camera, the rendezvous registration — until the first consumer asks for a pad and the session
+dies inside a GStreamer thread with "libnice elements are not available". A build check cannot see
+it, so `scripts/duck-sim` checks the elements rather than the pkg-config file. `exposure.rs` stays Linux-only and that is not packaging — it writes V4L2
+controls through `ioctl`, and there is no sensor behind a simulated source to meter.
+
+Off by default there, deliberately: Homebrew's `gstreamer` is one merged formula that pulls gtk4 and
+ffmpeg with it, and somebody working on `robotd` should not need it to run `cargo check`. The cost is
+that no CI job compiles that combination — CI is `ubuntu-*` throughout — so it is a developer
+running it that keeps it working. A `macos-latest` job doing `cargo check -p mediad --features
+gstreamer` is what would change that, and it is left out on purpose: CI is already slow and macOS
+runners are slower.
+
+## 10. The harness
 
 One MuJoCo process, one window, N duck bodies in one scene, so ducks share physics and can bump into
 each other. `microduck_rl` owns that half: it already has the scenes, the BAM actuator models and
@@ -260,7 +326,7 @@ more than N fifteen-DoF bodies, so cameras should be opt-in per duck. The 45 Hz 
 both a hard edge rather than a soft one — too many ducks and they do not get slow, they go
 *unhealthy* and the updater starts rolling releases back.
 
-## 9. Three ways to pick the wrong model
+## 11. Three ways to pick the wrong model
 
 Each of these presents as "the duck is on its back", and each cost an hour.
 
@@ -282,7 +348,7 @@ simulator that starts limp has its duck on the floor before the first read.
 The boot the daemon is actually written for is `--keyframe SIT`: a duck found folded, which it
 recognises and stands up with the sitstand policy.
 
-## 10. Known material to reuse
+## 12. Known material to reuse
 
 `~/MISC/microduck_maploc` (outdated in every other respect) has two things worth taking: a simulated
 VL53L5CX in `sim/tof_sensor.py` — 8×8 zones, 45° square FoV, 4 m range, noise that grows with

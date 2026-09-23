@@ -3,9 +3,11 @@
 The robot is behind somebody's router and this runs in a container in a data centre. The obvious
 way to join them is the one this Space used to take: a WebRTC consumer pulls the stream through
 `reachy_mini_central`. That ran into the one thing WebRTC cannot do unaided — a relay candidate —
-and `turn.fastrtc.org` has no A record and its zone no NS records at all
-(`docs/design/remote-access-design.md` §6). Signalling crossed and media never did, from every
-Space, every time.
+and the relay default every robot shipped with pointed at a name with no DNS behind it, so
+signalling crossed and media never did, from every Space, every time. That default is fixed
+(`docs/design/remote-access-design.md` §6) and this design is still the right one: a relay costs
+somebody's bandwidth, metered against the robot owner's Hugging Face allowance, for every frame
+of a stream only a program is going to look at.
 
 **So the direction is inverted and the problem disappears.** The rendezvous is used for one small
 thing — telling the robot where to send frames — and the frames come **outbound from the robot** to
@@ -81,7 +83,7 @@ class Ring(logging.Handler):
     **A Space's logs are on a page only its owner can open**, and reading them needs write access
     to the Space — so "click the button and tell me what it said" was a round trip through
     somebody's screenshot. The panel shows what the container's stderr shows, to whoever is
-    already looking at the thing that failed. `policy-shop` has the same handler for the same
+    already looking at the thing that failed. `policy-playground` has the same handler for the same
     reason.
     """
 
@@ -124,7 +126,8 @@ PORT = int(os.environ.get("PORT", 7860))
 #
 # On a Space, `SPACE_HOST` is the Space's own hostname and `wss://` is the only thing that will
 # work through the platform's proxy. Locally the default is loopback, because the common local case
-# is `fake_duck.py` on this same machine — and loopback is then exactly right. A *real* robot is on
+# is a duck from `scripts/duck-sim` on this same machine — and loopback is then exactly right. A
+# *real* robot is on
 # another machine, so it needs this host's address on the robot's network instead, which is what
 # the box on the page is for.
 def default_receiver() -> str:
@@ -256,8 +259,8 @@ def start(url: str, fps: float, longest: int) -> str:
     if not url.startswith(("ws://", "wss://")):
         return f"**`{url}` is not a ws:// or wss:// url**, so the robot will refuse it."
     if "127.0.0.1" in url or "localhost" in url:
-        # Right for `fake_duck.py` on this machine, and wrong for anything else — a real robot's
-        # loopback is its own, so it would dial itself and find nothing.
+        # Right for a `scripts/duck-sim` duck on this machine, and wrong for anything else — a
+        # real robot's loopback is its own, so it would dial itself and find nothing.
         logger.info("the receiver is loopback, which only a duck on this machine can reach")
 
     try:
@@ -277,7 +280,7 @@ def start(url: str, fps: float, longest: int) -> str:
     if ("127.0.0.1" in url or "localhost" in url) and not ON_A_SPACE:
         note += (
             " That address is loopback, so it only works for a duck running on this machine — "
-            "`fake_duck.py`. A robot elsewhere needs this host's address on *its* network."
+            "`scripts/duck-sim`. A robot elsewhere needs this host's address on *its* network."
         )
     return note
 
@@ -352,8 +355,8 @@ with gr.Blocks(title="duck vision demo") as demo:
         # A duck's camera, processed in a data centre
 
         The robot **dials this Space** and pushes JPEG frames; OpenCV runs over them here. Nothing
-        is on the robot's network, and no relay candidate is involved — which is why this works
-        where pulling the stream over WebRTC does not, while `turn.fastrtc.org` has no DNS.
+        is on the robot's network, and no relay candidate is involved — so no shared relay carries
+        the pixels, and none of this is spent against the robot owner's TURN allowance.
 
         Frames arrive at `{RECEIVER_URL}` — change it below if the robot cannot reach that.
         """
@@ -396,8 +399,8 @@ with gr.Blocks(title="duck vision demo") as demo:
             info=(
                 "This Space's own address, as the robot sees it."
                 if ON_A_SPACE
-                else "Loopback works for `fake_duck.py` on this machine; a real robot needs this "
-                "host's address on its own network."
+                else "Loopback works for a `scripts/duck-sim` duck on this machine; a real robot "
+                "needs this host's address on its own network."
             ),
             scale=3,
         )

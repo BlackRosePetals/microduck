@@ -533,6 +533,13 @@ fills it in arbitrarily gets subtly wrong behaviour rather than a clear failure:
   falls back to `/etc/machine-id`, stable per *install* rather than per robot. Weaker and still
   correct for the purpose: one machine is listed once, and the producer stays sweepable. `sounds`
   already makes exactly this substitution for exactly this reason.
+- **`simulated`** is ours rather than the server's, and a key it never reads: a duck in MuJoCo
+  registers exactly as a robot does, and a listing that could not tell them apart would end with
+  somebody driving a simulation and wondering why the robot on the shelf is still.
+  `configd --simulated <serial>` is where the fact is declared, and `docs/design/simulation.md` §8
+  is why it is declared only there. That serial is also what makes a simulated duck's `hardware_id`
+  work: the `/etc/machine-id` fallback is per *install*, so ducks sharing a machine would evict each
+  other, and macOS has no such file at all.
 - **`name`** is what the listing shows a person, and the consumer's `name` is what the server
   reports back as `activeApp` to the owner's other devices. `transport` (`"wifi"` / `"usb"`) is a
   mini-ism a duck can leave alone; a `kind` of `microduck` is what lets one client list both
@@ -696,7 +703,7 @@ and it is a two-line change on their side — `kind` is already on the wire.
 
 ### 5.2 A consumer that drives a duck, and the one line of theirs it has to get past
 
-`spaces/policy-shop` is the second consumer in this repository and the first that *sends*
+`spaces/policy-playground` is the second consumer in this repository and the first that *sends*
 anything: sign in, list the account's ducks, and put a policy from the Hub onto one in a click —
 `policy.fetch`, `robot.setSkill`, `robot.policies`, `robot.do`, which is `robotctl policy add`'s
 own order over a datachannel instead of over a unix socket.
@@ -762,10 +769,11 @@ error, deliberately — safety refusing to run a policy on a fallen robot is not
 page that only catches errors reports every one of those as a success and leaves a motionless
 robot unexplained.
 
-**And the transport is the one thing this cannot prove from a Space yet.** The control channel is
-SCTP over the same candidate pair as the media, so §6's dead TURN endpoint takes the click with
-it: from a data centre the session negotiates and may then carry nothing. That is why the status
-line names the stage it reached rather than saying "connecting…" — and why the page has a second
+**And the transport is what this leans on hardest from a Space.** The control channel is SCTP over
+the same candidate pair as the media, so a relay that is not there takes the click with it: from a
+data centre the session negotiates and may then carry nothing. §6's endpoint answers now, so the
+ordinary case is covered — but a metered dependency is still a dependency, which is why the status
+line names the stage it reached rather than saying "connecting…", and why the page has a second
 way in.
 
 **`lan.py` is that second way, and it is a transport rather than a second design.** The robot is
@@ -849,18 +857,53 @@ consumer behind whatever a cloud provider gives a container, srflx-to-srflx need
 allow a hole to be punched — often they do, and often enough they do not. A relay always works, at
 the cost of somebody's bandwidth, which is why ICE tries it last.
 
-**Only the robot offers one**, and that is the part worth knowing before writing any of it: a
-connection needs *one* relay candidate, not two. If the robot offers one, a consumer that can
-reach the internet uses it — so credentials live on the robot and a consumer needs none. Which
-matters more than it sounds, because `aiortc`'s STUN client works where its TURN client does not,
-so a Python consumer *cannot* be the side that relays. `reachy_mini`'s #1182 established this
+**One relay candidate is enough, and it is not always the robot's.** A connection needs *one*, not
+two, and `aiortc`'s STUN client works where its TURN client does not — so a Python consumer cannot
+be the side that relays, and the robot has to be. `reachy_mini`'s #1182 established that
 arrangement and `mediad::turn` is the same one.
 
-The credentials are Cloudflare's, minted per account by a proxy Hugging Face hosts
-(`turn.fastrtc.org/credentials`) and authenticated with **the same token the relay signs in with**
-— so a robot that belongs to somebody can offer a relay and one that belongs to nobody cannot,
-which is the same line §2 draws everywhere else. They are short-lived: a task refreshes at half of
-a 600 s lifetime, and retries in thirty seconds after a *transient* failure only. A robot nobody
+**What that argument left out is whether the two ends can address each other at all**, and an
+iPhone on a mobile network is the case where they cannot. It has no IPv4 socket: it reaches a
+*hostname* through DNS64/NAT64, the STUN server reports an IPv4 reflexive address back, and the
+phone gathers a candidate saying so. But an ICE candidate is a bare literal, and the robot's relay
+candidate is a bare IPv4 literal on a board with no global IPv6 at all — which that phone cannot
+send a packet to. Measured on olducky: six sessions, `offering relay candidates relays=5` every
+time, `Ice connection state … failed` every time, about eight seconds apart.
+
+**That measurement cannot carry the weight it was given, and the phone turned out to have IPv4.**
+`relays=5` counted the TURN server URIs `webrtcbin` accepted inside `consumer-added`, before any
+allocation had been attempted — not relay candidates gathered. A robot whose allocation fails every
+time logs it identically to one whose allocation succeeds, so those six sessions are equally
+consistent with the ordinary explanation: no relay candidate on either end. The line is now named
+`added TURN servers for this consumer servers=N` for what it counts, and `count_gathered_candidates`
+logs the half that was missing, once per consumer when gathering completes:
+
+```
+gathered ICE candidates host=2 srflx=1 prflx=0 relay=0 unparsed=0
+TURN servers were added and no relay candidate came back …
+```
+
+`relay=0` beside a non-zero `servers` is the failure with no other symptom, and the second line
+fires only on that pair. Until a robot has produced one of these, the cause above is unconfirmed
+and the DNS64/NAT64 paragraph should be read as the hypothesis it was, not a finding.
+
+So **the console offers a relay of its own** (`refreshRelays` in `mediad/webclient/index.html`),
+and only its own allocation can bridge this: `turn.cloudflare.com` is a name, so it resolves over
+IPv6, and the relayed address Cloudflare hands back is IPv4, which the robot can reach. Confirmed
+from the phone before it was written — the same credentials in a Trickle ICE page gathered a
+`relay` candidate with an IPv4 address over 4G, where the robot's own candidates paired with
+nothing.
+
+The page mints them with **the visitor's** token, not the robot's, which is the right way round
+twice over: a robot's allowance should go on being watched rather than on watching, and a browser
+signed in with `hf_oauth` already holds a token of its own. A LAN session asks for none — there
+are host candidates on both sides and nothing would use a relay.
+
+The credentials are Cloudflare's, minted per account by a proxy Hugging Face hosts and
+authenticated with **the same token the relay signs in with** — so a robot that belongs to
+somebody can offer a relay and one that belongs to nobody cannot, which is the same line §2 draws
+everywhere else. They are short-lived: a task refreshes at half of a 600 s lifetime, and retries
+in thirty seconds after a *transient* failure only. A robot nobody
 has signed in has nothing to retry for, and a warning every thirty seconds for the life of the
 daemon is how a log stops being read.
 
@@ -872,22 +915,124 @@ blocks (a `try_read` that yields nothing rather than waiting) and never fails. A
 the ordinary state for the first few seconds after boot and forever on a robot with no account,
 and it means host and srflx only, which is all anything on the same network needs.
 
-**And the endpoint is not answering, which is where this stands.** `turn.fastrtc.org` has no A
-record and `fastrtc.org` has no NS records at all, from three public resolvers and from the board
-— so the proxy both `fastrtc`'s own current code and `reachy_mini`'s #1182 point at cannot be
-reached by anybody. Their documentation describes it as a live Hugging Face–Cloudflare arrangement
-(10 GB a month free with an account), so this reads as a lapsed registration or an outage rather
-than a moved URL, and it means the mini fleet's relay path is down too. Worth telling whoever owns
-`fastrtc`.
+**A duck does gather relay candidates, measured rather than inferred.** On `lavandiere`
+(0.12.0-dev.1007.3c8e681, signed in as `PierreRouanet`), a LAN session over `webrtcsink`'s own
+signalling server:
 
-Three ways on, in the order they should be considered:
+```
+added TURN servers for this consumer  servers=5
+gathered ICE candidates  host=6 srflx=3 prflx=0 relay=6 unparsed=0 complete=false
+```
 
-- **Wait, having reported it.** The robot degrades exactly as designed — a warning every thirty
-  seconds and host/srflx candidates — so nothing is broken except reaching a robot from a network
-  that needs a relay.
-- **Our own proxy**, which is what that endpoint is: a small service holding a Cloudflare Calls key
-  and minting short-lived credentials for a caller presenting a valid HF token. `--turn-url` is
-  already the seam it plugs into, and the key stays in one place rather than on robots.
+with the six `typ relay` lines on `104.30.…` seen independently at the consumer. So
+`add-turn-server` works, `libnice` completes a Cloudflare allocation over the credentials this
+account mints, and nothing in the robot's half of §6 is broken. A **LAN** session settles this
+because gathering does not depend on the peer: a relay candidate is allocated whether or not
+anything will ever pair with it, and only the pairing is remote. That makes it the cheap first
+test whenever this question comes up again — no rendezvous, no Space, no second network.
+
+What it does not settle is a session that *fails*. The tally has to be read on the robot that is
+failing, during the failure; `relay=6` here means the machinery works, not that every duck's does.
+
+**And a relay carries a real session, end to end.** `lavandiere` on
+`0.12.0-dev.1011.cb17b40`, driven from a private HF Space over the rendezvous:
+
+```
+ICE connection state  state=Checking → Connected (2.0 s) → Completed (2.2 s)
+gathered ICE candidates  host=6 srflx=3 prflx=0 relay=9 unparsed=0 complete=true
+selected candidate pair  local=relay 104.30.144.144:29840/udp via 141.101.90.1
+                         remote=prflx 54.225.144.144:11854/udp
+```
+
+The robot's Cloudflare relay is the local half of the pair that won, so §6's arrangement is not
+merely available — it is what carried the video. The consumer offered no TURN credentials of its
+own and needed none, which is the property the whole section is built on.
+
+The remote half being **`prflx`** is worth reading too: the robot learned the Space's address from
+an inbound STUN check rather than from a signalled candidate, which is the ordinary shape for a
+consumer whose srflx is not usable. Nothing had to be done about it.
+
+So a duck that cannot be reached is a duck to take these three lines from, not a design to revisit.
+The first thing to check remains the build: a robot older than the endpoint fix holds no
+credentials at all and says so every thirty seconds.
+
+**`reachy_mini` main is not a working reference to copy from — it is the same arrangement,
+unverified in the same way.** Read against `mediad` at `9d364df`: `webrtc_utils.TurnCredentials`
+and `media_server._apply_turn_servers` match `turn.rs` and `offer_relay_candidates` point for
+point — the same Space endpoint, the same 600 s TTL refreshed at half, the same 30 s retry after a
+transient failure only, the same `stun:`/no-credential entries skipped, the same percent-encoded
+`turn://user:pass@host:port`, the same `add-turn-server` inside `consumer-added` before the offer,
+the same cached read that never blocks the offer thread. Neither daemon sets `stun-server`, so both
+take `webrtcsink`'s default. **And neither observes a candidate**: no `on-ice-candidate` and no
+`ice-gathering-state` anywhere in `src/reachy_mini/`, so "the patched daemon offers its own relay"
+— `rf-detr-realtime-webcam`'s `app.py` says it while passing STUN-only for the robot leg — rests on
+the same `add-turn-server`-returned-cleanly inference §6 made here. So there is no patch to port,
+and the mini working where a duck does not would be an environmental difference (allowance, board
+network, `libnice` build) rather than a code one.
+
+What the mini does have and `mediad` does not is a **negotiation watchdog**: 12 s from
+`consumer-added` to `connection-state == connected`, after which it ends the session with a named
+reason rather than leaving a client spinning. Its comment names the culprit it was written for —
+"`libnice` frozen mid-`CHECKING` (a known crash mode of certain `libnice` versions)" — which is a
+second way a session negotiates perfectly and carries nothing, distinct from having no usable
+candidate pair. Worth having for the same reason the candidate tally is: it separates two failures
+that look identical from outside.
+
+**The proxy is the Space, and the name in front of it was the dead part.** `turn.fastrtc.org` —
+what `fastrtc`'s own code points at and what `reachy_mini` #1182 copied into this arrangement — is
+a dangling delegation, not an outage: the `.org` registry names four Route53 nameservers for the
+zone, the registration is healthy and locked until 2027, and all four nameservers answer `REFUSED`
+for the zone they are authoritative for, which is what Route53 says when the hosted zone behind
+them is gone. `fastrtc/turn-service`, the Space that alias pointed at, never stopped answering.
+So `DEFAULT_TURN_ENDPOINT` addresses it directly, at
+`https://fastrtc-turn-service.hf.space/credentials`, and the vanity record is out of the path.
+
+**That also closes a token-exfiltration route, which is the half that mattered more than the
+outage.** A dangling Route53 delegation is a known takeover shape — create hosted zones until AWS
+assigns you one of the four delegated nameservers, and one is enough, because a resolver needs
+only one authoritative answer. Whoever landed it would serve records for the name, pass DNS
+validation for a certificate on it, and be handed the account token every signed-in robot sends
+as a bearer header every five minutes. That token is the robot's whole credential; §2.4 is about
+how broad its scopes are.
+
+**The endpoint is checked before the token can reach it.** `turn::parse_endpoint` is a `clap`
+`value_parser` on `--turn-url`: `https` unless the host is loopback, no userinfo, no query and no
+fragment. A wrong value stops the daemon at argument parsing rather than becoming a warning every
+thirty seconds. Redirects need no separate guard — `reqwest` strips `Authorization` when a
+redirect crosses scheme, host or port (`src/redirect.rs`, `remove_sensitive_headers`), so the
+token cannot be walked to a third-party origin.
+
+**The allowance is the robot owner's, and it is finite** — 10 GB a month on a free Hugging Face
+account. A relayed video session is roughly a gigabyte an hour, so a robot driven hard over a
+relay can spend it, after which the proxy answers with no relay servers and `turn.rs` logs "the
+TURN proxy offered no relay servers" at info level. That is indistinguishable from a robot that
+was never offered one, which is a legibility gap worth closing when somebody hits it. It is also
+the argument `stream.rs` makes for sending frames outbound rather than through a relay.
+
+**Something now notices when it dies, which is the reason this went unnoticed for three months.**
+The endpoint was already dead when #1182 shipped it, and the only symptom was a warning in a log
+and a candidate type nobody counted. `.github/workflows/turn-endpoint.yml` runs daily: one
+authenticated `GET` against `DEFAULT_TURN_ENDPOINT`, asserting 200 and at least one `turn:`/
+`turns:` entry. Every other check in the repository passes regardless, because every one of them
+pairs two peers on one network, which never looks at a relay.
+
+Three things about its shape are deliberate. It reads the URL **out of `turn.rs` with `sed`**
+rather than keeping a copy, because a check holding its own endpoint tests whatever it was last
+told and can drift from what the daemon compiles in — and a green check on a URL no robot uses is
+worse than no check, since it reads as proof. It is **not** on `pull_request`: the failure being
+guarded against is "nobody touched this for months", which a PR trigger cannot see, and a third
+party's outage must never block unrelated work. And a **missing `HF_TOKEN` secret fails** rather
+than skipping, because a check that quietly skips itself into permanent silence is the exact
+failure mode it exists to end.
+
+Two things this deliberately does not do:
+
+- **Our own proxy.** This endpoint is a small service holding a Cloudflare Calls key and minting
+  short-lived credentials for a caller with a valid HF token, and running one ourselves would end
+  the dependency on a dormant project's Space — `--turn-url` is already the seam it plugs into.
+  Worth doing, and not worth blocking relay coverage on: `*.hf.space` is `{owner}-{space}`, so it
+  breaks if `fastrtc` renames or removes the Space, and there is no CNAME layer left to repoint.
+  That is the residual risk, named rather than closed.
 - **A Cloudflare key on the robot**, using `TURN_KEY_ID` and `TURN_KEY_API_TOKEN` directly. Fastest
   and worst: a long-lived API token on every board, which is the shape of mistake §2.4 exists to
   stop making.
@@ -949,8 +1094,10 @@ Five slices, and the first two are independently useful and need no client:
    bridge to, which is a robot whose pipeline never reached PLAYING.
 5. **STUN decided; TURN offered by the robot.** §6. **Done**: `stun.l.google.com:19302` on both
    ends, and `mediad::turn` keeps Cloudflare credentials fresh so every consumer's offer carries a
-   `relay` candidate. §6 has the argument; the two things to carry away are that only the robot
-   needs credentials, and that reading them must never block the thread building an offer.
+   `relay` candidate — from `fastrtc-turn-service.hf.space`, the Space itself, because the alias
+   in front of it is a dangling delegation. §6 has the argument; the three things to carry away
+   are that only the robot needs credentials, that reading them must never block the thread
+   building an offer, and that no check in this repo would notice if that endpoint died again.
 
 ## 9. What is open, and who can close it
 
@@ -960,12 +1107,15 @@ Five slices, and the first two are independently useful and need no client:
 | a calibration for the camera | `media.video` publishes the module's design figures with `calibrated: false`, which is enough to map a room and not enough for metrology. Measuring one robot and writing `[media.intrinsics]` closes it for that robot; a per-unit calibration in provisioning closes it for the family. §11 of `remote-webrtc.md` |
 | everything on the wire should be timestamped at source | `remote-webrtc.md` §11: `abs-capture-time` on the media, checked against what `webrtcsink`, a browser and `aiortc` actually surface; and a monotonic-plus-epoch field on every control-channel notification that describes a moment. Wanted for any consumer that has to relate what the robot saw to what it felt — visual-inertial SLAM is the case that makes it concrete — and it wants its own version bump rather than riding along with a transport |
 | §2.6 `logout` revokes nothing | whether Hugging Face accepts a revocation for the first-party device-code client, checked rather than assumed. Not blocking — signing out stops the robot being reachable, and a stolen board is answered on hf.co — but it is the difference between "forgotten" and "revoked" |
+| §6 the relay check needs a token | `.github/workflows/turn-endpoint.yml` exists and runs daily, and fails until an `HF_TOKEN` secret is set on the repository — a Hugging Face token with no scope beyond sign-in, used only to mint TURN credentials. Failing loudly is deliberate; the alternative is a check that skips itself into silence |
+| §6 the relay is somebody else's Space | a credentials proxy of our own, holding the Cloudflare key in one place instead of trusting a dormant project's Space to keep its name. `--turn-url` is the seam. Not blocking — the Space answers — but `*.hf.space` is `{owner}-{space}` and there is no alias left to repoint if it moves |
 
 Closed since this page was written: the OAuth client (§2.3 — Hugging Face ships one), whether the
 token expires (§2.7 — thirty days, with a rotating refresh token), which rendezvous to use (§4 —
 the mini's), whether we can read it (§4 — we maintain it; the "private repo" in an earlier draft
-was a wrong-name 401), and where the client is served (§5 — a static Space with `hf_oauth`, because
-the question was never hosting but how a page gets a token).
+was a wrong-name 401), where the client is served (§5 — a static Space with `hf_oauth`, because
+the question was never hosting but how a page gets a token), and which relay endpoint to use (§6 —
+the Space itself; the alias in front of it is a dangling delegation).
 
 One item this page created and closed: **peers are keyed by token**, so two things sharing one
 take turns being reachable. Not a provisioning problem — images are built from scratch, not cloned,

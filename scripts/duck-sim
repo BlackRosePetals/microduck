@@ -6,6 +6,15 @@
 #   scripts/duck-sim ctl health   # anything robotctl does
 #   scripts/duck-sim down
 #
+# And the same duck reachable from outside this machine, signed in to a Hugging Face account the
+# way a real one is:
+#
+#   DUCK_SIM_CAMERAS=a scripts/duck-sim
+#   scripts/duck-sim ctl account login    # type the code at hf.co/oauth/device
+#
+# It then appears in that account's robot list, flagged `simulated` — so nobody drives a duck in
+# MuJoCo believing it is the one on the shelf.
+#
 # And the same duck, as a machine you log into:
 #
 #   scripts/duck-sim boot         # the daemons under real systemd, in a container
@@ -70,9 +79,20 @@ WHO="${DUCK_SIM_DUCK:-}"
 # pointed at the wrong path.
 ctl() {
     name="${WHO:-$(duck_name 0)}"
+    # **`configure` edits a file rather than talking to a socket**, and its `--file` is not one of
+    # robotctl's global flags — so it is the one subcommand that has to be told which duck's params
+    # to open, and it cannot simply be added to the list below. Left alone it reads
+    # /etc/robot/robotd.toml, which is right on a robot and on a laptop does not exist: the answer
+    # was "changes nothing — every value is the default", about a file nobody has.
+    if [ "${1:-}" = configure ]; then
+        shift
+        set -- configure --file "$STATE/robotd-$name.toml" "$@"
+    fi
     "$REPO/target/debug/robotctl" \
         --robot-socket "$STATE/$name.sock" \
         --tof-socket "$STATE/$name-tof.sock" \
+        --config-socket "$STATE/$name-config.sock" \
+        --socket "$STATE/$name-updater.sock" \
         "$@"
 }
 
@@ -80,6 +100,14 @@ ctl() {
 # By pidfile, never by name. `pkill -f robotd` also matches the shell that is about to start one,
 # which is a good way to kill your own terminal — three times in one afternoon, in this case.
 # Stop one thing this script started, identified by name and by what it must still be running.
+#
+# **`$expect` names *this* state directory's daemon, not the daemon's kind.** It used to be
+# `robotd`, and matching on that is a name check dressed as an identity check: a stale pidfile
+# whose pid has since been recycled onto *another* `duck-sim`'s robotd passes it, and this then
+# TERMs somebody else's duck. Two simulators on one machine — different `DUCK_SIM_STATE`,
+# different ports, which is exactly how you run one while another is up — is not an exotic case.
+# So every caller below passes a path under `$STATE`, or for the body the port it was given, and
+# every one of those appears in the argv of the process this script started and in nothing else.
 #
 # **A pid is not an identity.** This function used to kill the process *group* named by a pidfile,
 # with a `sudo` fallback — and pidfiles go stale, pids are recycled, and a `boot` leaves behind the
@@ -133,14 +161,16 @@ stop_one() {
 }
 
 down() {
-    stop_one robotd robotd
-    stop_one ether duck-ether
-    stop_one body body_server
+    stop_one robotd "$STATE/"
+    stop_one ether "$STATE/"
+    stop_one body "body_server --port $PORT"
     i=0
     while [ "$i" -lt 16 ]; do
-        stop_one "$(duck_name "$i")" robotd
-        stop_one "$(duck_name "$i")-tof" tofd
-        stop_one "$(duck_name "$i")-media" mediad
+        stop_one "$(duck_name "$i")" "$STATE/$(duck_name "$i").sock"
+        stop_one "$(duck_name "$i")-tof" "$STATE/$(duck_name "$i")-tof.sock"
+        stop_one "$(duck_name "$i")-media" "$STATE/mediad-$(duck_name "$i").toml"
+        stop_one "$(duck_name "$i")-config" "$STATE/$(duck_name "$i")-config.sock"
+        stop_one "$(duck_name "$i")-updater" "$STATE/$(duck_name "$i")-updater.sock"
         i=$((i + 1))
     done
     # The container-mode radio is a unit, not a pidfile — see `boot`.
@@ -165,7 +195,7 @@ down() {
 # enable". cargo returns in a moment when nothing changed, which is the only case the guard saved.
 build_daemons() {
     say "building the daemons from $(git -C "$REPO" rev-parse --abbrev-ref HEAD)"
-    (cd "$REPO" && cargo build --quiet -p robotd -p robotctl -p tof -p sounds)
+    (cd "$REPO" && cargo build --quiet -p robotd -p robotctl -p tof -p sounds -p configd -p updater)
 }
 
 # **A checkout has no policies.** They live on the Hub and reach a robot through
@@ -274,6 +304,89 @@ TOML
         i=$((i + 1))
     done
 
+    # **Who each duck is, and which account it belongs to.** These two are what make a duck in
+    # MuJoCo a robot rather than a process. `configd` owns the identity — the serial, the name
+    # derived from it, and the fact that this one is simulated — and `updaterd` owns the Hugging
+    # Face credential, so `scripts/duck-sim ctl account login` is the device flow a real robot runs.
+    # `mediad` reads both, which is what puts a simulated duck in its owner's robot list, flagged.
+    # `docs/robot/simulation.md` has the walkthrough.
+    #
+    # `--simulated sim-<name>`: a laptop has no SoC serial, `/etc/machine-id` is one value per
+    # machine so ducks would evict each other from the listing, and macOS has none at all. Stable
+    # across restarts, so a restarted duck replaces itself rather than appearing twice.
+    say "starting configd"
+    i=0
+    while [ "$i" -lt "$DUCKS" ]; do
+        name="$(duck_name "$i")"
+        mkdir -p "$STATE/$name"
+        # `--fake-net` and `--fake-pads` for the reason those flags exist: there is no
+        # NetworkManager and no BlueZ here, and a configd spending its life saying so would bury
+        # the calls that do work.
+        DUCK_RUNTIME_DIR="$STATE" $SETSID nohup "$REPO/target/debug/configd" \
+            --socket "$STATE/$name-config.sock" --state-dir "$STATE/$name" \
+            --simulated "sim-$name" --fake-net --fake-pads \
+            > "$STATE/$name-config.log" 2>&1 &
+        echo $! > "$STATE/$name-config.pid"
+        i=$((i + 1))
+    done
+
+    say "starting updaterd"
+    i=0
+    while [ "$i" -lt "$DUCKS" ]; do
+        name="$(duck_name "$i")"
+        mkdir -p "$STATE/$name/updater"
+        # Enough config to serve, which here means `account.*` and `update check`. An apply is
+        # `boot`'s business: these daemons are not units, so there is nothing to restart and
+        # `on_apply` names nothing.
+        #
+        # **The repo's own trust anchor, not an empty directory.** updaterd refuses to start
+        # without one — correctly, since a trust anchor nobody filled in verifies everything — and
+        # these are the three release keys install.sh puts on a robot.
+        #
+        # No backticks in this heredoc: it is unquoted so the paths expand, which means backticks
+        # would run as commands. The robotd.toml heredoc above says the same thing, from the same
+        # afternoon.
+        cat > "$STATE/updater-$name.toml" <<TOML
+trusted_keys_dir = "$REPO/deploy/trusted_keys"
+hw_rev = 1
+state_dir = "$STATE/$name/updater"
+robot_socket = "$STATE/$name.sock"
+
+# Where `policy.fetch` puts what it downloads. The default is /var/lib/robot/policies, which is
+# the board's and is unwritable here — every fetch against a twin refused with `Permission denied
+# (os error 13)` naming a path no simulator should have been given.
+policy_library = "$STATE/$name/policies"
+
+# Nothing in a simulator applies a release behind your back. The default is "mandatory", which is
+# right for a fleet and wrong for a laptop somebody is working on.
+auto_apply = "off"
+
+[component.daemon]
+install_dir = "$STATE/$name/daemon"
+keep_previous = 1
+
+[component.daemon.source]
+type = "github_releases"
+repo = "pollen-robotics/microduck"
+tag_prefix = "daemon-v"
+manifest_asset = "manifest.json"
+
+[component.daemon.on_apply]
+action = "restart"
+units = []
+
+[component.daemon.health]
+probe = "socket"
+timeout = "30s"
+TOML
+        DUCK_RUNTIME_DIR="$STATE" $SETSID nohup "$REPO/target/debug/updaterd" \
+            --config "$STATE/updater-$name.toml" --socket "$STATE/$name-updater.sock" \
+            --token "$STATE/$name/hf-token" \
+            > "$STATE/$name-updater.log" 2>&1 &
+        echo $! > "$STATE/$name-updater.pid"
+        i=$((i + 1))
+    done
+
     say "starting robotd"
     i=0
     while [ "$i" -lt "$DUCKS" ]; do
@@ -298,17 +411,71 @@ TOML
     # container mode: `webrtcsink` here is a local build at /opt/gst-plugins-rs, and a Debian
     # container has no packaged one — so the console is served from the host, pointed at the
     # simulator's frame port. `360p30` is exactly the 640x360 the renderer produces.
+    #
+    # **Off Linux the pipeline is a cargo feature and two packages.** `mediad/Cargo.toml` says why
+    # the feature exists; what it means here is a `brew install` once, and checking for it before
+    # cargo does — without it the build dies inside `gstreamer-sys` with a pkg-config error naming
+    # neither the feature nor the formula.
+    #
+    # **Two checks, because they fail at different moments.** pkg-config answers whether `mediad`
+    # will *build*. Whether it will *stream* is a different question, and on macOS the answer can
+    # be no while the build is perfect: Homebrew's `gstreamer` symlinks `libgstnice.dylib` into a
+    # separate `libnice-gstreamer` formula that is not one of its dependencies, so the link dangles
+    # and `webrtcbin` has no ICE agent. Everything comes up — the pipeline, the camera, the
+    # registration — and then the first consumer to ask for video dies with "libnice elements are
+    # not available" from inside a GStreamer thread. So the elements the pipeline actually needs
+    # are checked here, where the answer can still name the formula.
+    mediad_features=""
+    if any_camera && [ "$(uname -s)" != Linux ]; then
+        pkg-config --exists gstreamer-1.0 2>/dev/null || die "$(cat <<'WHY'
+a duck was asked for a camera, and this machine has no GStreamer.
+
+    brew install gstreamer libnice-gstreamer
+
+`gstreamer` is one merged formula carrying gst-plugins-rs (which is where webrtcsink comes from),
+srtp and x264; `libnice-gstreamer` is the ICE agent webrtcbin needs, and is not pulled in by it.
+Then run this again — or drop DUCK_SIM_CAMERAS for ducks with no eyes.
+WHY
+)"
+        missing=""
+        for element in nice webrtcsink x264enc; do
+            gst-inspect-1.0 "$element" >/dev/null 2>&1 || missing="$missing $element"
+        done
+        # The message needs $missing, so this heredoc is unquoted — and then an apostrophe in it
+        # would break the `$( )` around it in dash, several hundred lines further down. No
+        # apostrophes, and no backticks either, for the reason the params heredoc above gives.
+        [ -z "$missing" ] || die "$(cat <<WHY
+GStreamer is installed, but these elements are missing:$missing
+
+    brew install libnice-gstreamer
+
+"nice" is the usual one, and the usual cause: the Homebrew gstreamer formula links
+libgstnice.dylib into a formula it does not itself depend on, so the link dangles until that
+formula is installed. A duck without it comes up and streams to nothing, and fails the moment a
+browser asks for the video.
+WHY
+)"
+        mediad_features="--features gstreamer"
+    fi
+
     i=0
     while [ "$i" -lt "$DUCKS" ]; do
         if has_camera "$i"; then
             name="$(duck_name "$i")"
-            [ -x "$REPO/target/debug/mediad" ] || (cd "$REPO" && cargo build --quiet -p mediad)
+            # Always, for `build_daemons`' reason: a mediad in target/debug is not a mediad built
+            # from this branch, and off Linux it may be one built without the feature.
+            # shellcheck disable=SC2086
+            (cd "$REPO" && cargo build --quiet -p mediad $mediad_features)
             printf '[media]\nquality = "360p30"\n' > "$STATE/mediad-$name.toml"
             DUCK_RUNTIME_DIR="$STATE" RUST_LOG="${RUST_LOG:-info}" \
                 $SETSID nohup "$REPO/target/debug/mediad" \
                 --sim-camera "127.0.0.1:$((FRAME_PORT + i))" \
                 --config "$STATE/mediad-$name.toml" \
                 --robot-socket "$STATE/$name.sock" --tof-socket "$STATE/$name-tof.sock" \
+                --config-socket "$STATE/$name-config.sock" \
+                --updater-socket "$STATE/$name-updater.sock" \
+                --token "$STATE/$name/hf-token" \
+                --frame-socket "$STATE/$name-frame.sock" \
                 --port $((8443 + i)) --web-port $((8080 + i)) \
                 > "$STATE/$name-media.log" 2>&1 &
             echo $! > "$STATE/$name-media.pid"
@@ -356,6 +523,7 @@ TOML
     scripts/duck-sim ctl health   or anything else robotctl does
     scripts/duck-sim ctl robot do roulade
     scripts/duck-sim log          what the daemon is saying
+    scripts/duck-sim ctl account login    reach it from anywhere, like a real duck
     scripts/duck-sim down
 
 NEXT
@@ -433,6 +601,12 @@ WHY
     return 1
 }
 
+# Does any duck have an eye? Asked before the loop, because what a camera needs — a formula, a
+# feature, a longer build — is worth checking once rather than per duck.
+any_camera() {
+    [ -n "$CAMERAS" ]
+}
+
 # Does this duck have an eye? `all`, or its letter in the list.
 has_camera() {
     case "$CAMERAS" in
@@ -449,7 +623,7 @@ start_body() {
     [ -d "$RL" ] || die "no simulator at $RL. It is the microduck_rl repo — set DUCK_SIM_RL."
     [ -x "$RL/.venv/bin/python" ] || die "$RL has no .venv. Run \`uv sync\` there first."
     mkdir -p "$STATE"
-    say "starting the body — a MuJoCo window should open"
+    say "starting the body from $RL — a MuJoCo window should open"
     # `DUCK_SIM_VIEWER=0` for a window-less run: watching costs frames, and the daemon's loop is
     # wall-clock, so a simulator that cannot keep up is a robot that cannot balance.
     [ "${DUCK_SIM_VIEWER:-1}" = 0 ] && HEADLESS=--headless || HEADLESS=
@@ -476,9 +650,17 @@ start_body() {
     # invocation over two arguments nobody asked to use, and the duck never starts. Passed only
     # when a camera was actually requested, so asking for one against such a build still fails,
     # loudly and about the thing that is missing.
+    #
+    # **And `--camera-fps`, because the two ends have to agree on it.** `mediad` is configured with
+    # the `360p30` rung and meters what arrives against it; the renderer's own default is 15, to
+    # halve the cost of something nobody is watching. Left alone, every simulated duck with an eye
+    # logs "capture is below its target rate" forever — a warning that means nothing, on the one
+    # line that would mean something if the simulator really were falling behind. 30 costs about a
+    # third of a core per camera, which is the trade `DUCK_SIM_CAMERAS` already exists to let you
+    # decline.
     cam_args=""
     if [ -n "$CAMERAS" ]; then
-        cam_args="--cameras $CAMERAS --frame-port $FRAME_PORT"
+        cam_args="--cameras $CAMERAS --frame-port $FRAME_PORT --camera-fps 30"
     fi
     # shellcheck disable=SC2086
     $SETSID nohup "$PY_BIN" -m mjlab_microduck.sim.body_server \
@@ -486,7 +668,26 @@ start_body() {
         $cam_args \
         > "$STATE/body.log" 2>&1 &
     echo $! > "$STATE/body.pid"
-    wait_for_port || die "the simulator did not come up. $STATE/body.log has why."
+    if ! wait_for_port; then
+        # **The one failure here that belongs to the other repo.** The camera arrived in
+        # `microduck_rl` long after `duck-body` did, so a checkout that predates it runs a body
+        # server with no `--cameras`/`--frame-port` — and argparse exits on an unknown argument
+        # rather than ignoring it. The process is started in the background with its output
+        # redirected, so what that looks like from here is a port that never opens: the real reason
+        # is one line in `body.log` that nobody has opened yet.
+        if grep -q 'unrecognized arguments: --cameras' "$STATE/body.log" 2>/dev/null; then
+            die "$(cat <<WHY
+this microduck_rl has no camera: its body server does not know --cameras.
+
+    git -C $RL checkout develop && git -C $RL pull
+
+The rendering is on develop; a checkout on an older branch has the body and not the eye.
+Or unset DUCK_SIM_CAMERAS, and the duck runs blind.
+WHY
+)"
+        fi
+        die "the simulator did not come up. $STATE/body.log has why."
+    fi
 }
 
 wait_for_port() {
@@ -782,6 +983,17 @@ ExecStart=
 ExecStart=/opt/robot/daemon/current/bin/tofd --sim 127.0.0.1:$(duck_port "$i")
 RestrictAddressFamilies=
 RestrictAddressFamilies=AF_UNIX AF_INET
+CONF
+        # Its identity, and the fact that it is not a real one. A container does have its own
+        # /etc/machine-id, so this duck would register and be listed either way; what the flag adds
+        # is that the listing says `simulated`, and that the serial survives a rebuild of the rootfs
+        # rather than being a fresh id each time. The rest of the ExecStart is restated because a
+        # drop-in that clears it has to give the whole line back.
+        sudo mkdir -p "$upper/merged/etc/systemd/system/configd.service.d"
+        sudo tee "$upper/merged/etc/systemd/system/configd.service.d/sim.conf" >/dev/null <<CONF
+[Service]
+ExecStart=
+ExecStart=/opt/robot/daemon/current/bin/configd --allow-user btd --simulated sim-$name --fake-net --fake-pads
 CONF
         # Singing is opt-in. Only this key: everything else resolves from the release, which is
         # the reason to boot a container in the first place.
