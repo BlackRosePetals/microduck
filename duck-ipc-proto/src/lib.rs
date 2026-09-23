@@ -3675,12 +3675,18 @@ pub struct RobotState {
     pub velocities: Vec<f64>,
     /// Present current magnitude per joint, mA, indexed as [`JOINT_NAMES`].
     ///
-    /// Sign is dropped by the control loop, which is deliberate there and worth repeating here:
-    /// direction is inferable from [`Self::velocities`], and what a consumer wants is load.
+    /// Magnitude, not a signed current: the sign is dropped in the bus driver
+    /// (`duck_control::bus`, the `.abs()` on the present-current word), not in the control
+    /// loop and not here. What a consumer wants is load, and load is what this is.
     ///
-    /// This is the robot's only measure of external force. A joint holding a squat, a foot
-    /// taking weight, a hand pressing on the beak and a servo about to latch its overload
-    /// shutdown are all visible here and nowhere else on this wire.
+    /// **Direction is not recoverable from [`Self::velocities`].** That works while a joint is
+    /// moving, and the cases this field exists for are the still ones: a joint holding a squat,
+    /// a foot taking weight and a hand pressing on the beak are all near-zero velocity at
+    /// non-zero current, where a push and a pull read alike. Wanting the direction of an
+    /// external force is a reason to carry the sign, not something to derive downstream.
+    ///
+    /// This is the robot's only measure of external force. Those three, and a servo on its way
+    /// to latching its overload shutdown, are visible here and nowhere else on this wire.
     ///
     /// Same `default` rule as [`Self::velocities`]: empty is *not reported*, not zero load. (v28)
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -5995,37 +6001,7 @@ mod tests {
     /// the field where the docs say it is.
     #[test]
     fn the_theremin_block_is_absent_until_there_is_a_theremin() {
-        let mut state = RobotState {
-            t: 1.5,
-            t_ns: 0,
-            imu: None,
-            frames: None,
-            skeleton: Vec::new(),
-            movement: MoveState {
-                requested: [0.0; 3],
-                applied: [0.0; 3],
-                limited_by: Vec::new(),
-            },
-            head: [0.0; 4],
-            policy: "stand".into(),
-            safety: SafetyState {
-                fallen: false,
-                limp: false,
-                gravity: [0.0, 0.0, -1.0],
-                gain: Some(200),
-            },
-            control_loop: LoopState {
-                hz: 50.0,
-                missed: 0,
-            },
-            joints: vec![0.0; 15],
-            targets: vec![0.0; 15],
-            velocities: vec![0.0; 15],
-            currents_ma: vec![0.0; 15],
-            odom: OdomState::default(),
-            theremin: None,
-            chorale: None,
-        };
+        let mut state = a_state();
         let down = serde_json::to_string(&state).unwrap();
         assert!(!down.contains("theremin"), "{down}");
 
@@ -6058,36 +6034,16 @@ mod tests {
     /// in either rename is invisible in Rust and breaks every consumer, so pin the JSON.
     #[test]
     fn robot_state_uses_the_documented_field_names() {
+        // Only the fields this test is about; everything else is `a_state()`'s business, so
+        // the next field added to `RobotState` does not have to be typed out again here.
         let state = RobotState {
-            t: 1.5,
-            t_ns: 0,
-            imu: None,
-            frames: None,
-            skeleton: Vec::new(),
             movement: MoveState {
                 requested: [0.4, 0.0, 0.0],
                 applied: [0.15, 0.0, 0.0],
                 limited_by: vec!["deadman".into()],
             },
-            head: [0.0; 4],
             policy: "walk".into(),
-            safety: SafetyState {
-                fallen: false,
-                limp: false,
-                gravity: [0.0, 0.0, -1.0],
-                gain: Some(200),
-            },
-            control_loop: LoopState {
-                hz: 49.8,
-                missed: 0,
-            },
-            joints: vec![0.0; 15],
-            targets: vec![0.0; 15],
-            velocities: vec![0.0; 15],
-            currents_ma: vec![0.0; 15],
-            odom: OdomState::default(),
-            theremin: None,
-            chorale: None,
+            ..a_state()
         };
 
         let line = serde_json::to_string(&Request::notify_state(&state)).unwrap();
@@ -6160,6 +6116,10 @@ mod tests {
     }
 
     /// A minimal frame: everything present, nothing interesting.
+    ///
+    /// The one place a full [`RobotState`] is spelled out in this module. A test that cares
+    /// about two fields overrides those two — `RobotState { policy: "walk".into(), ..a_state() }`
+    /// — so an additive field is one line here rather than one line per test.
     fn a_state() -> RobotState {
         RobotState {
             t: 1.5,

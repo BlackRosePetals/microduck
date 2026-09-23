@@ -18,8 +18,10 @@ pub struct Sensors {
     pub positions: [f64; NUM_JOINTS],
     /// Joint velocities, rad/s.
     pub velocities: [f64; NUM_JOINTS],
-    /// Present current magnitude, mA. Sign is dropped — direction is inferable from
-    /// velocity, and every consumer so far wants load, not direction.
+    /// Present current magnitude, mA. The sign is dropped by whichever driver fills this —
+    /// [`crate::bus`] takes the absolute value as it unpacks the word — because what every
+    /// consumer so far wants is load. It is not recoverable from `velocities`: a joint holding
+    /// a squat or a foot taking weight is near-zero velocity at non-zero current.
     pub currents_ma: [f64; NUM_JOINTS],
     pub imu: ImuData,
 }
