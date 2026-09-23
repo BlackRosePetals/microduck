@@ -224,9 +224,8 @@ up() {
     [ -x "$RL/.venv/bin/python" ] || die "$RL has no .venv. Run \`uv sync\` there first."
     # `.so.<version>` on Linux, `.<version>.dylib` on macOS — the wheel names it after the platform
     # and `ort` dlopens whatever this points at, so both spellings are looked for rather than one.
-    ORT="$(ls "$RL"/.venv/lib/python*/site-packages/onnxruntime/capi/libonnxruntime.so.* \
-            "$RL"/.venv/lib/python*/site-packages/onnxruntime/capi/libonnxruntime*.dylib \
-            2>/dev/null | head -1)"
+    ORT="$(find "$RL"/.venv/lib/python*/site-packages/onnxruntime/capi \
+            \( -name 'libonnxruntime.so*' -o -name 'libonnxruntime*.dylib' \) -type f 2>/dev/null | head -1)"
     [ -n "$ORT" ] || die "no onnxruntime in $RL/.venv — the policies cannot load without it."
 
     down
@@ -343,18 +342,21 @@ TOML
         # without one — correctly, since a trust anchor nobody filled in verifies everything — and
         # these are the three release keys install.sh puts on a robot.
         #
-        # No backticks in this heredoc: it is unquoted so the paths expand, which means backticks
-        # would run as commands. The robotd.toml heredoc above says the same thing, from the same
-        # afternoon.
+        # Backticks in this heredoc are escaped, because it is unquoted: that is what expands the
+        # paths, and it is also what would run a bare backtick pair as a command. The robotd.toml
+        # heredoc above carries the same warning, written there after a bare pair was executed in
+        # it. This heredoc was warned too, two hours before the author of the warning added an
+        # unescaped pair anyway. A prose warning cannot fail a build; SC2006 can, which is why
+        # this script is in the shellcheck list now.
         cat > "$STATE/updater-$name.toml" <<TOML
 trusted_keys_dir = "$REPO/deploy/trusted_keys"
 hw_rev = 1
 state_dir = "$STATE/$name/updater"
 robot_socket = "$STATE/$name.sock"
 
-# Where `policy.fetch` puts what it downloads. The default is /var/lib/robot/policies, which is
-# the board's and is unwritable here — every fetch against a twin refused with `Permission denied
-# (os error 13)` naming a path no simulator should have been given.
+# Where \`policy.fetch\` puts what it downloads. The default is /var/lib/robot/policies, which is
+# the board's and is unwritable here — every fetch against a twin refused with \`Permission denied
+# (os error 13)\` naming a path no simulator should have been given.
 policy_library = "$STATE/$name/policies"
 
 # Nothing in a simulator applies a release behind your back. The default is "mandatory", which is
@@ -763,6 +765,13 @@ Try DUCK_SIM_VIEWER=0, or fewer ducks." ;;
 down_containers() {
     # Called by every `down`, including the plain one. A machine with no systemd has no containers
     # to stop, and sixteen `sudo systemctl` that cannot resolve would ask for a password first.
+    #
+    # `set -eu` is on at the top of this file and is never turned off, which is what the `|| true` on
+    # the two `sudo` calls below is for. That is load-bearing rather than tidiness: a `stop` or an
+    # `umount` that failed would end this loop where it stands, and the rest of `down_containers`
+    # would never run — ducks left booted, overlays left mounted, which is the one outcome this
+    # function exists to prevent. `shellcheck` does not report a `|| true` that was dropped, so
+    # nothing in CI catches the removal.
     command -v systemctl >/dev/null 2>&1 || return 0
     i=0
     while [ "$i" -lt 16 ]; do
@@ -771,7 +780,9 @@ down_containers() {
             sudo systemctl stop "$name" 2>/dev/null || true
         fi
         merged="$STATE/ducks/$name/merged"
-        mountpoint -q "$merged" 2>/dev/null && sudo umount "$merged" 2>/dev/null || true
+        if mountpoint -q "$merged" 2>/dev/null; then
+            sudo umount "$merged" 2>/dev/null || true
+        fi
         i=$((i + 1))
     done
 }
@@ -847,7 +858,7 @@ rootfs() {
 # Everything a release puts on a board, put here by hand — this is not `robotctl update apply`, it
 # is what a board looks like *after* one, so that the units and the daemons are the real thing.
 stage() {
-    ORT="$(ls "$RL"/.venv/lib/python*/site-packages/onnxruntime/capi/libonnxruntime.so.* 2>/dev/null | head -1)"
+    ORT="$(find "$RL"/.venv/lib/python*/site-packages/onnxruntime/capi -name 'libonnxruntime.so*' -type f 2>/dev/null | head -1)"
     [ -n "$ORT" ] || die "no onnxruntime in $RL/.venv"
     say "installing the release into the container"
     # **Every daemon's users, not just robotd's.** A unit whose `User=` does not exist fails with
@@ -1008,6 +1019,10 @@ CONF
                 --dir "$upper/merged/var/lib/robot/sounds" >/dev/null 2>&1 || say "$name has no voice"
         fi
         say "booting $name (body on port $(duck_port "$i"))"
+        # An empty AUDIO_BIND must pass no argument at all, so the word split is the point — the
+        # same shape as the four other deliberately unquoted lists here: `$mediad_features`, two
+        # calls' `$args`, and the body server's `$HEADLESS $scene_arg $cam_args`.
+        # shellcheck disable=SC2086
         sudo systemd-run --collect --unit="$name" --quiet \
             systemd-nspawn -D "$upper/merged" --machine="$name" --boot \
             --hostname="$name" --resolv-conf=copy-host \
