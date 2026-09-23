@@ -98,11 +98,19 @@ jobs:
       # other script here, and was missing from this list while being the one file that runs on
       # every board on every update — the argument this comment opens with, applied to itself.
       #
+      # `duck-sim` is here for the sharpest version of the same argument: it is the no-hardware entry
+      # point `README.md` and `docs/robot/simulation.md` both send a newcomer to, and nothing had ever
+      # run it. The heredoc that writes a twin's `updater.toml` is unquoted so the paths expand, which
+      # also means a bare backtick pair in a comment runs as a command — it did, on every start, after
+      # the comment directly above that very heredoc had already warned not to. The `robotd.toml`
+      # heredoc above it is the same shape and carries the same warning, written there when its own
+      # comment was executed. A comment cannot fail a build; SC2006 can.
+      #
       # POSIX sh, not bash: the script is piped to `sh` by the documented one-liner, and
       # a bashism would work on a dev box and fail on the board.
       - name: Lint the installer
         run: |
-          for script in scripts/install.sh scripts/setup-board.sh scripts/setup-gstreamer.sh scripts/setup-login.sh scripts/setup-quiet-boot.sh scripts/migrate-network.sh scripts/provision.sh scripts/provision-board.sh scripts/ci-release-notes.sh scripts/robot-rescue scripts/dev-push.sh scripts/pad-link-test.sh scripts/pad-stack-report.sh scripts/seed-policies.sh scripts/seed-detector.sh; do
+          for script in scripts/install.sh scripts/setup-board.sh scripts/setup-gstreamer.sh scripts/setup-login.sh scripts/setup-quiet-boot.sh scripts/migrate-network.sh scripts/provision.sh scripts/provision-board.sh scripts/ci-release-notes.sh scripts/robot-rescue scripts/dev-push.sh scripts/pad-link-test.sh scripts/pad-stack-report.sh scripts/seed-policies.sh scripts/seed-detector.sh scripts/duck-sim; do
             sh -n "$script"
             shellcheck --shell=sh "$script"
             # The one-liner is only correct if the file is executable and self-contained.

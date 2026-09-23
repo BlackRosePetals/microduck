@@ -260,6 +260,88 @@ impl Pins {
     }
 }
 
+/// When each component's update source last answered with a manifest that verified.
+///
+/// A robot that cannot reach its source (a blocked host, a DNS that stopped resolving, a clock TLS
+/// will not accept) looks like a robot with nothing to install: the scheduled check fails, and
+/// every other answer about the robot stays the same. How long ago the source last answered is the
+/// one thing that differs, so it is written down here and `update.status` reports it
+/// (`docs/design/updater-design.md` §8.4.2, option 3). A source replaying an old signed manifest
+/// still answers, and this does not catch that one; expiry would.
+///
+/// Only the source's latest counts. An exact version is one a source that stopped moving still
+/// serves.
+pub struct Checked {
+    path: PathBuf,
+}
+
+impl Checked {
+    pub fn open(state_dir: &Path) -> Self {
+        Self {
+            path: state_dir.join("checked.json"),
+        }
+    }
+
+    /// When `component`'s source last answered, in unix seconds. `None` when it never has on this
+    /// board, or the record cannot be read: this is a report riding on `update.status`, and a
+    /// report that failed the call it rides on would be worse than a missing one.
+    pub fn get(&self, component: &str) -> Option<i64> {
+        self.read_all().unwrap_or_default().remove(component)
+    }
+
+    /// Record that `component`'s source answered now.
+    pub fn record(&self, component: &str) -> Result<(), Error> {
+        self.record_at(component, now_unix())
+    }
+
+    /// A clock before the preflight floor is not written down. A board with no RTC boots in 1970,
+    /// a `local_dir` source needs no TLS to answer, and a time from then would report the source as
+    /// fifty years quiet the moment the clock caught up.
+    ///
+    /// Said out loud, at debug, because the board it happens on is one where every check succeeds
+    /// and nothing is ever recorded — and the report staying empty forever is otherwise
+    /// indistinguishable from a source that has gone quiet.
+    fn record_at(&self, component: &str, at: i64) -> Result<(), Error> {
+        if at < crate::preflight::CLOCK_FLOOR_UNIX {
+            tracing::debug!(
+                component,
+                at,
+                floor = crate::preflight::CLOCK_FLOOR_UNIX,
+                "source answered, but the clock is before the preflight floor: not recorded"
+            );
+            return Ok(());
+        }
+        let mut all = self.read_all()?;
+        all.insert(component.to_owned(), at);
+        let bytes = serde_json::to_vec(&all)
+            .map_err(|e| Error::Internal(format!("serialising check times: {e}")))?;
+        write_atomic(&self.path, &bytes)
+    }
+
+    /// Absent is empty; unreadable is an error, because the caller is about to write the whole
+    /// map back. Swallowing an IO error here would replace every other component's time with a
+    /// map holding only the one being recorded — losing, on a transient failure, exactly the
+    /// record this exists to keep. Damaged JSON is different: nothing can read any entry in it,
+    /// so starting over loses nothing that was still there.
+    fn read_all(&self) -> Result<BTreeMap<String, i64>, Error> {
+        match std::fs::read(&self.path) {
+            Ok(bytes) => Ok(serde_json::from_slice(&bytes).unwrap_or_else(|e| {
+                tracing::warn!(
+                    path = %self.path.display(),
+                    error = %e,
+                    "check times unreadable: starting the record again"
+                );
+                BTreeMap::new()
+            })),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(BTreeMap::new()),
+            Err(e) => Err(Error::Io {
+                path: self.path.clone(),
+                source: e,
+            }),
+        }
+    }
+}
+
 /// What `scripts/robot-rescue` leaves in the state dir when it swaps `current` to golden.
 ///
 /// The file it writes, verbatim:
@@ -757,5 +839,59 @@ mod tests {
         let counter = BootCounter::open(dir.path());
         counter.confirm("daemon").unwrap();
         counter.confirm("daemon").unwrap();
+    }
+
+    /// A board that has never reached its source has nothing to report, and one component's
+    /// check says nothing about another's.
+    #[test]
+    fn a_check_is_recorded_per_component() {
+        let dir = tempfile::tempdir().unwrap();
+        let checked = Checked::open(dir.path());
+        assert_eq!(checked.get("daemon"), None);
+
+        checked.record_at("daemon", 1_800_000_000).unwrap();
+        assert_eq!(checked.get("daemon"), Some(1_800_000_000));
+        assert_eq!(checked.get("model"), None);
+
+        checked.record_at("model", 1_800_000_500).unwrap();
+        assert_eq!(
+            checked.get("daemon"),
+            Some(1_800_000_000),
+            "another component's check leaves this one alone"
+        );
+    }
+
+    /// A clock that has not synced is not a time anything happened.
+    #[test]
+    fn a_check_under_an_unsynced_clock_is_not_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let checked = Checked::open(dir.path());
+        checked.record_at("daemon", 1_800_000_000).unwrap();
+        checked.record_at("daemon", 86_400).unwrap();
+        assert_eq!(checked.get("daemon"), Some(1_800_000_000));
+    }
+
+    /// A damaged record is a missing report, not a failed `update.status`.
+    #[test]
+    fn a_damaged_record_reads_as_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("checked.json"), b"{not json").unwrap();
+        assert_eq!(Checked::open(dir.path()).get("daemon"), None);
+    }
+
+    /// A record that cannot be read for a reason that is not "it is not there" refuses the write
+    /// rather than replacing the file with the one component being recorded. The engine logs the
+    /// failure; what it must not do is quietly forget when every other component last checked.
+    #[test]
+    fn an_unreadable_record_is_not_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        // A directory where the file goes: `read` fails with something other than `NotFound`,
+        // which is what a permission change or a failing disk looks like from here.
+        std::fs::create_dir(dir.path().join("checked.json")).unwrap();
+        let checked = Checked::open(dir.path());
+        assert!(matches!(
+            checked.record_at("daemon", 1_800_000_000),
+            Err(Error::Io { .. })
+        ));
     }
 }

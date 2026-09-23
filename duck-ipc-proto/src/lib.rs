@@ -394,7 +394,17 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// Both are absent from an older `updaterd` and neither needs a fallback: a client with no
 /// description shows the id, which is what it showed before.
 ///
-/// # v35 — measured joint velocity and load, on the state stream
+/// # v35 — when the update source last answered
+///
+/// One `Option<i64>` on [`ComponentStatus`]. `update.status` says when each component's update
+/// source last answered with a manifest that verified, so a robot that has stopped reaching its
+/// source stops looking up to date: a failed check left the installed release and no error, which
+/// is what a robot with nothing to install looks like.
+///
+/// Absent is "it has not answered since this robot started recording", which is what an older
+/// `updaterd` sends and what a client must not read as a fresh check.
+///
+/// # v36 — measured joint velocity and load, on the state stream
 ///
 /// [`RobotState::velocities`] and [`RobotState::currents_ma`]: the two blocks the control loop has
 /// read beside position on every tick and never published. Neither is recoverable from outside
@@ -405,7 +415,7 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// Absent is also what a backend with nothing to measure sends — `--fake` has no servos — and
 /// what a robot with `[control] publish_velocity_and_load` off sends. A client that reads absent
 /// as "not told" rather than as zero handles all three without having to know which.
-pub const API_VERSION: u32 = 35;
+pub const API_VERSION: u32 = 36;
 
 /// The observation width every policy this robot family runs is built against.
 ///
@@ -3128,7 +3138,24 @@ pub struct ComponentStatus {
     pub reason: Option<String>,
     pub pinned: Option<semver::Version>,
     pub last_attempt: Option<LogEntry>,
+    /// When this component's update source last answered with a manifest that verified, unix
+    /// seconds. `None` on a board where it never has, and from an `updaterd` older than v35.
+    ///
+    /// A robot that cannot reach its source reads exactly like one with nothing to install: the
+    /// scheduled check fails and every other field here stays the same. How long ago the source
+    /// last answered is what shows it. A source replaying an old signed manifest still answers,
+    /// so this does not catch that one; `updater-design.md` §8.4.2 has what would.
+    pub last_checked: Option<i64>,
 }
+
+/// The API version [`ComponentStatus::last_checked`] arrived in.
+///
+/// A client needs it to read the absent field, because absent means two opposite things: an
+/// `updaterd` older than this cannot say, and a newer one saying nothing means the source has
+/// never answered on this board — which is the state a robot blocked since first boot is in, and
+/// the one worth warning about. Without the version they are the same silence, and the case the
+/// report exists for is the one that reads as "fine".
+pub const API_LAST_CHECKED: u32 = 35;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InstalledRelease {
@@ -3677,11 +3704,11 @@ pub struct RobotState {
     /// a client must not render it as zero velocity.
     ///
     /// Three things make it empty, and nothing on the wire tells them apart: a daemon older
-    /// than v35; a backend with nothing to measure — `--fake` has no servos, and a simulator
+    /// than v36; a backend with nothing to measure — `--fake` has no servos, and a simulator
     /// may send no load for [`Self::currents_ma`]; and `[control] publish_velocity_and_load =
     /// false` in `robotd.toml`, which is how an operator takes the bytes off the stream. All
     /// three say the same thing — this robot is not telling you — and none of them is a zero.
-    /// (v35)
+    /// (v36)
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub velocities: Vec<f64>,
     /// Present current magnitude per joint, mA, indexed as [`JOINT_NAMES`].
@@ -3700,7 +3727,7 @@ pub struct RobotState {
     /// to latching its overload shutdown, are visible here and nowhere else on this wire.
     ///
     /// Same `default` rule as [`Self::velocities`], and the same three ways of being empty:
-    /// empty is *not reported*, never zero load. (v35)
+    /// empty is *not reported*, never zero load. (v36)
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub currents_ma: Vec<f64>,
     /// Where contact odometry believes the robot is. `default` so a frame from

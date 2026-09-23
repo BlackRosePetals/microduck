@@ -900,6 +900,28 @@ cost — a re-signing schedule that, if missed, warns the entire fleet — is no
 paying before the publishing pipeline is routine. (2) is cheap but solves a problem
 §8.4.1 already covers at the version level.
 
+**(3) is built.** `update.status` carries `last_checked` per component, and `robotctl health`
+says when the update source last answered and warns once it has been quiet for a week. Only the
+source's latest counts, signed and for the right channel, so a failed fetch, a manifest that does
+not verify and a `--from` directory all leave it where it was. As the option says, it makes a robot
+that cannot reach its source visible, and not one being fed an old signed manifest; that is still
+(1).
+
+**A source that has never answered is the warning, not the silence.** A board that has been
+blocked since it was provisioned has nothing recorded — which is also what an `updaterd` older
+than `API_LAST_CHECKED` sends. `robotctl health` tells the two apart by the API version in the
+`hello` it already has, and warns on the first: a robot that has never reached its source is the
+worst case this report exists for, and reading it as "no news" prints what a healthy robot prints.
+
+**It does depend on the clock**, unlike the option as listed above — a recorded time is only
+meaningful against the one reading it. Both directions are handled where they land rather than
+trusted: a time below §7.2's clock floor is not recorded at all (a board with no RTC, on a
+`local_dir` source that needs no TLS to answer, would otherwise report fifty years of silence the
+moment NTP arrives), and a time *ahead* of the reader's clock is reported as unknown and warned
+about rather than clamped to "just now" — a board whose clock was corrected backwards after a
+check would otherwise read as freshly checked for good, since only a successful check replaces the
+record.
+
 **Explicitly accepted for v1:** a robot whose network is hostile can be prevented
 from updating. It cannot be made to *downgrade*, install an artifact we did not
 sign, or install one that fails its health gate. Those are the properties we
@@ -1463,10 +1485,9 @@ Still open:
   That listener's blast radius is bounded by signature verification (an unsigned
   upload cannot install; worst case is filling the disk), but it wants a token
   and a deliberate bind regardless (`architecture.md` §2.2). Backup plan, not v1.
-- **Manifest staleness reporting** (§8.4.2) — surface "last successful check N
-  days ago" in `status` and the app, converting a freeze attack from silent to
-  visible. Cheap; recommended. Signed manifest expiry is the real defence but
-  carries a re-signing schedule, deferred until publishing is routine.
+- ~~**Manifest staleness reporting**~~ (§8.4.2), **built**: `update.status` carries
+  `last_checked`, and `robotctl health` warns when a source has been quiet for a week. Signed
+  manifest expiry is still the real defence, deferred until publishing is routine.
 - **Config ownership** — does config ride with the model bundle, the daemon, or
   become its own tiny channel? (Hooks handle migrations either way, §9.)
 - **Minimal success/failure phone-home** — one ping per update would let us catch
