@@ -401,6 +401,10 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// the daemon — differencing `joints` across a decimated subscription is not a velocity, and
 /// present current is the only measure of external force this robot has. Additive, on the rule
 /// `odom` set: absent from a daemon predating it, and absent stays distinguishable from zero.
+///
+/// Absent is also what a backend with nothing to measure sends — `--fake` has no servos — and
+/// what a robot with `[control] publish_velocity_and_load` off sends. A client that reads absent
+/// as "not told" rather than as zero handles all three without having to know which.
 pub const API_VERSION: u32 = 35;
 
 /// The observation width every policy this robot family runs is built against.
@@ -3670,7 +3674,14 @@ pub struct RobotState {
     ///
     /// `default` so a frame from a `robotd` predating this field still parses, on the same rule
     /// as [`Self::odom`]. Empty means *not reported*, which is not the same as a robot at rest —
-    /// a client must not render it as zero velocity. (v28)
+    /// a client must not render it as zero velocity.
+    ///
+    /// Three things make it empty, and nothing on the wire tells them apart: a daemon older
+    /// than v35; a backend with nothing to measure — `--fake` has no servos, and a simulator
+    /// may send no load for [`Self::currents_ma`]; and `[control] publish_velocity_and_load =
+    /// false` in `robotd.toml`, which is how an operator takes the bytes off the stream. All
+    /// three say the same thing — this robot is not telling you — and none of them is a zero.
+    /// (v35)
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub velocities: Vec<f64>,
     /// Present current magnitude per joint, mA, indexed as [`JOINT_NAMES`].
@@ -3688,7 +3699,8 @@ pub struct RobotState {
     /// This is the robot's only measure of external force. Those three, and a servo on its way
     /// to latching its overload shutdown, are visible here and nowhere else on this wire.
     ///
-    /// Same `default` rule as [`Self::velocities`]: empty is *not reported*, not zero load. (v28)
+    /// Same `default` rule as [`Self::velocities`], and the same three ways of being empty:
+    /// empty is *not reported*, never zero load. (v35)
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub currents_ma: Vec<f64>,
     /// Where contact odometry believes the robot is. `default` so a frame from

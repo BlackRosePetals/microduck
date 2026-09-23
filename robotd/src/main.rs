@@ -1871,6 +1871,10 @@ async fn control_loop<T: RobotIo>(
     let dt = period.as_secs_f64();
     let cmd_alpha = params.control.cmd_alpha.clamp(0.0, 1.0);
     let head_alpha = params.control.head_alpha.clamp(0.0, 1.0);
+    // Whether measured velocity and load go on the state stream. Read once: it is a startup
+    // setting like the rest of `[control]`, and `robotctl configure` writing the file takes
+    // effect on the next start of the daemon, not mid-tick.
+    let publish_measurements = params.control.publish_velocity_and_load;
     let mut twist_ema = [0.0f64; 3];
     let mut head_ema = [0.0f64; 4];
     let mut body_ema = [0.0f64; 3];
@@ -3225,8 +3229,21 @@ async fn control_loop<T: RobotIo>(
                 },
                 joints: sensors.positions.to_vec(),
                 targets: targets.to_vec(),
-                velocities: sensors.velocities.to_vec(),
-                currents_ma: sensors.currents_ma.to_vec(),
+                // Empty is *not reported* on this wire, and both of these have two ways of
+                // being that: `[control] publish_velocity_and_load = false` on a robot whose
+                // operator does not want the bytes, and a backend with nothing to report —
+                // `--fake` has no servos, and a simulator may send no load. Neither may become
+                // a block of zeros, which reads as a robot at rest under no load.
+                velocities: if publish_measurements && safety.measures_velocity() {
+                    sensors.velocities.to_vec()
+                } else {
+                    Vec::new()
+                },
+                currents_ma: if publish_measurements && safety.measures_load() {
+                    sensors.currents_ma.to_vec()
+                } else {
+                    Vec::new()
+                },
                 odom: proto::OdomState {
                     position: odometry.position(),
                     yaw: odometry.yaw(),
@@ -6724,6 +6741,90 @@ mod tests {
         // ...and not confused with each other, or with the angles the robot is holding.
         assert_ne!(frame.velocities, frame.currents_ma);
         assert_ne!(frame.velocities, frame.joints);
+    }
+
+    /// A backend with no servos must report *nothing*, not a robot at rest.
+    ///
+    /// `FakeIo` fills `Sensors` with zeros and `--fake` is the default backend on any host that
+    /// is not the robot, so without this the loop puts fifteen zero velocities and zero
+    /// milliamps on the stream while `joints` sweeps through the home ramp — a dashboard draws
+    /// a robot moving under no load rather than a robot that cannot say. Empty is how this wire
+    /// says "not reported", and a backend that measures neither has to reach it.
+    #[tokio::test]
+    async fn a_backend_that_measures_neither_publishes_neither() {
+        let frame = a_frame_from(FakeIo::at(DEFAULT_POSITION), Params::default()).await;
+
+        assert!(
+            frame.velocities.is_empty(),
+            "a fake robot reports no velocity, not zero velocity: {:?}",
+            frame.velocities
+        );
+        assert!(
+            frame.currents_ma.is_empty(),
+            "and no load, not zero load: {:?}",
+            frame.currents_ma
+        );
+        // The frame is otherwise the frame it always was.
+        assert_eq!(frame.joints.len(), NUM_JOINTS);
+    }
+
+    /// `[control] publish_velocity_and_load = false` takes both blocks off the stream, on a
+    /// backend that does measure them.
+    ///
+    /// The way out if the bytes turn out to cost something on a particular robot, or a consumer
+    /// turns out to mishandle the fields: off is *absent*, which is what a daemon predating them
+    /// sends, and never a block of zeros.
+    #[tokio::test]
+    async fn the_config_can_take_both_blocks_off_the_stream() {
+        let mut io = FakeIo::at(DEFAULT_POSITION);
+        io.set_velocities([0.3; NUM_JOINTS]);
+        io.set_currents_ma([250.0; NUM_JOINTS]);
+
+        let mut params = Params::default();
+        params.control.publish_velocity_and_load = false;
+
+        let frame = a_frame_from(io, params).await;
+
+        assert!(frame.velocities.is_empty(), "{:?}", frame.velocities);
+        assert!(frame.currents_ma.is_empty(), "{:?}", frame.currents_ma);
+    }
+
+    /// Run the loop over one backend until it publishes a frame, and stop it.
+    async fn a_frame_from(io: FakeIo, params: Params) -> proto::RobotState {
+        let params = Params {
+            policy: params::PolicyParams {
+                enabled: false,
+                ..params.policy
+            },
+            ..params
+        };
+        let s = Arc::new(RobotState::new(
+            &params,
+            &PathBuf::from("/nonexistent/robotd.toml"),
+            false,
+            false,
+        ));
+        let mut states = s.state_tx.subscribe();
+
+        let loop_state = Arc::clone(&s);
+        let handle = tokio::spawn(control_loop(
+            io,
+            loop_state,
+            Arc::new(Intents::new()),
+            params,
+            PathBuf::from("/nonexistent/robotd.toml"),
+            Duration::from_millis(2),
+            noop_poweroff(),
+        ));
+
+        let frame = tokio::time::timeout(Duration::from_secs(5), states.recv())
+            .await
+            .expect("a frame within five seconds")
+            .expect("the stream stayed open");
+
+        s.shutdown.store(true, Ordering::Relaxed);
+        handle.await.unwrap();
+        frame
     }
 
     /// Assembling a frame allocates, on the thread that should not be visiting the

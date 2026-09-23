@@ -86,8 +86,12 @@ struct Hello {
 struct SensorFrame {
     positions: [f64; NUM_JOINTS],
     velocities: [f64; NUM_JOINTS],
+    /// Optional, and `None` is not a simulator reporting no load: a MuJoCo model without
+    /// actuator force to report simply omits it, and filling the gap with zeros would put
+    /// "every joint unloaded" on the state stream. [`RobotIo::measures_load`] carries the
+    /// difference out of here.
     #[serde(default)]
-    currents_ma: [f64; NUM_JOINTS],
+    currents_ma: Option<[f64; NUM_JOINTS]>,
     imu: ImuFrame,
 }
 
@@ -117,6 +121,10 @@ pub struct RemoteIo {
     link: Option<Link>,
     /// Reported once rather than every tick a disconnected loop runs.
     complained: bool,
+    /// Whether the last frame carried a load block. Per-frame rather than settled at startup:
+    /// nothing is connected until the first read, so there is no earlier moment at which this
+    /// could be known.
+    load_reported: bool,
 }
 
 struct Link {
@@ -132,6 +140,7 @@ impl RemoteIo {
             addr: addr.into(),
             link: None,
             complained: false,
+            load_reported: false,
         }
     }
 
@@ -263,10 +272,11 @@ fn acked(ack: Ack, what: &str) -> Result<()> {
 impl RobotIo for RemoteIo {
     fn read(&mut self) -> Result<Sensors> {
         let frame: SensorFrame = self.call(&Request::Read)?;
+        self.load_reported = frame.currents_ma.is_some();
         Ok(Sensors {
             positions: frame.positions,
             velocities: frame.velocities,
-            currents_ma: frame.currents_ma,
+            currents_ma: frame.currents_ma.unwrap_or([0.0; NUM_JOINTS]),
             imu: ImuData {
                 gyro: frame.imu.gyro,
                 gravity: frame.imu.gravity,
@@ -296,6 +306,12 @@ impl RobotIo for RemoteIo {
     /// there is nothing to send: the reboot succeeds at once and the caller restores the gains as
     /// it would on a robot. Deliberately not an op on the wire — the simulator would only have to
     /// answer it with an ack.
+    /// The simulator computes joint velocity from the physics, so this is a measurement in the
+    /// same sense the bus's is. Load is the one that may be missing, and says so per frame.
+    fn measures_load(&self) -> bool {
+        self.load_reported
+    }
+
     fn reboot(&mut self, id: u8) -> Result<()> {
         tracing::debug!(id, "reboot of a simulated servo: nothing to do");
         Ok(())
@@ -368,6 +384,34 @@ mod tests {
         let heard = sim.join().expect("the simulator thread");
         assert!(heard[0].contains(r#""op":"hello""#), "{heard:?}");
         assert!(heard[1].contains(r#""op":"read""#), "{heard:?}");
+    }
+
+    /// A simulator that sends no load block is not a simulator reporting no load. The frame
+    /// still parses — that is what the `default` is for — and what must not happen is the zeros
+    /// it defaults to reaching the state stream as though something had measured them.
+    #[test]
+    fn a_frame_without_a_load_block_is_not_a_frame_of_zero_load() {
+        const NO_LOAD: &str = concat!(
+            r#"{"positions":[0.1,0,0,0,0,0,0,0,0,0,0,0,0,0,0],"#,
+            r#""velocities":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0.5],"#,
+            r#""imu":{"gyro":[0,0,0],"gravity":[0,0,-1],"quat":[1,0,0,0]}}"#
+        );
+        let (addr, sim) = simulator(vec![vec![HELLO, NO_LOAD, SENSORS]]);
+        let mut io = RemoteIo::at(addr);
+
+        io.read().expect("a frame with no load block");
+        assert!(!io.measures_load(), "an absent block is not a measurement");
+        assert!(
+            io.measures_velocity(),
+            "the simulator computes velocity from the physics and always sends it"
+        );
+
+        // And it is per frame, not settled once: the same connection sending load next tick is
+        // reporting load.
+        io.read().expect("a frame with one");
+        assert!(io.measures_load());
+
+        sim.join().expect("the simulator thread");
     }
 
     #[test]
