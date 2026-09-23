@@ -1465,13 +1465,101 @@ struct ComponentReport {
     /// The last update attempt, as one line. `None` on a robot that has never updated.
     #[serde(skip_serializing_if = "Option::is_none")]
     last_attempt: Option<String>,
-    /// How long since the update source last answered, in words: "3 hours ago". `None` when it
-    /// never has, or `updaterd` predates saying.
+    /// When the update source last answered, unix seconds — the same number, in the same unit,
+    /// that `robotctl update status --json` carries. A rendered "9 days ago" is what a person
+    /// wants and what a script cannot use: it cannot recompute the age, cannot apply the
+    /// threshold, and the phrase is wrong the moment it is stored.
     #[serde(skip_serializing_if = "Option::is_none")]
-    last_checked: Option<String>,
-    /// The same, in whole days, for the warning. The words are what a report carries.
+    last_checked: Option<i64>,
+    /// What that means, decided once where the clock and the daemon's version are both known.
+    /// The line and the warning both read it rather than re-deriving it from the timestamp.
     #[serde(skip)]
-    quiet_days: Option<i64>,
+    source: SourceCheck,
+}
+
+/// What the record says about a component's update source.
+///
+/// A timestamp and an `Option` cannot carry this: absent means "this `updaterd` cannot say" and
+/// "it has never answered" both, and those want opposite treatment — the first is silence, the
+/// second is the loudest case there is. Deciding it once, here, is also what keeps a clock that
+/// has moved backwards from reading as a fresh check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum SourceCheck {
+    /// An `updaterd` older than [`proto::API_LAST_CHECKED`], which does not carry the field.
+    /// Nothing is shown and nothing is warned: this robot is not being asked the question.
+    #[default]
+    Unsupported,
+    /// A daemon that would say, with nothing to say. The source has not answered once since this
+    /// board started recording — a robot blocked since it was provisioned, and the exact shape of
+    /// #282: no error anywhere, and an installed release that looks current.
+    Never,
+    /// It answered, this many seconds ago.
+    Answered(i64),
+    /// Recorded ahead of this clock, so the age is unknown. A board that checked with a fast
+    /// clock and then had it corrected backwards sits here — and clamping that to "0 days ago"
+    /// would pin it at fresh forever, because only a successful check overwrites the record and
+    /// by hypothesis there are none.
+    Ahead,
+}
+
+impl SourceCheck {
+    /// Read a component's status, with the API version of the `updaterd` that answered.
+    fn read(last_checked: Option<i64>, api_version: Option<u32>, now: i64) -> Self {
+        if api_version.is_none_or(|v| v < proto::API_LAST_CHECKED) {
+            return Self::Unsupported;
+        }
+        match last_checked {
+            None => Self::Never,
+            Some(at) => Self::at(at, now),
+        }
+    }
+
+    /// A recorded time this daemon did send, against this machine's clock.
+    fn at(at: i64, now: i64) -> Self {
+        if at > now {
+            Self::Ahead
+        } else {
+            Self::Answered(now - at)
+        }
+    }
+
+    /// The whole `health` line, in the unit a person would pick — whole, because "never" and "9
+    /// hours ago" do not finish the same sentence. `None` for a daemon that cannot say.
+    fn line(self) -> Option<String> {
+        match self {
+            Self::Unsupported => None,
+            Self::Never => Some("source has never answered on this robot".to_owned()),
+            Self::Ahead => Some(
+                "source last answered at a time this clock has not reached (not synced yet?)"
+                    .to_owned(),
+            ),
+            Self::Answered(age) => Some(format!("source last answered {}", describe_age(age))),
+        }
+    }
+
+    /// Whether this is worth saying without being asked, and the phrase for how long it has been.
+    fn quiet(self) -> Option<String> {
+        if !self.past_threshold() {
+            return None;
+        }
+        match self {
+            Self::Unsupported => None,
+            Self::Never => Some("has not answered once on this robot".to_owned()),
+            Self::Ahead => Some(
+                "last answered at a time this clock has not reached, so how long ago is not known"
+                    .to_owned(),
+            ),
+            Self::Answered(age) => Some(format!("has not answered in {} days", age / 86_400)),
+        }
+    }
+
+    fn past_threshold(self) -> bool {
+        match self {
+            Self::Unsupported => false,
+            Self::Never | Self::Ahead => true,
+            Self::Answered(age) => age / 86_400 >= QUIET_SOURCE_DAYS,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -1544,6 +1632,11 @@ fn run_health(
         software: collect_version_report(socket, robot_socket, config_socket),
         camera: proto::read_camera_stats(),
     };
+    // Here rather than in `collect_version_report`, which `robotctl version` shares: `version`
+    // prints a component's name, release and revision and not the line this warning points at,
+    // so a robot that had gone quiet warned there about something nothing on screen said.
+    let quiet = quiet_source_warnings(&report.software.components);
+    report.software.warnings.extend(quiet);
 
     match Client::connect_to("robotd", robot_socket) {
         Err(failure) => report.robot_error = Some(failure.message),
@@ -1782,8 +1875,8 @@ fn render_health(report: &HealthReport) -> String {
         if let Some(attempt) = &component.last_attempt {
             let _ = writeln!(out, "  {:<9} last update {attempt}", "");
         }
-        if let Some(checked) = &component.last_checked {
-            let _ = writeln!(out, "  {:<9} source last answered {checked}", "");
+        if let Some(line) = component.source.line() {
+            let _ = writeln!(out, "  {:<9} {line}", "");
         }
     }
 
@@ -1845,6 +1938,8 @@ fn collect_version_report(
 
     // updaterd: running build, then what it says is installed.
     let mut updaterd_running: Option<semver::Version> = None;
+    // Which of the two silences an absent `last_checked` is — see [`SourceCheck`].
+    let mut updaterd_api: Option<u32> = None;
     match Client::connect(socket) {
         Err(failure) => report
             .services
@@ -1854,6 +1949,7 @@ fn collect_version_report(
             match hello {
                 Ok(hello) => {
                     updaterd_running = hello.daemon_version.clone();
+                    updaterd_api = Some(hello.api_version);
                     report.services.push(ServiceReport {
                         name: "updaterd",
                         version: hello.daemon_version.map(|v| v.to_string()),
@@ -1865,7 +1961,7 @@ fn collect_version_report(
                     .services
                     .push(ServiceReport::failed("updaterd", failure.message)),
             }
-            report.components = installed_components(&mut client);
+            report.components = installed_components(&mut client, updaterd_api);
         }
     }
 
@@ -1928,9 +2024,6 @@ fn collect_version_report(
 
     report.warnings = version_warnings(&report, updaterd_running.as_ref());
     report
-        .warnings
-        .extend(quiet_source_warnings(&report.components));
-    report
 }
 
 /// Installed release per component, with the revision of the active one.
@@ -1939,7 +2032,7 @@ fn collect_version_report(
 /// `listInstalled` knows the revision it was built from. Revision matters for support —
 /// once branch installs land, several builds share a version — so it is worth the extra
 /// round trip in a diagnostic command.
-fn installed_components(client: &mut Client) -> Vec<ComponentReport> {
+fn installed_components(client: &mut Client, api_version: Option<u32>) -> Vec<ComponentReport> {
     let Ok(response) = client.call(&proto::Call::Status) else {
         return Vec::new();
     };
@@ -1969,8 +2062,8 @@ fn installed_components(client: &mut Client) -> Vec<ComponentReport> {
                 revision,
                 pinned: status.pinned.map(|v| v.to_string()),
                 last_attempt: status.last_attempt.as_ref().map(describe_attempt),
-                last_checked: status.last_checked.map(|at| describe_check(at, now)),
-                quiet_days: status.last_checked.map(|at| (now - at).max(0) / 86_400),
+                last_checked: status.last_checked,
+                source: SourceCheck::read(status.last_checked, api_version, now),
             }
         })
         .collect()
@@ -2003,15 +2096,9 @@ fn unix_now() -> i64 {
         .unwrap_or(0)
 }
 
-/// When the update source last answered, in the unit a person would pick.
-///
-/// A clock behind the recorded time is a board that rebooted and has not synced yet. "In 3 hours"
-/// would be a claim about the future, so it says that instead of guessing.
-fn describe_check(at: i64, now: i64) -> String {
-    let age = now - at;
-    if age < 0 {
-        return "at a time this clock has not reached (not synced yet?)".to_owned();
-    }
+/// How long ago, in the unit a person would pick. Takes an age rather than a timestamp: a clock
+/// ahead of the record is not a duration, and [`SourceCheck`] has already sorted that out.
+fn describe_age(age: i64) -> String {
     if age < 60 {
         return "just now".to_owned();
     }
@@ -2037,11 +2124,9 @@ fn quiet_source_warnings(components: &[ComponentReport]) -> Vec<String> {
     components
         .iter()
         .filter_map(|component| {
-            let days = component
-                .quiet_days
-                .filter(|days| *days >= QUIET_SOURCE_DAYS)?;
+            let how_long = component.source.quiet()?;
             Some(format!(
-                "the {} update source has not answered in {days} days.\n  \
+                "the {} update source {how_long}.\n  \
                  A robot that cannot reach it still reads as up to date, because the only thing\n  \
                  that fails is the check. `journalctl -u updaterd` has each attempt and why.",
                 component.name
@@ -4855,8 +4940,15 @@ fn print_result(command: &UpdateCommand, result: serde_json::Value) {
                         if let Some(last) = &status.last_attempt {
                             println!("  last attempt: {}", compact(last));
                         }
-                        if let Some(at) = status.last_checked {
-                            println!("  source last answered {}", describe_check(at, unix_now()));
+                        // No `hello` on this path, so an absent value stays silent rather than
+                        // claiming a source that has never answered: `robotctl health` is where
+                        // the two silences are told apart.
+                        if let Some(line) = status
+                            .last_checked
+                            .map(|at| SourceCheck::at(at, unix_now()))
+                            .and_then(SourceCheck::line)
+                        {
+                            println!("  {line}");
                         }
                     }
                 }
@@ -6359,16 +6451,13 @@ mod tests {
         assert_eq!(describe_attempt(&first), "0.2.0: applied");
     }
 
-    /// When the source last answered, in the unit a person would pick, and honest about a clock
-    /// that has not caught up with it.
+    /// When the source last answered, in the unit a person would pick.
     #[test]
     fn a_check_is_described_by_how_long_ago_it_was() {
-        let now = 1_800_000_000;
-        assert_eq!(describe_check(now - 5, now), "just now");
-        assert_eq!(describe_check(now - 60, now), "1 minute ago");
-        assert_eq!(describe_check(now - 3 * 3_600, now), "3 hours ago");
-        assert_eq!(describe_check(now - 47 * 86_400, now), "47 days ago");
-        assert!(describe_check(now + 600, now).contains("not synced"));
+        assert_eq!(describe_age(5), "just now");
+        assert_eq!(describe_age(60), "1 minute ago");
+        assert_eq!(describe_age(3 * 3_600), "3 hours ago");
+        assert_eq!(describe_age(47 * 86_400), "47 days ago");
     }
 
     /// A week of silence is a warning without being asked for, and the line is in `health` either
@@ -6376,19 +6465,91 @@ mod tests {
     #[test]
     fn a_quiet_update_source_is_said_without_being_asked() {
         let mut report = health_report(Some(proto::HealthResult::default()), None);
-        report.software.components[0].last_checked = Some("9 days ago".into());
-        report.software.components[0].quiet_days = Some(9);
+        report.software.components[0].source = SourceCheck::Answered(9 * 86_400);
 
         let out = render_health(&report);
         assert!(out.contains("source last answered 9 days ago"), "{out}");
         let warnings = quiet_source_warnings(&report.software.components);
         assert_eq!(warnings.len(), 1, "{warnings:?}");
-        assert!(warnings[0].contains("9 days"), "{warnings:?}");
+        assert!(
+            warnings[0].contains("has not answered in 9 days"),
+            "{warnings:?}"
+        );
 
-        report.software.components[0].quiet_days = Some(0);
+        report.software.components[0].source = SourceCheck::Answered(3 * 3_600);
         assert!(quiet_source_warnings(&report.software.components).is_empty());
-        report.software.components[0].quiet_days = None;
+        report.software.components[0].source = SourceCheck::Unsupported;
         assert!(quiet_source_warnings(&report.software.components).is_empty());
+        assert!(!render_health(&report).contains("source"), "{out}");
+    }
+
+    /// The case the whole report exists for: a robot that has never once reached its source —
+    /// blocked since it was provisioned — and so has nothing recorded. Reading that as "no
+    /// answer yet, say nothing" printed exactly what a healthy robot prints, which is #282
+    /// with the fix installed.
+    #[test]
+    fn a_source_that_never_answered_is_the_loudest_case_not_the_quietest() {
+        let mut report = health_report(Some(proto::HealthResult::default()), None);
+        report.software.components[0].source = SourceCheck::Never;
+
+        let out = render_health(&report);
+        assert!(out.contains("source has never answered"), "{out}");
+        let warnings = quiet_source_warnings(&report.software.components);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("has not answered once"),
+            "{warnings:?}"
+        );
+    }
+
+    /// Which is only distinguishable from an `updaterd` that cannot say with the API version in
+    /// hand. Both send no timestamp.
+    #[test]
+    fn an_absent_timestamp_is_read_against_the_daemons_api_version() {
+        let now = 1_800_000_000;
+        assert_eq!(SourceCheck::read(None, None, now), SourceCheck::Unsupported);
+        assert_eq!(
+            SourceCheck::read(None, Some(proto::API_LAST_CHECKED - 1), now),
+            SourceCheck::Unsupported
+        );
+        assert_eq!(
+            SourceCheck::read(None, Some(proto::API_LAST_CHECKED), now),
+            SourceCheck::Never
+        );
+        assert_eq!(
+            SourceCheck::read(Some(now - 600), Some(proto::API_LAST_CHECKED), now),
+            SourceCheck::Answered(600)
+        );
+    }
+
+    /// A clock corrected backwards after a check must not read as a fresh one. Clamping the age
+    /// at zero pinned it there for good: only a successful check overwrites the record, and this
+    /// is the robot that is not getting one.
+    #[test]
+    fn a_record_ahead_of_this_clock_warns_rather_than_reading_as_fresh() {
+        let now = 1_800_000_000;
+        let ahead = SourceCheck::read(Some(now + 3 * 86_400), Some(proto::API_LAST_CHECKED), now);
+        assert_eq!(ahead, SourceCheck::Ahead);
+        assert!(ahead.line().unwrap().contains("not synced"));
+        assert!(ahead.quiet().unwrap().contains("not known"));
+    }
+
+    /// `health --json` carries the timestamp, not the sentence: a script has to be able to
+    /// recompute the age and apply its own threshold, and `update status --json` already
+    /// answers in unix seconds.
+    #[test]
+    fn health_json_carries_the_timestamp_rather_than_the_words() {
+        let mut report = health_report(Some(proto::HealthResult::default()), None);
+        report.software.components[0].last_checked = Some(1_800_000_000);
+        report.software.components[0].source = SourceCheck::Answered(9 * 86_400);
+
+        let json = serde_json::to_value(&report).unwrap();
+        let component = &json["software"]["components"][0];
+        assert_eq!(
+            component["last_checked"],
+            serde_json::json!(1_800_000_000i64)
+        );
+        assert!(component.get("source").is_none(), "{component}");
     }
 
     // ── version reporting ────────────────────────────────────────────────────
@@ -6406,7 +6567,7 @@ mod tests {
                 pinned: None,
                 last_attempt: None,
                 last_checked: None,
-                quiet_days: None,
+                source: SourceCheck::Unsupported,
             }],
             warnings: Vec::new(),
         }

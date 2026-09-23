@@ -3136,6 +3136,15 @@ pub struct ComponentStatus {
     pub last_checked: Option<i64>,
 }
 
+/// The API version [`ComponentStatus::last_checked`] arrived in.
+///
+/// A client needs it to read the absent field, because absent means two opposite things: an
+/// `updaterd` older than this cannot say, and a newer one saying nothing means the source has
+/// never answered on this board — which is the state a robot blocked since first boot is in, and
+/// the one worth warning about. Without the version they are the same silence, and the case the
+/// report exists for is the one that reads as "fine".
+pub const API_LAST_CHECKED: u32 = 35;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InstalledRelease {
     pub version: semver::Version,
