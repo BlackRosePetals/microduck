@@ -222,6 +222,17 @@ const BOND_SETTLE: Duration = Duration::from_secs(5);
 /// How often to re-read `Paired` while waiting for a bond.
 const BOND_POLL: Duration = Duration::from_millis(200);
 
+/// Settle time before judging the link a fresh bond ended up with, and between re-pages of
+/// one that dropped.
+const LINK_SETTLE: Duration = Duration::from_secs(2);
+
+/// Re-pages after a fresh bond before the rest is left to the background reconnect sweep.
+const LINK_ATTEMPTS: u32 = 3;
+
+/// A page against a pad that is right there answers in well under a second; one that has
+/// gone dark burns its ~5 s page timeout inside this.
+const LINK_CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
+
 /// How long to keep sweeping after the first classified, unbonded pad turns up, for the rest of it.
 ///
 /// A pad can be two devices — the Pro Controller clones advertise an LE face and a BR/EDR face.
@@ -658,6 +669,64 @@ impl BlueZ {
         }
     }
 
+    /// A freshly bonded classic pad may drop the link it paired over within seconds — the
+    /// Pro Controller clone does, when its pairing-mode page-scan window closes. Re-page a
+    /// pad that dropped, so a successful pairing leaves the pad *connected* rather than
+    /// bonded and dark until something else pages it.
+    async fn ensure_link(&self, mac: &str) {
+        for attempt in 1..=LINK_ATTEMPTS {
+            tokio::time::sleep(LINK_SETTLE).await;
+            let state = self
+                .devices()
+                .await
+                .ok()
+                .and_then(|all| all.into_iter().find(|d| d.mac.eq_ignore_ascii_case(mac)));
+            let Some(device) = state else {
+                tracing::warn!("pad vanished from BlueZ right after bonding");
+                return;
+            };
+            if device.connected {
+                tracing::info!("link up");
+                return;
+            }
+            tracing::info!(attempt, "link down after bonding; re-paging");
+            let builder = DeviceProxy::builder(&self.bus).path(device.path.as_ref());
+            let Ok(builder) = builder else { continue };
+            let Ok(proxy) = builder.build().await else {
+                continue;
+            };
+            match tokio::time::timeout(LINK_CONNECT_TIMEOUT, proxy.connect()).await {
+                Ok(Ok(())) => tracing::info!("re-paged; connected"),
+                Ok(Err(e)) => tracing::info!(error = %e, "re-page refused"),
+                Err(_) => tracing::info!("re-page did not answer in time"),
+            }
+        }
+        tracing::warn!("bonded pad still not connected; the background sweep keeps trying");
+    }
+
+    /// Ask every bonded pad that lost its link to reconnect. One sweep; the caller repeats.
+    async fn sweep_reconnects(&self) -> PadResult<()> {
+        // The pairing window owns the radio: a Connect here would fight its discovery.
+        let Ok(_not_pairing) = self.pairing.try_lock() else {
+            return Ok(());
+        };
+        let devices = self.devices().await?;
+        for pad in needs_reconnect(&devices) {
+            let proxy = DeviceProxy::builder(&self.bus)
+                .path(pad.path.as_ref())
+                .map_err(|e| e.to_string())?
+                .build()
+                .await
+                .map_err(|e| e.to_string())?;
+            match tokio::time::timeout(LINK_CONNECT_TIMEOUT, proxy.connect()).await {
+                Ok(Ok(())) => tracing::info!(mac = %pad.mac, "reconnected bonded pad"),
+                Ok(Err(e)) => tracing::debug!(mac = %pad.mac, error = %e, "reconnect refused"),
+                Err(_) => tracing::debug!(mac = %pad.mac, "reconnect did not answer in time"),
+            }
+        }
+        Ok(())
+    }
+
     /// Connect, pair, trust — in that order, for the reasons in this module's docs.
     async fn bond(&self, device: &Snapshot) -> Result<(), (proto::PadPairFailure, String)> {
         let proxy = DeviceProxy::builder(&self.bus)
@@ -791,8 +860,32 @@ impl BlueZ {
             .set_trusted(true)
             .await
             .map_err(|e| (proto::PadPairFailure::Other, e.to_string()))?;
+
+        // Classic only: an LE pad pages *us* when it wants back, and paging it from here only
+        // races its own reconnect.
+        if device.is_classic() {
+            self.ensure_link(&device.mac).await;
+        }
         Ok(())
     }
+}
+
+/// Bonded pads worth re-paging: trusted, a gamepad, on the classic transport, link down.
+///
+/// Empty while any pad is connected — the pad that is driving wins, and re-paging another one
+/// mid-drive is how a second bonded pad steals the robot from the hands holding the first.
+/// LE pads are excluded: they reconnect by themselves, and a host page only races that.
+fn needs_reconnect(devices: &[Snapshot]) -> Vec<&Snapshot> {
+    if devices
+        .iter()
+        .any(|d| d.paired && d.connected && d.is_gamepad())
+    {
+        return Vec::new();
+    }
+    devices
+        .iter()
+        .filter(|d| d.paired && d.trusted && !d.connected && d.is_classic() && d.is_gamepad())
+        .collect()
 }
 
 /// Collapse a pad that presents as two devices into the one worth bonding.
@@ -1074,6 +1167,10 @@ impl Pads for BlueZ {
         tracing::info!(mac, "pad forgotten");
         Ok(proto::PadForgetResult { removed: true })
     }
+
+    async fn reconnect_bonded(&self) -> PadResult<()> {
+        self.sweep_reconnects().await
+    }
 }
 
 #[cfg(test)]
@@ -1118,5 +1215,44 @@ mod tests {
         let a = face("98:B6:E9:28:06:09", "Pro Controller", Some(0x2508));
         let b = face("78:86:2E:BB:13:28", "Xbox Wireless Controller", None);
         assert_eq!(one_face_per_pad(vec![&a, &b]).len(), 2);
+    }
+
+    fn bonded(mac: &str, name: &str, class: Option<u32>, connected: bool) -> Snapshot {
+        Snapshot {
+            paired: true,
+            trusted: true,
+            connected,
+            ..face(mac, name, class)
+        }
+    }
+
+    /// A bonded classic pad with its link down is the one case the sweep pages.
+    #[test]
+    fn a_bonded_classic_pad_with_a_dropped_link_is_paged() {
+        let pad = bonded("98:B6:E9:28:06:09", "Pro Controller", Some(0x2508), false);
+        let devices = [pad];
+        let kept = needs_reconnect(&devices);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].mac, "98:B6:E9:28:06:09");
+    }
+
+    /// The pad someone is driving with stands down the sweep for everyone else.
+    #[test]
+    fn a_connected_pad_suppresses_the_sweep() {
+        let driving = bonded("98:B6:E9:28:06:09", "Pro Controller", Some(0x2508), true);
+        let idle = bonded("78:86:2E:BB:13:28", "Pro Controller", Some(0x2508), false);
+        assert!(needs_reconnect(&[driving, idle]).is_empty());
+    }
+
+    /// LE pads page us themselves; untrusted bonds and non-pads are not ours to page.
+    #[test]
+    fn le_untrusted_and_non_pads_are_never_paged() {
+        let le = bonded("78:86:2E:BB:13:28", "Xbox Wireless Controller", None, false);
+        let untrusted = Snapshot {
+            trusted: false,
+            ..bonded("98:B6:E9:28:06:09", "Pro Controller", Some(0x2508), false)
+        };
+        let speaker = bonded("00:11:22:33:44:55", "BT Speaker", Some(0x240414), false);
+        assert!(needs_reconnect(&[le, untrusted, speaker]).is_empty());
     }
 }

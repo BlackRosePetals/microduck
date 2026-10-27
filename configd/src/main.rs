@@ -5,6 +5,7 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::time::Duration;
 
 use clap::Parser;
 use configd::net::{FakeNet, Net};
@@ -190,6 +191,22 @@ fn hostname() -> String {
         .unwrap_or_else(|| "robot".to_owned())
 }
 
+/// How often bonded-but-disconnected pads are re-paged. A classic `Connect()` against a pad
+/// that is off burns its ~5 s page timeout, so this cannot be much tighter.
+const PAD_RECONNECT_INTERVAL: Duration = Duration::from_secs(12);
+
+/// Pairing bonds a pad but nothing chases the link afterwards: a classic pad that drops right
+/// after pairing — the Pro Controller clone does — would stay down until someone paged it by
+/// hand. This sweep is the someone.
+async fn pad_reconnect_loop(pads: Arc<dyn Pads>) {
+    loop {
+        tokio::time::sleep(PAD_RECONNECT_INTERVAL).await;
+        if let Err(e) = pads.reconnect_bonded().await {
+            tracing::debug!(error = %e, "pad reconnect sweep failed");
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     tracing_subscriber::fmt()
@@ -251,6 +268,7 @@ async fn main() -> ExitCode {
     tracing::info!(serial = ?serial, %default_name, simulated, "identity");
 
     tokio::spawn(configd::indicator::run(Arc::clone(&net)));
+    tokio::spawn(pad_reconnect_loop(Arc::clone(&pads)));
 
     let service = Arc::new(Service {
         net,

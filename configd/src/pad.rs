@@ -61,6 +61,12 @@ pub trait Pads: Send + Sync {
 
     /// Drop the bond, so this pad stops reconnecting.
     async fn forget(&self, mac: &str) -> PadResult<proto::PadForgetResult>;
+
+    /// Re-page bonded pads whose link dropped. The default is a no-op, for backends that
+    /// cannot initiate a connection (the fakes).
+    async fn reconnect_bonded(&self) -> PadResult<()> {
+        Ok(())
+    }
 }
 
 /// Clamp a caller's timeout into something the adapter should be asked to do.
