@@ -437,6 +437,11 @@ library. Gating the run as well was considered and rejected: turning the key off
 shipping it off, would then change what a robot runs at its next start, and the sandbox, not the
 org, is still what keeps a robot safe from a policy.
 
+**The vet book records it.** When a load or skill change goes live and a slot or skill starts or
+stops running a community policy, `robotd` writes a dated `policy` event naming
+`org/name@revision`. Official changes are not logged, because the events list is capped. A shared
+book is public, so the repos a duck ran are visible to anyone holding the link.
+
 **A repo carries one `policy.onnx`.** That convention already existed on the Hub before this was
 built — every published microduck policy has exactly one `.onnx` beside a README and a manifest —
 so the fetch takes the sole `.onnx` and refuses a repo with several by naming them. Choosing wrong
@@ -753,6 +758,7 @@ its meaning for the things that genuinely are models and not control policies, s
 | The seeder never replaces an installed set | Otherwise a daemon update silently reverts a gait chosen with `policy update` (§9) |
 | Origin is the org in the path | Honest without a lookup, and a label rather than a boundary (§9.2) |
 | Community fetches are opt-in, `[policy] allow_community` | A robot out of the box only downloads what we published (§9.2) |
+| The vet book dates community policies coming and going | Which stranger's network a duck ran is the question; official changes would crowd the capped list (§9.2) |
 | …and the key gates the download, not the run | Turning it off must not change what a robot runs at its next start (§9.2) |
 | The manifest can refuse but never bless | It is a stranger's claim; the shape gate is the check (§9.2) |
 | A repo with two policies is a refusal | Guessing means running the wrong network on a real robot (§9.2) |
