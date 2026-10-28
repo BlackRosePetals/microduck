@@ -1416,6 +1416,14 @@ pub struct PolicyParams {
     pub voltage_adapt: bool,
     /// Reference voltage for `voltage_adapt` — the supply the gains were identified at.
     pub nominal_voltage: f64,
+    /// Whether `policy.fetch` may download a policy from a Hub repo outside `pollen-robotics`.
+    ///
+    /// Off by default: a robot out of the box only fetches networks we published. It gates the
+    /// download and nothing else — a slot already pointing at a community policy keeps running
+    /// when this is turned off, so flipping it can never change what a robot does at its next
+    /// start. `robotd` does not read it; `updaterd` does, before every fetch
+    /// ([`Self::community_allowed`]). `docs/design/policy-channel-design.md` §9.2.
+    pub allow_community: bool,
 }
 
 /// The literal that disables an optional policy slot, per the prototype's `--x-policy None`.
@@ -1997,6 +2005,26 @@ impl ResolvedPolicy {
 }
 
 impl PolicyParams {
+    /// Whether `robotd.toml` at `path` allows community policies, read on its own.
+    ///
+    /// For `updaterd`, before every fetch, the way it reads the board
+    /// ([`board::Board::declared`]): so `robotctl configure` applies without a restart, and a file
+    /// that is invalid somewhere else still answers. Missing, unreadable or not a bool is `false`
+    /// — the default, and the answer that downloads nothing.
+    pub fn community_allowed(path: &Path) -> bool {
+        let Some(text) = std::fs::read_to_string(path).ok() else {
+            return false;
+        };
+        let Ok(table) = toml::from_str::<toml::Table>(&text) else {
+            return false;
+        };
+        table
+            .get("policy")
+            .and_then(|policy| policy.get("allow_community"))
+            .and_then(toml::Value::as_bool)
+            .unwrap_or(false)
+    }
+
     /// The built-in skills with config merged over them, by name.
     ///
     /// Merge rather than replace, for the reason every other key in this file resolves the way it
@@ -2282,6 +2310,7 @@ impl Default for PolicyParams {
             skills: Vec::new(),
             voltage_adapt: true,
             nominal_voltage: 7.4,
+            allow_community: false,
         }
     }
 }
@@ -4163,6 +4192,10 @@ mod tests {
         assert!(!skill("kick_left").chain);
         assert!(p.voltage_adapt, "on by default since 2026-09-14");
         assert_eq!(p.nominal_voltage, 7.4);
+        assert!(
+            !PolicyParams::default().allow_community,
+            "only pollen-robotics policies out of the box"
+        );
 
         let name = |p: &Option<std::path::PathBuf>| {
             p.as_ref()
@@ -4376,5 +4409,29 @@ mod tests {
             let path = write(dir.path(), &format!("[control]\nhz = {hz}\n"));
             assert!(Params::load(&path, true).is_err(), "hz = {hz} was accepted");
         }
+    }
+
+    /// `updaterd` asks this before every fetch, so it must answer from a file `robotd` would
+    /// reject, and must fall to "no" — the answer that downloads nothing — on anything else.
+    #[test]
+    fn community_allowed_reads_one_key_and_defaults_to_no() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("robotd.toml");
+
+        let read = |text: &str| {
+            std::fs::write(&path, text).expect("write");
+            PolicyParams::community_allowed(&path)
+        };
+        assert!(read("[policy]\nallow_community = true\n"));
+        assert!(
+            read("[policy]\nallow_community = true\n[future]\nx = 2\n"),
+            "a section this build does not know is no reason to change the answer"
+        );
+        assert!(!read("[policy]\nallow_community = false\n"));
+        assert!(!read("[policy]\n# allow_community = true\n"));
+        assert!(!read("[policy]\nallow_community = \"yes\"\n"));
+        assert!(!read("not toml ["));
+        std::fs::remove_file(&path).expect("remove");
+        assert!(!PolicyParams::community_allowed(&path));
     }
 }
