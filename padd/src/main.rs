@@ -223,10 +223,11 @@ fn bit(button: Button) -> Buttons {
         .map_or(Buttons::NONE, |(_, bit)| *bit)
 }
 
-/// When the config was last written, for spotting a change. `None` for a file that is not there,
-/// which is a real state and compares equal to itself.
-fn config_mtime(path: &Path) -> Option<std::time::SystemTime> {
-    std::fs::metadata(path).ok()?.modified().ok()
+/// When the config was last written, for spotting a change — both layers, since an edit lands in
+/// the user layer and the image's file only moves with an OS update. A file that is not there is
+/// a real state and compares equal to itself.
+fn config_mtime(path: &Path) -> robotd_params::ConfigStamp {
+    robotd_params::config_stamp(path)
 }
 
 fn main() -> std::process::ExitCode {

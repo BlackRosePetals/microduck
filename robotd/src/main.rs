@@ -624,6 +624,10 @@ struct RobotState {
     ///
     /// A change to one slot is reported on that slot instead, which says more.
     policy_change_error: ArcSwapOption<String>,
+    /// Why the user config layer was set aside at startup, if it was
+    /// ([`Params::user_layer_rejected`]). Degraded, never unhealthy: it is a file on this board,
+    /// so no release the update gate could revert to would read it any differently.
+    config_error: Option<String>,
     /// Which policy files this process is running, as file names. `None` when the policy is
     /// disabled.
     ///
@@ -755,6 +759,7 @@ impl RobotState {
             board: params.board.version,
             policy_error: ArcSwapOption::empty(),
             policy_change_error: ArcSwapOption::empty(),
+            config_error: params.user_layer_rejected.clone(),
             policies: ArcSwap::from_pointee(PolicyNames::of(&params.policy.resolved())),
             policy_slots: ArcSwap::from_pointee(slot_report(
                 &params.policy,
@@ -922,6 +927,14 @@ impl RobotState {
             return unhealthy(format!(
                 "control loop at {hz:.1} Hz, below the {:.1} Hz floor",
                 self.min_achieved_hz
+            ));
+        }
+
+        // Last, so it never hides an unhealthy verdict above: the robot is running, on the
+        // image's settings instead of its owner's, and the owner needs to know which file to fix.
+        if let Some(reason) = &self.config_error {
+            return degraded(format!(
+                "running without this robot's own settings, which are invalid — {reason}"
             ));
         }
 
@@ -9128,6 +9141,34 @@ mod tests {
         assert_eq!(walk.origin.as_deref(), Some("local"));
         assert!(walk.overridden);
         assert_eq!(walk.path.as_deref(), Some("/srv/mine.onnx"));
+    }
+
+    /// A user config layer that was set aside is degraded, for the same reason as a slot that
+    /// fell back: it is this board's file, and an update that rolled back over it would roll back
+    /// every release after it too. It still names the file somebody has to fix.
+    #[test]
+    fn a_set_aside_user_config_is_degraded_and_names_the_file() {
+        let params = Params {
+            user_layer_rejected: Some(
+                "parsing /var/lib/robot/robotd.toml: expected `]` at line 1".into(),
+            ),
+            ..Params::default()
+        };
+        let s = RobotState::new(
+            &params,
+            std::path::Path::new("/test/robotd.toml"),
+            false,
+            false,
+        );
+        s.ticks.store(1, Ordering::Relaxed);
+        s.last_tick_us
+            .store(s.started.elapsed().as_micros() as u64, Ordering::Relaxed);
+
+        let health = s.health();
+        assert!(!health.healthy);
+        assert!(health.degraded, "this must not roll a release back");
+        let reason = health.reason.unwrap();
+        assert!(reason.contains("/var/lib/robot/robotd.toml"), "{reason}");
     }
 
     /// The other unhealthy states *are* evidence about the release, so they must not be

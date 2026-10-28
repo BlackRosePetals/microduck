@@ -74,9 +74,18 @@ pub enum Edit {
 }
 
 /// The editable state of one file: the parsed document, and the rows over it.
+///
+/// At the provisioned path that file is the **user layer** ([`crate::USER_PATH`]), and the base
+/// under it is read-only here. A row's `default` is then what the robot runs on with no override
+/// — the base's value where it sets one, the built-in default where it does not — so clearing a
+/// key goes back to what the image says, and typing the image's value clears the override rather
+/// than pinning a copy that would stop following the image.
 pub struct Model {
+    /// The file this model writes — the user layer, when there is a base.
     pub path: PathBuf,
     doc: DocumentMut,
+    /// The layer under [`Self::doc`], if it has one: where it is, and what it says.
+    base: Option<(PathBuf, toml::Table)>,
     defaults: toml::Value,
     /// Keyed by `section.key`. Applied to the document only on save.
     pub pending: BTreeMap<&'static str, Edit>,
@@ -96,13 +105,81 @@ impl Model {
 
     /// Load the file — or start from an empty document when there is none, which is a real
     /// state: a robot may run entirely on defaults with no file at all.
+    ///
+    /// At the provisioned path, the model is over the user layer with `path` as its base.
     pub fn load(path: &Path) -> Result<Self, String> {
-        let text = match std::fs::read_to_string(path) {
-            Ok(text) => text,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-            Err(e) => return Err(format!("cannot read {}: {e}", path.display())),
+        match crate::user_layer_for(path) {
+            Some(user) => Self::load_layered(path, &user),
+            None => Self::from_text(path, &read_or_empty(path)?),
+        }
+    }
+
+    /// A model over the user layer at `user`, with the file at `base` under it.
+    ///
+    /// The base is held to the daemon's standard — the editor will not open over a base `robotd`
+    /// would refuse — because every value this model calls a default comes from it.
+    pub fn load_layered(base: &Path, user: &Path) -> Result<Self, String> {
+        let base_text = read_or_empty(base)?;
+        let base_params = Params::parse(&base_text, base, false).map_err(|e| e.to_string())?;
+        let base_table: toml::Table = base_text
+            .parse()
+            .map_err(|e| format!("{}: {e}", base.display()))?;
+        let mut model = Self::from_text(user, &read_or_empty(user)?)?;
+        model.defaults = toml::Value::try_from(base_params).expect("Params serializes");
+        model.base = Some((base.to_path_buf(), base_table));
+        Ok(model)
+    }
+
+    /// Both layers as one document — what the daemon would load, pending edits included.
+    fn merged(&self) -> String {
+        let user = self.rendered();
+        match &self.base {
+            Some((_, base)) => match user.parse::<toml::Table>() {
+                Ok(user) => crate::merge_layers(base.clone(), user).to_string(),
+                Err(_) => user,
+            },
+            None => user,
+        }
+    }
+
+    /// Before the first edit to a list the base sets, a copy of the base's list in the user layer.
+    ///
+    /// A list in the user layer replaces the base's whole ([`crate::merge_layers`]), so adding one
+    /// skill to a user layer that has no `[[policy.skill]]` yet would otherwise drop every skill
+    /// the base offers.
+    fn seed_skills_from_base(&mut self) -> Result<(), String> {
+        let has_own = self
+            .doc
+            .get("policy")
+            .and_then(|p| p.get("skill"))
+            .is_some();
+        let Some(skills) = self
+            .base
+            .as_ref()
+            .and_then(|(_, base)| base.get("policy")?.get("skill"))
+        else {
+            return Ok(());
         };
-        Self::from_text(path, &text)
+        if has_own {
+            return Ok(());
+        }
+        let mut wrapper = toml::Table::new();
+        let mut policy = toml::Table::new();
+        policy.insert("skill".to_owned(), skills.clone());
+        wrapper.insert("policy".to_owned(), toml::Value::Table(policy));
+        let copied: DocumentMut = wrapper
+            .to_string()
+            .parse()
+            .map_err(|e| format!("copying the base's skills: {e}"))?;
+        let item = copied["policy"]["skill"].clone();
+        let policy = self
+            .doc
+            .entry("policy")
+            .or_insert(toml_edit::Item::Table(toml_edit::Table::new()))
+            .as_table_mut()
+            .ok_or_else(|| "[policy] is not a table".to_owned())?;
+        policy.insert("skill", item);
+        Ok(())
     }
 
     /// A model over text already in hand, for a caller that has read the file itself — and for
@@ -119,6 +196,7 @@ impl Model {
         Ok(Self {
             path: path.to_path_buf(),
             doc,
+            base: None,
             defaults: toml::Value::try_from(Params::default()).expect("Params serializes"),
             pending: BTreeMap::new(),
             written: Vec::new(),
@@ -197,7 +275,7 @@ impl Model {
     /// defaults, release-relative paths, the mic's mode-dependent switch. Parsed from the
     /// pending state, so flipping `mode` updates every hint that depends on it.
     fn resolved_hint(&self, key: &str) -> Option<String> {
-        let params: Params = toml::from_str(&self.rendered()).ok()?;
+        let params: Params = toml::from_str(&self.merged()).ok()?;
         let policy = params.policy.resolved();
         let path = |p: Option<std::path::PathBuf>| {
             Some(match p {
@@ -393,6 +471,7 @@ impl Model {
                 skill.name
             ));
         }
+        self.seed_skills_from_base()?;
         let mut entry = toml_edit::Table::new();
         entry["name"] = toml_edit::value(skill.name.clone());
         if let Some(path) = &skill.path {
@@ -455,6 +534,7 @@ impl Model {
 
     /// Remove a `[[policy.skill]]` entry by name. `false` if there was none.
     fn drop_skill(&mut self, name: &str) -> Result<bool, String> {
+        self.seed_skills_from_base()?;
         let Some(skills) = self
             .doc
             .get_mut("policy")
@@ -515,7 +595,13 @@ impl Model {
             file.sync_all()
         };
         write(&staged).map_err(|e| writable_hint(&staged, &e))?;
-        if let Err(e) = Params::load(&staged, true) {
+        // Over the base when there is one: a user layer is only valid as the half of a robot it
+        // is, and the loader would set aside one that failed this.
+        let checked = match &self.base {
+            Some((base, _)) => Params::with_user_layer(base, &staged).map(|_| ()),
+            None => Params::load(&staged, true).map(|_| ()),
+        };
+        if let Err(e) = checked {
             let _ = std::fs::remove_file(&staged);
             return Err(format!(
                 "refusing to write a config robotd would reject: {e}"
@@ -536,6 +622,20 @@ impl Model {
 
 /// An exclusive hold on the config file, for the duration of one read-modify-write.
 type Lock = std::fs::File;
+
+/// The file an edit to the config at `path` actually writes: the user layer, when it has one.
+fn written_path(path: &Path) -> PathBuf {
+    crate::user_layer_for(path).unwrap_or_else(|| path.to_path_buf())
+}
+
+/// A file's text, or nothing when there is no file.
+fn read_or_empty(path: &Path) -> Result<String, String> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(e) => Err(format!("cannot read {}: {e}", path.display())),
+    }
+}
 
 /// Take it.
 ///
@@ -565,7 +665,7 @@ fn lock(path: &Path) -> Result<Lock, String> {
 /// as a keyed edit and so cannot be rebased the way [`Model::save`] rebases one. `robotctl
 /// policy add` and `robot.setSkill` both come through here.
 pub fn set_skill(path: &Path, skill: &crate::SkillDef) -> Result<(), String> {
-    let lock = lock(path)?;
+    let lock = lock(&written_path(path))?;
     let mut model = Model::load(path)?;
     model.put_skill(skill)?;
     let text = model.doc.to_string();
@@ -575,7 +675,7 @@ pub fn set_skill(path: &Path, skill: &crate::SkillDef) -> Result<(), String> {
 /// Take a skill out of the table. `false` if there was none, which is not a failure — it is the
 /// answer to "is this robot's own back", and the caller says so differently.
 pub fn remove_skill(path: &Path, name: &str) -> Result<bool, String> {
-    let lock = lock(path)?;
+    let lock = lock(&written_path(path))?;
     let mut model = Model::load(path)?;
     if !model.drop_skill(name)? {
         return Ok(false);
@@ -641,11 +741,7 @@ fn writable_hint(path: &Path, e: &std::io::Error) -> String {
 
 /// The pad's button bindings as the daemon resolves them — config over the defaults.
 pub fn pad_bindings(path: &Path) -> Result<crate::PadParams, String> {
-    let text = match std::fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(e) => return Err(format!("cannot read {}: {e}", path.display())),
-    };
+    let text = crate::layered_text(path)?;
     toml::from_str::<Params>(&text)
         .map(|params| params.pad)
         .map_err(|e| format!("{}: {e}", path.display()))
@@ -864,6 +960,125 @@ mod tests {
         assert_eq!(on_disk, "[control]\nhz = 50\n", "disk untouched");
         // The staging file is cleaned up, not left beside the config.
         assert!(!path.with_extension("toml.new").exists());
+    }
+
+    /// The image's file and an owner's layer over it, in one directory.
+    fn layered(dir: &Path, base: &str, user: Option<&str>) -> (PathBuf, PathBuf) {
+        let base_path = dir.join("base.toml");
+        let user_path = dir.join("user.toml");
+        std::fs::write(&base_path, base).expect("writes");
+        if let Some(user) = user {
+            std::fs::write(&user_path, user).expect("writes");
+        }
+        (base_path, user_path)
+    }
+
+    /// **An edit never touches the image's file.** It is the one an OS update replaces, so an
+    /// edit written there is an edit the next update throws away.
+    #[test]
+    fn a_layered_edit_writes_the_user_layer_and_only_the_key() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (base, user) = layered(dir.path(), SHIPPED, None);
+        let mut m = Model::load_layered(&base, &user).expect("loads");
+        assert_eq!(m.path, user, "the model writes the user layer");
+        m.edit(entry("control.hz"), "100").expect("valid");
+        m.save().expect("saves");
+        assert_eq!(
+            std::fs::read_to_string(&base).unwrap(),
+            SHIPPED,
+            "base untouched"
+        );
+        let written = std::fs::read_to_string(&user).expect("the user layer exists now");
+        assert!(written.contains("hz = 100"), "{written}");
+        assert!(
+            !written.contains("port"),
+            "only what was changed: {written}"
+        );
+        let p = Params::load_layered(&base, &user, true).unwrap();
+        assert_eq!(p.control.hz, 100);
+    }
+
+    /// With a base, "default" is what the robot runs on with no override — the image's value.
+    /// Typing that value clears the override, so the key keeps following the image.
+    #[test]
+    fn the_base_is_the_default_a_user_override_falls_back_to() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (base, user) = layered(
+            dir.path(),
+            "[control]\nhz = 75\n",
+            Some("[control]\nhz = 100\n"),
+        );
+        let mut m = Model::load_layered(&base, &user).expect("loads");
+        let hz = |m: &Model| {
+            m.rows()
+                .into_iter()
+                .find(|r| r.entry.key == "control.hz")
+                .unwrap()
+        };
+        assert_eq!(
+            hz(&m).default,
+            "75",
+            "the image's value, not the built-in 50"
+        );
+        assert_eq!(hz(&m).effective(), "100");
+        m.edit(entry("control.hz"), "75").expect("valid");
+        assert!(matches!(m.pending.get("control.hz"), Some(Edit::Clear)));
+        m.save().expect("saves");
+        assert!(!std::fs::read_to_string(&user).unwrap().contains("hz"));
+    }
+
+    /// The editor's gate is the loader's: a user layer that would be set aside is never written.
+    #[test]
+    fn a_user_layer_robotd_would_set_aside_is_never_written() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (base, user) = layered(dir.path(), "[control]\nhz = 50\n", None);
+        let mut m = Model::load_layered(&base, &user).expect("loads");
+        m.edit(entry("control.hz"), "0").expect("row-level ok");
+        assert!(m.save().is_err());
+        assert!(!user.exists(), "nothing written");
+        assert!(
+            !user.with_extension("toml.new").exists(),
+            "nothing staged left behind"
+        );
+    }
+
+    /// Adding a skill to a user layer with no list of its own keeps the image's skills: the
+    /// user's list replaces the base's whole, so it starts as a copy.
+    #[test]
+    fn a_first_skill_in_the_user_layer_keeps_the_base_skills() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (base, user) = layered(
+            dir.path(),
+            "[[policy.skill]]\nname = \"wave\"\npath = \"/srv/wave.onnx\"\nduration = 1.0\n",
+            None,
+        );
+        let mut m = Model::load_layered(&base, &user).expect("loads");
+        m.put_skill(&crate::SkillDef {
+            name: "polite-bow".into(),
+            path: Some(PathBuf::from("/srv/bow.onnx")),
+            duration: 1.0,
+            ..Default::default()
+        })
+        .expect("adds");
+        let merged: Params = toml::from_str(&m.merged()).expect("parses");
+        let names: Vec<_> = merged
+            .policy
+            .skills
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        assert_eq!(names, ["wave", "polite-bow"]);
+
+        // And removing the image's one takes it out of the robot, not just out of the layer.
+        assert!(m.drop_skill("wave").expect("drops"));
+        let merged: Params = toml::from_str(&m.merged()).expect("parses");
+        let names: Vec<_> = merged
+            .policy
+            .skills
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        assert_eq!(names, ["polite-bow"]);
     }
 
     /// A good save is atomic-by-rename, folds the edits in, and a fresh load agrees.

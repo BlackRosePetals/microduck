@@ -10,7 +10,7 @@ a **credential that names an account**, and a **service to present it to**.
 **Built so far** (2026-09-02): §2 — the account. `account.login`, `account.status` and
 `account.logout` are served by `updaterd` and reachable locally, over BLE and over a WebRTC
 datachannel; `robotctl account login` prints a code and waits, `duckctl account login` prints one
-and hangs up. The credential lands in `/etc/robot/hf-token` and renews itself. Nothing consumes it
+and hangs up. The credential lands in `/var/lib/robot/hf-token` and renews itself. Nothing consumes it
 yet — that is §3, and it is the next slice.
 
 What is **established** about the services this depends on, by probing them rather than by reading
@@ -244,10 +244,16 @@ Pollen-owned dataset instead of the owner's.
 
 ### 2.5 Where the token lives, and who writes it
 
-`/etc/robot/hf-token`, `root:robot`, `0640`. JSON: the access token, the refresh token, an
+`/var/lib/robot/hf-token`, `root:robot`, `0640`. JSON: the access token, the refresh token, an
 absolute `expires_at` (the response gives a duration, and a duration means nothing after a reboot)
 and the username, so `account.status` answers with no network at all — a robot that is offline
 still knows who it belongs to.
+
+**Under `/var/lib/robot`, not `/etc/robot`, where it began.** A robot that updates its OS by A/B
+slots replaces `/etc` with each image, so a token there signed the robot out at every OS update
+([`architecture.md`](architecture.md), "Where the state lives"). `updaterd` moves a token it finds at the old path at
+startup (`updater::account::migrate_legacy`); on an A/B robot that has to happen on the slot the
+token is in, i.e. through a daemon update before the next OS update, or the owner signs in again.
 
 **Written `0600` and relaxed to `0640` after the group is set**, rather than through
 `fsutil::write_atomic` like everything else this daemon writes. That helper does not set a mode,
@@ -1121,7 +1127,7 @@ Five slices, and the first two are independently useful and need no client:
    which is what made it the first slice: it prints the Hugging Face username.
 2. **The relay, registering only** — producer registration, the negotiated heartbeat, reconnect and
    backoff, the split-brain poll. `mediad`. **Done**: `mediad::relay`, a task with no GStreamer in
-   it, inert until `/etc/robot/hf-token` exists and picking it up without a restart when it does.
+   it, inert until `/var/lib/robot/hf-token` exists and picking it up without a restart when it does.
    Verifiable with no client at all: the service's dashboard counts a producer and
    `/api/robot-status` lists the duck.
 3. **The client, hosted.** §5. Ahead of session translation rather than after it, which is a change

@@ -24,6 +24,8 @@
 
 use hf_robot_account::{Config, FileStore, Identity, LoginCode, Status};
 
+use std::path::Path;
+
 use crate::proto;
 
 pub use hf_robot_account::{Account, maintain};
@@ -34,7 +36,79 @@ pub use hf_robot_account::{Account, maintain};
 /// `robotctl configure --list` prints what a robot changes, the config editor shows the whole
 /// file, and "what was changed on this robot" is a report we generate. A bearer token would be in
 /// all three.
-pub const DEFAULT_PATH: &str = "/etc/robot/hf-token";
+///
+/// **Under `/var/lib/robot`, not `/etc/robot`.** A robot that updates its OS by A/B slots replaces
+/// `/etc` with every image, and a sign-in is the owner's, not the image's: in `/etc` every OS update
+/// signed the robot out. `/var/lib/robot` is the tree that survives both kinds of update. Directly
+/// in it rather than in a directory of its own, because the store renames a temp file beside the
+/// credential and creates no directories, and this one always exists.
+pub const DEFAULT_PATH: &str = "/var/lib/robot/hf-token";
+
+/// Where the credential lived before it moved. See [`migrate_legacy`].
+pub const LEGACY_PATH: &str = "/etc/robot/hf-token";
+
+/// Move a credential left at [`LEGACY_PATH`] to [`DEFAULT_PATH`], once, at `updaterd`'s startup.
+///
+/// Without this, the release that moved the path would sign out every robot it was installed
+/// on. It has to run while the old file is still visible — on an A/B robot, before the next OS
+/// update replaces `/etc` — which is why it is `updaterd`'s startup and not anything later.
+///
+/// An existing credential at the new path wins, and the old copy is removed either way: a stale
+/// refresh token left in `/etc` is a secret that `account.logout` no longer knows to delete.
+pub fn migrate_legacy() {
+    let (from, to) = (Path::new(LEGACY_PATH), Path::new(DEFAULT_PATH));
+    match migrate(from, to) {
+        Ok(true) => {
+            tracing::warn!(from = %from.display(), to = %to.display(), "moved the account credential")
+        }
+        Ok(false) => {}
+        Err(e) => tracing::error!(
+            from = %from.display(),
+            to = %to.display(),
+            error = %e,
+            "could not move the account credential; the robot reads as signed out until it is moved"
+        ),
+    }
+}
+
+/// [`migrate_legacy`] between any two paths. `Ok(true)` when a credential moved.
+fn migrate(from: &Path, to: &Path) -> std::io::Result<bool> {
+    use std::io::Write as _;
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+
+    let meta = match std::fs::metadata(from) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    if to.try_exists()? {
+        std::fs::remove_file(from)?;
+        return Ok(false);
+    }
+    let bytes = std::fs::read(from)?;
+    // Private from the first byte, then given the old file's group and mode — the store's own
+    // discipline, so the token is never briefly readable by anyone it was not readable by before.
+    let tmp = to.with_extension("migrating");
+    {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+    }
+    // A chown this process may not do leaves the file private, which is the safe failure.
+    let _ = std::os::unix::fs::chown(&tmp, None, Some(meta.gid()));
+    std::fs::set_permissions(&tmp, meta.permissions())?;
+    std::fs::rename(&tmp, to)?;
+    if let Some(dir) = to.parent() {
+        std::fs::File::open(dir)?.sync_all()?;
+    }
+    std::fs::remove_file(from)?;
+    Ok(true)
+}
 
 /// The group that may read the token file.
 ///
@@ -177,5 +251,46 @@ mod tests {
 
         let down: crate::Error = Hf::Network("POST /oauth/device: timed out".into()).into();
         assert_eq!(down.code(), proto::code::NETWORK);
+    }
+
+    /// The release that moved the path must not sign a robot out: the credential moves, with
+    /// its mode, and the old copy is gone.
+    #[test]
+    fn a_legacy_credential_moves_with_its_mode() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (from, to) = (dir.path().join("etc-token"), dir.path().join("token"));
+        std::fs::write(&from, r#"{"access_token":"hf_abc"}"#).unwrap();
+        std::fs::set_permissions(&from, std::fs::Permissions::from_mode(0o640)).unwrap();
+
+        assert!(migrate(&from, &to).unwrap());
+        assert_eq!(
+            std::fs::read_to_string(&to).unwrap(),
+            r#"{"access_token":"hf_abc"}"#
+        );
+        assert_eq!(
+            std::fs::metadata(&to).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        assert!(!from.exists(), "no second copy of a secret left behind");
+        assert!(
+            !migrate(&from, &to).unwrap(),
+            "and the next start has nothing to do"
+        );
+    }
+
+    /// A credential already at the new path is the current one — a sign-in since the move. The
+    /// stale copy is removed, not moved over it.
+    #[test]
+    fn an_existing_credential_wins_over_a_legacy_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let (from, to) = (dir.path().join("etc-token"), dir.path().join("token"));
+        std::fs::write(&from, "old").unwrap();
+        std::fs::write(&to, "new").unwrap();
+
+        assert!(!migrate(&from, &to).unwrap());
+        assert_eq!(std::fs::read_to_string(&to).unwrap(), "new");
+        assert!(!from.exists());
     }
 }
