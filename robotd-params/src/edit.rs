@@ -815,6 +815,147 @@ pub fn set_slots(path: &Path, slots: &[crate::Slot], to: Option<&Path>) -> Resul
     model.save().map(|()| true)
 }
 
+/// Every value a release's `deploy/robotd.toml` ever shipped live (uncommented), by key.
+///
+/// From the template's whole git history — 69 versions when this was written. It is what tells
+/// [`adopt_base_edits`] a value somebody chose from one an older release put there: `install.sh`
+/// copied the template once and never again, so a robot installed in the spring still carries
+/// that spring's live values, and comparing against today's template alone would mistake them for
+/// an owner's decisions and freeze them in. `every_live_template_value_is_listed` keeps it
+/// complete going forward. `[board] version` is never adopted and needs no entry.
+const EVER_SHIPPED: &[(&str, &str)] = &[
+    ("bus.port", "\"/dev/ttyS2\""),
+    ("control.hz", "50"),
+    ("control.cmd_alpha", "0.2"),
+    ("control.head_alpha", "0.2"),
+    ("update_gate.stall_periods", "25"),
+    ("update_gate.min_achieved_hz", "45.0"),
+    ("update_gate.max_consecutive_errors", "10"),
+    ("safety.gain_limp", "50"),
+    ("safety.fall_gravity_z", "-0.5"),
+    ("safety.fall_debounce_ms", "200"),
+    ("safety.deadman_ms", "500"),
+    ("safety.fall_recover", "false"),
+    ("safety.battery_empty_shutdown", "true"),
+    ("policy.enabled", "true"),
+    ("policy.mode", "\"walk\""),
+    ("policy.gain", "200"),
+    ("policy.action_scale", "0.7"),
+    ("policy.standing_action_scale", "1.0"),
+    ("policy.standing_gain_ratio", "0.8"),
+    ("policy.standing_gain_ratio", "0.6"),
+    ("policy.voltage_adapt", "false"),
+    ("policy.nominal_voltage", "7.4"),
+    ("policy.kick_duration", "0.5"),
+    ("policy.ground_pick_gain_ratio", "1.0"),
+    ("policy.roulade_gain_ratio", "1.0"),
+    ("policy.roulade_duration", "1.0"),
+    ("policy.roulade_action_scale", "1.0"),
+    (
+        "policy.walk",
+        "\"/opt/robot/daemon/current/policies/alpha_walking.onnx\"",
+    ),
+    (
+        "policy.stand",
+        "\"/opt/robot/daemon/current/policies/alpha_stand.onnx\"",
+    ),
+];
+
+fn ever_shipped(key: &str, value: &toml::Value) -> bool {
+    EVER_SHIPPED.iter().any(|(k, literal)| {
+        *k == key
+            && format!("v = {literal}")
+                .parse::<toml::Table>()
+                .is_ok_and(|t| t.get("v") == Some(value))
+    })
+}
+
+/// The first time a robot runs a release with layers: copy what its owner had changed in the base
+/// into a new user layer. Returns the keys copied; an empty list when there is already a user
+/// layer, which makes this a no-op on every later start.
+///
+/// **Why it is needed.** Before layers, every edit landed in the base, mixed in with what the
+/// installer or image wrote. Left there, those edits read as the robot's *defaults* in the editor
+/// — not marked, not in `configure --list`, and `u` "reverts" to them — and on a robot whose OS
+/// updates by A/B slots, the next OS update throws them away with the rest of `/etc`.
+///
+/// **Copied, never moved.** The base is not touched: a rollback to a release that predates layers
+/// reads the base alone, and has to find the robot as it was.
+///
+/// What counts as an edit: a key this build knows whose value no release's template ever shipped
+/// ([`EVER_SHIPPED`]). `[board] version` is the installer's and the image's, never adopted. A key
+/// this build does not know is left in the base, where the lenient loader already ignores it — it
+/// cannot go in the user layer, which the editor reads strictly. An owner who had typed exactly a
+/// shipped value in is not told apart from the template, and their key goes on following the base;
+/// on a robot without slots that changes nothing.
+///
+/// The user layer is written even when nothing is copied, so the question is asked once.
+pub fn adopt_base_edits(base: &Path, user: &Path) -> Result<Vec<String>, String> {
+    let lock = lock(user)?;
+    match user.try_exists() {
+        Ok(false) => {}
+        Ok(true) => return Ok(Vec::new()),
+        Err(e) => return Err(format!("cannot read {}: {e}", user.display())),
+    }
+    let mut table: toml::Table = read_or_empty(base)?
+        .parse()
+        .map_err(|e| format!("{}: {e}", base.display()))?;
+    crate::normalise_renamed(&mut table);
+    let mut picked = toml::Table::new();
+    let mut keys = Vec::new();
+    collect_edits(&table, "", &mut picked, &mut keys);
+
+    let header = format!(
+        "# Settings changed on this robot, layered over {} key by key.\n\
+         # Change them with `robotctl configure`. This file survives OS updates; that one does not.\n\
+         {}\n",
+        base.display(),
+        if keys.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "# Copied from {} when this robot first ran a release with layers.\n",
+                base.display()
+            )
+        },
+    );
+    let model = Model::load_layered(base, user)?;
+    model.write_through(&lock, &format!("{header}{picked}"))?;
+    Ok(keys)
+}
+
+/// The base's owner edits under `prefix`, into `picked` at the same paths.
+fn collect_edits(
+    node: &toml::Table,
+    prefix: &str,
+    picked: &mut toml::Table,
+    keys: &mut Vec<String>,
+) {
+    for (name, value) in node {
+        let key = if prefix.is_empty() {
+            name.clone()
+        } else {
+            format!("{prefix}.{name}")
+        };
+        if crate::registry::entry_for(&key).is_some() {
+            if key != "board.version" && !ever_shipped(&key, value) {
+                let mut at = &mut *picked;
+                for part in key.split('.').take(key.split('.').count() - 1) {
+                    at = at
+                        .entry(part)
+                        .or_insert_with(|| toml::Value::Table(toml::Table::new()))
+                        .as_table_mut()
+                        .expect("only tables are made here");
+                }
+                at.insert(name.clone(), value.clone());
+                keys.push(key);
+            }
+        } else if let toml::Value::Table(below) = value {
+            collect_edits(below, &key, picked, keys);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1079,6 +1220,90 @@ mod tests {
             .map(|s| s.name.as_str())
             .collect();
         assert_eq!(names, ["polite-bow"]);
+    }
+
+    /// The template this build ships has to read as *nothing changed*. A new live value added to
+    /// `deploy/robotd.toml` without an [`EVER_SHIPPED`] entry would otherwise be copied into
+    /// every fresh robot's user layer as if its owner had chosen it, and frozen there.
+    #[test]
+    fn every_live_template_value_is_listed() {
+        let table: toml::Table = SHIPPED.parse().expect("parses");
+        let (mut picked, mut keys) = (toml::Table::new(), Vec::new());
+        collect_edits(&table, "", &mut picked, &mut keys);
+        assert!(keys.is_empty(), "add these to EVER_SHIPPED: {keys:?}");
+    }
+
+    /// A robot installed from an older template, with three things its owner changed among what
+    /// that template shipped. Only the owner's arrive in the user layer, under today's names, and
+    /// the base is left exactly as it was for a release that predates layers.
+    #[test]
+    fn an_old_robots_edits_are_adopted_and_its_template_values_are_not() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let old = "[board]\nversion = \"beta\"\n\
+                   [control]\nhz = 100\ncmd_alpha = 0.2\n\
+                   [safety]\ndeadman_ms = 500\n\
+                   [policy]\ngain = 200\n\
+                   [[policy.skill]]\nname = \"polite-bow\"\npath = \"/srv/bow.onnx\"\nduration = 1.0\n\
+                   [imu_head]\ngain = 0.7\n\
+                   [health]\nstall_periods = 3\n";
+        let (base, user) = layered(dir.path(), old, None);
+
+        let mut keys = adopt_base_edits(&base, &user).expect("adopts");
+        keys.sort();
+        assert_eq!(
+            keys,
+            ["control.hz", "pad_imu_head_control.gain", "policy.skill"],
+            "not board.version, not the old template's values, not a section this build lacks"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&base).unwrap(),
+            old,
+            "base untouched"
+        );
+
+        let p = Params::load_layered(&base, &user, true).unwrap();
+        assert!(p.user_layer_rejected.is_none());
+        assert_eq!(p.control.hz, 100);
+        assert_eq!(p.pad_imu_head_control.gain, 0.7);
+        assert_eq!(p.policy.skills.len(), 1);
+
+        // And the editor now shows them for what they are.
+        let m = Model::load_layered(&base, &user).expect("the editor opens it");
+        let hz = m
+            .rows()
+            .into_iter()
+            .find(|r| r.entry.key == "control.hz")
+            .unwrap();
+        assert!(hz.overridden());
+    }
+
+    /// Once there is a user layer, this never runs again — not over the owner's later edits.
+    #[test]
+    fn adoption_happens_once() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (base, user) = layered(
+            dir.path(),
+            "[control]\nhz = 100\n",
+            Some("[control]\nhz = 60\n"),
+        );
+        assert!(adopt_base_edits(&base, &user).unwrap().is_empty());
+        assert_eq!(
+            std::fs::read_to_string(&user).unwrap(),
+            "[control]\nhz = 60\n"
+        );
+    }
+
+    /// A robot nobody changed gets an empty user layer — written anyway, so the question is asked
+    /// once — and runs exactly as before.
+    #[test]
+    fn an_untouched_robot_adopts_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (base, user) = layered(dir.path(), SHIPPED, None);
+        assert!(adopt_base_edits(&base, &user).unwrap().is_empty());
+        assert!(user.exists());
+        let p = Params::load_layered(&base, &user, true).unwrap();
+        assert!(p.user_layer_rejected.is_none());
+        assert!(Model::load_layered(&base, &user).is_ok());
     }
 
     /// A good save is atomic-by-rename, folds the edits in, and a fresh load agrees.

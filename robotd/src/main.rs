@@ -1031,6 +1031,27 @@ async fn main() -> ExitCode {
         .params
         .clone()
         .unwrap_or_else(|| PathBuf::from(params::DEFAULT_PATH));
+    // Before the load, and here rather than in any other daemon: robotd is the first thing a
+    // release starts that writes this file, and a phone's edit saved before the adoption ran
+    // would create the user layer and make the old edits look adopted. Only where there is a
+    // `/var/lib/robot` — on a laptop running the default path there is nothing to adopt into.
+    if let Some(user) = params::user_layer_for(&params_path)
+        && user.parent().is_some_and(std::path::Path::is_dir)
+    {
+        match params::edit::adopt_base_edits(&params_path, &user) {
+            Ok(keys) if keys.is_empty() => {}
+            Ok(keys) => tracing::warn!(
+                ?keys,
+                to = %user.display(),
+                "copied this robot's own settings out of the base config, once"
+            ),
+            Err(e) => tracing::error!(
+                error = %e,
+                "could not copy this robot's settings into its user config; they still apply \
+                 from the base, and the next start tries again"
+            ),
+        }
+    }
     let mut params = match Params::load(&params_path, explicit) {
         Ok(params) => params,
         Err(e) => {

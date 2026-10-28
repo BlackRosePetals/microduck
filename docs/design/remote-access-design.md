@@ -255,6 +255,12 @@ slots replaces `/etc` with each image, so a token there signed the robot out at 
 startup (`updater::account::migrate_legacy`); on an A/B robot that has to happen on the slot the
 token is in, i.e. through a daemon update before the next OS update, or the owner signs in again.
 
+The old path is left as a **symlink** to the new one, for a rollback to a release that reads only
+`/etc`: it finds the current credential, and after a logout the link dangles and reads as signed
+out. A rolled-back `updaterd` that signs in replaces the link with a file; the next start of a
+newer one keeps whichever credential is more recent. One case is not covered: a *logout* made
+while rolled back deletes only the link, so the robot is signed in again once it moves forward.
+
 **Written `0600` and relaxed to `0640` after the group is set**, rather than through
 `fsutil::write_atomic` like everything else this daemon writes. That helper does not set a mode,
 and a token that lands `0644` and is chmodded a moment later is world-readable for that moment —

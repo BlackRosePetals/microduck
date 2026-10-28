@@ -123,6 +123,13 @@ anything an *owner* decides lives there, and anything the *image* decides stays 
   release over a file no release can fix. A broken base is still fatal: that is a broken image.
   The editors validate a user layer against its base before writing it, so only a hand edit can
   produce one.
+- **A robot that predates the layers has its edits in the base**, mixed in with the template it
+  was installed from. The first time `robotd` starts with no user layer, it *copies* the keys
+  somebody changed into a new one (`robotd_params::edit::adopt_base_edits`): a known key whose
+  value no release's template ever shipped live, never `[board] version`. The base is left as it
+  was, so a rollback to a release without layers finds the robot unchanged. On an A/B robot this
+  only saves the edits if the release reaches the robot as a daemon update before its next OS
+  update — the copy has to run on the slot whose `/etc` holds them.
 - **`updater.toml` is still single-layered.** Almost all of it is the image's policy, but two keys
   are per-robot decisions — `allow_dev_keys` on a dev board, `auto_apply = "all"` on a canary —
   and on an A/B robot an OS update currently puts both back to the image's values. Open.
