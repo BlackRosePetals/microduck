@@ -131,6 +131,9 @@ fn apply_for(key: &str) -> Option<Apply> {
         //   config and adopting the file's mode would undo a live switch as a side effect.
         // - `enabled` is read once into `RobotState`, and the reload call is *refused* while it
         //   is false — so the one direction anybody cares about, off to on, cannot be a reload.
+        // `allow_community` is not `robotd`'s at all: `updaterd` reads it before every fetch
+        // (`PolicyParams::community_allowed`), the way it reads the board.
+        "policy" if name == "allow_community" => Apply::Live("updaterd"),
         "policy" if name != "mode" && name != "enabled" => Apply::Reload("robotd"),
         // Read once at startup by both `padd` and `netpadd`, each to decide whether it is the one
         // to run (`--should-run`). `apply_for` names one daemon; `plan_for_keys` adds `padd`.
@@ -1274,6 +1277,16 @@ mod tests {
             unmapped.is_empty(),
             "nothing says how {unmapped:?} applies — add an arm to `apply_for`"
         );
+    }
+
+    /// `allow_community` sits in `[policy]` but belongs to `updaterd`, which reads it before every
+    /// fetch. Falling through to the section's arm would offer to reload a walking robot for a key
+    /// it never reads.
+    #[test]
+    fn allow_community_is_live_in_the_updater_and_disturbs_nothing() {
+        let plan = plan_for_written(&["policy.allow_community".to_string()]);
+        assert_eq!(plan.live, vec!["updaterd"]);
+        assert!(plan.is_quiet(), "{plan:?}");
     }
 
     /// Either half of the pad source restarted alone leaves the other on the old answer.

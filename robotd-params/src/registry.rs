@@ -244,6 +244,11 @@ pub const REGISTRY: &[Entry] = &[
         Kind::Float,
         "Reference voltage the gains were identified at",
     ),
+    feature(
+        "policy.allow_community",
+        Kind::Bool,
+        "Allow fetching policies from outside pollen-robotics on the Hub",
+    ),
     // ── [safety] ─────────────────────────────────────────────────────────────
     entry(
         "safety.fall_gravity_z",
@@ -1297,6 +1302,7 @@ mod tests {
                 "policy.enabled",
                 "policy.mode",
                 "policy.voltage_adapt",
+                "policy.allow_community",
                 "safety.battery_empty_shutdown",
                 "safety.limp_fall",
                 "duck_detector.enabled",
