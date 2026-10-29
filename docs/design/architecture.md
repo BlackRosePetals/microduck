@@ -125,11 +125,14 @@ anything an *owner* decides lives there, and anything the *image* decides stays 
   produce one.
 - **A robot that predates the layers has its edits in the base**, mixed in with the template it
   was installed from. The first time `robotd` starts with no user layer — or an editor writes
-  one, whichever comes first — the keys somebody changed are *copied* into a new one (`robotd_params::edit::adopt_base_edits`): a known key whose
-  value no release's template ever shipped live, never `[board] version`. The base is left as it
-  was, so a rollback to a release without layers finds the robot unchanged. On an A/B robot this
-  only saves the edits if the release reaches the robot as a daemon update before its next OS
-  update — the copy has to run on the slot whose `/etc` holds them.
+  one, whichever comes first — the keys somebody changed are *moved* into a new one (`robotd_params::edit::adopt_base_edits`): a known key whose
+  value no release's template ever shipped live, never `[board] version`. Moved rather than
+  copied, because a copy left in the base would still be the default the editor compares against,
+  hiding the edit and making "revert" a no-op; a rollback to a release without layers runs on the
+  template's values until it moves forward again. On an A/B robot whose OS update arrives first,
+  the bundle's install hook (`microduck_yocto`, `microduck-bundle-hook`) copies the running slot's
+  base to `/var/lib/robot/robotd.toml.from-slot` while there is no user layer, and the edits are
+  adopted from there; it does the same for `hf-token`.
 - **`updater.toml` is still single-layered.** Almost all of it is the image's policy, but two keys
   are per-robot decisions — `allow_dev_keys` on a dev board, `auto_apply = "all"` on a canary —
   and on an A/B robot an OS update currently puts both back to the image's values. Open.

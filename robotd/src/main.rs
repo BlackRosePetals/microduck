@@ -1042,11 +1042,11 @@ async fn main() -> ExitCode {
             Ok(keys) => tracing::warn!(
                 ?keys,
                 to = %user.display(),
-                "copied this robot's own settings out of the base config, once"
+                "moved this robot's own settings out of the base config, once"
             ),
             Err(e) => tracing::error!(
                 error = %e,
-                "could not copy this robot's settings into its user config; they still apply \
+                "could not move this robot's settings into its user config; they still apply \
                  from the base, and the next start tries again"
             ),
         }

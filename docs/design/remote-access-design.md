@@ -252,8 +252,9 @@ still knows who it belongs to.
 **Under `/var/lib/robot`, not `/etc/robot`, where it began.** A robot that updates its OS by A/B
 slots replaces `/etc` with each image, so a token there signed the robot out at every OS update
 ([`architecture.md`](architecture.md), "Where the state lives"). `updaterd` moves a token it finds at the old path at
-startup (`updater::account::migrate_legacy`); on an A/B robot that has to happen on the slot the
-token is in, i.e. through a daemon update before the next OS update, or the owner signs in again.
+startup (`updater::account::migrate_legacy`). When an OS update arrives first, the bundle's install
+hook (`microduck_yocto`, `microduck-bundle-hook`) copies it to the new path instead, before the
+old slot's `/etc` is left behind.
 
 The old path is left as a **symlink** to the new one, for a rollback to a release that reads only
 `/etc`: it finds the current credential, and after a logout the link dangles and reads as signed
