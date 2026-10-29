@@ -2780,7 +2780,9 @@ fn limp_note(command: &Command, reply: &serde_json::Value) -> Option<&'static st
     }
     // Only when `robotd` took it. A refusal prints as JSON above and leaves the robot as it was.
     reply["result"]["accepted"].as_bool()?.then_some(
-        "note: torque is off on every joint while the servos come back — hold the robot, or have          it down. It stays limp until something stands it up: press Start on the pad, or          `duckctl call robot.init`.",
+        "note: torque is off on every joint while the servos come back — hold the robot, or have \
+         it down. It stays limp until something stands it up: press Start on the pad, or \
+         `duckctl call robot.init`.",
     )
 }
 
@@ -2791,7 +2793,9 @@ fn os_note(command: &Command, reply: &serde_json::Value) -> Option<String> {
     }
     let phase = reply["result"]["phase"].as_str()?;
     Some(format!(
-        "note: the robot is {phase}. It reboots by itself once the new OS is installed, and is          gone for a minute or so — that is the update working. `duckctl os status` follows it;          after the reboot, `last_result` says whether the new slot came up or it went back."
+        "note: the robot is {phase}. It reboots by itself once the new OS is installed, and is \
+         gone for a minute or so — that is the update working. `duckctl os status` follows it; \
+         after the reboot, `last_result` says whether the new slot came up or it went back."
     ))
 }
 
@@ -3696,12 +3700,26 @@ mod tests {
         let note = limp_note(&cli.command, &accepted).expect("a note");
         assert!(note.contains("torque is off"), "{note}");
         assert!(note.contains("robot.init"), "{note}");
+        assert!(!note.contains("  "), "a line break leaked its indent: {note}");
 
         let refused = serde_json::json!({ "error": { "code": 14, "message": "no" } });
         assert_eq!(limp_note(&cli.command, &refused), None);
 
         let health = Cli::try_parse_from(["duckctl", "health"]).expect("parses");
         assert_eq!(limp_note(&health.command, &accepted), None);
+    }
+
+    /// `os apply` answers mid-download; the reboot that follows is the update, not a fault.
+    #[test]
+    fn an_os_apply_says_the_robot_will_reboot() {
+        let cli = Cli::try_parse_from(["duckctl", "os", "apply"]).expect("parses");
+        let reply = serde_json::json!({ "result": { "phase": "downloading" } });
+        let note = os_note(&cli.command, &reply).expect("a note");
+        assert!(note.contains("the robot is downloading"), "{note}");
+        assert!(!note.contains("  "), "a line break leaked its indent: {note}");
+
+        let status = Cli::try_parse_from(["duckctl", "os", "status"]).expect("parses");
+        assert_eq!(os_note(&status.command, &reply), None);
     }
 
     /// **A load homes the robot before it answers**, so it gets the budget a slow call gets.
