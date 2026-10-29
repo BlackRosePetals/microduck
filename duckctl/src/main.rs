@@ -3700,7 +3700,10 @@ mod tests {
         let note = limp_note(&cli.command, &accepted).expect("a note");
         assert!(note.contains("torque is off"), "{note}");
         assert!(note.contains("robot.init"), "{note}");
-        assert!(!note.contains("  "), "a line break leaked its indent: {note}");
+        assert!(
+            !note.contains("  "),
+            "a line break leaked its indent: {note}"
+        );
 
         let refused = serde_json::json!({ "error": { "code": 14, "message": "no" } });
         assert_eq!(limp_note(&cli.command, &refused), None);
@@ -3716,7 +3719,10 @@ mod tests {
         let reply = serde_json::json!({ "result": { "phase": "downloading" } });
         let note = os_note(&cli.command, &reply).expect("a note");
         assert!(note.contains("the robot is downloading"), "{note}");
-        assert!(!note.contains("  "), "a line break leaked its indent: {note}");
+        assert!(
+            !note.contains("  "),
+            "a line break leaked its indent: {note}"
+        );
 
         let status = Cli::try_parse_from(["duckctl", "os", "status"]).expect("parses");
         assert_eq!(os_note(&status.command, &reply), None);
