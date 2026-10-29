@@ -262,6 +262,15 @@ Other people publish policies for this robot:
 robotctl policy search microduck
 ```
 
+A robot only fetches policies from `pollen-robotics` until you allow others. Run this, set
+`policy.allow_community` to `true`, and save:
+
+```
+sudo robotctl configure
+```
+
+Then:
+
 ```
 sudo robotctl policy load walk RemiFabre/microduck-flamingo-cycle
 ```

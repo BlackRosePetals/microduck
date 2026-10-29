@@ -685,6 +685,34 @@ pub struct CameraIntrinsics {
 }
 
 impl CameraIntrinsics {
+    /// The beta family's camera calibration: the GC2093 on Seeed's main board and its lens, one part across
+    /// the family like the alpha's, so one solve is every unit's.
+    ///
+    /// Solved on unit *sky-gtc*, 2026-10-28 — a printed 11×8 ChArUco (`DICT_4X4_1000`, legacy pattern, 20.75 mm
+    /// squares), 80 views, 1.28 px RMS (per view: median 1.1, max 2.7 — spread evenly, not a few outliers, and
+    /// every-frame and every-third-frame solves agree within 3 px on the principal point; a slower recording on a
+    /// rigid board should bring it under 1), on the 1280×720 frame as `mediad` sends it: a scaled readout of the
+    /// sensor's only 1920×1080 mode, so the same field at any size `mediad` streams. Mounted upright
+    /// (`rotate` 0), ~85° horizontal and ~55° vertical field — wider than the alpha's 62°.
+    /// Re-solve with `duckslam calib intrinsics`; `duckslam calib export-toml` prints this shape.
+    pub fn beta() -> Self {
+        Self {
+            width: 1280,
+            height: 720,
+            fx: 695.6216231288809,
+            fy: 696.0209167299262,
+            cx: 627.4740538073111,
+            cy: 363.60566030048255,
+            distortion: vec![
+                -0.368607360841971,
+                0.13550162561831905,
+                0.00012682873881955374,
+                0.0008719998338708391,
+                -0.022368269599378002,
+            ],
+        }
+    }
+
     /// The alpha family's camera calibration: the head camera module and M12 lens every alpha unit
     /// carries — one part across the family, so one solve is every unit's calibration.
     ///
@@ -1416,6 +1444,14 @@ pub struct PolicyParams {
     pub voltage_adapt: bool,
     /// Reference voltage for `voltage_adapt` — the supply the gains were identified at.
     pub nominal_voltage: f64,
+    /// Whether `policy.fetch` may download a policy from a Hub repo outside `pollen-robotics`.
+    ///
+    /// Off by default: a robot out of the box only fetches networks we published. It gates the
+    /// download and nothing else — a slot already pointing at a community policy keeps running
+    /// when this is turned off, so flipping it can never change what a robot does at its next
+    /// start. `robotd` does not read it; `updaterd` does, before every fetch
+    /// ([`Self::community_allowed`]). `docs/design/policy-channel-design.md` §9.2.
+    pub allow_community: bool,
 }
 
 /// The literal that disables an optional policy slot, per the prototype's `--x-policy None`.
@@ -1997,6 +2033,26 @@ impl ResolvedPolicy {
 }
 
 impl PolicyParams {
+    /// Whether `robotd.toml` at `path` allows community policies, read on its own.
+    ///
+    /// For `updaterd`, before every fetch, the way it reads the board
+    /// ([`board::Board::declared`]): so `robotctl configure` applies without a restart, and a file
+    /// that is invalid somewhere else still answers. Missing, unreadable or not a bool is `false`
+    /// — the default, and the answer that downloads nothing.
+    pub fn community_allowed(path: &Path) -> bool {
+        let Some(text) = std::fs::read_to_string(path).ok() else {
+            return false;
+        };
+        let Ok(table) = toml::from_str::<toml::Table>(&text) else {
+            return false;
+        };
+        table
+            .get("policy")
+            .and_then(|policy| policy.get("allow_community"))
+            .and_then(toml::Value::as_bool)
+            .unwrap_or(false)
+    }
+
     /// The built-in skills with config merged over them, by name.
     ///
     /// Merge rather than replace, for the reason every other key in this file resolves the way it
@@ -2282,6 +2338,7 @@ impl Default for PolicyParams {
             skills: Vec::new(),
             voltage_adapt: true,
             nominal_voltage: 7.4,
+            allow_community: false,
         }
     }
 }
@@ -4163,6 +4220,10 @@ mod tests {
         assert!(!skill("kick_left").chain);
         assert!(p.voltage_adapt, "on by default since 2026-09-14");
         assert_eq!(p.nominal_voltage, 7.4);
+        assert!(
+            !PolicyParams::default().allow_community,
+            "only pollen-robotics policies out of the box"
+        );
 
         let name = |p: &Option<std::path::PathBuf>| {
             p.as_ref()
@@ -4376,5 +4437,29 @@ mod tests {
             let path = write(dir.path(), &format!("[control]\nhz = {hz}\n"));
             assert!(Params::load(&path, true).is_err(), "hz = {hz} was accepted");
         }
+    }
+
+    /// `updaterd` asks this before every fetch, so it must answer from a file `robotd` would
+    /// reject, and must fall to "no" — the answer that downloads nothing — on anything else.
+    #[test]
+    fn community_allowed_reads_one_key_and_defaults_to_no() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("robotd.toml");
+
+        let read = |text: &str| {
+            std::fs::write(&path, text).expect("write");
+            PolicyParams::community_allowed(&path)
+        };
+        assert!(read("[policy]\nallow_community = true\n"));
+        assert!(
+            read("[policy]\nallow_community = true\n[future]\nx = 2\n"),
+            "a section this build does not know is no reason to change the answer"
+        );
+        assert!(!read("[policy]\nallow_community = false\n"));
+        assert!(!read("[policy]\n# allow_community = true\n"));
+        assert!(!read("[policy]\nallow_community = \"yes\"\n"));
+        assert!(!read("not toml ["));
+        std::fs::remove_file(&path).expect("remove");
+        assert!(!PolicyParams::community_allowed(&path));
     }
 }

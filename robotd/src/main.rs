@@ -434,6 +434,75 @@ fn origin_of(path: &std::path::Path) -> &'static str {
 /// a robot that can be *told* which org to trust has a badge that means nothing.
 const OFFICIAL_ORG: &str = "pollen-robotics";
 
+/// The vet book's `policy` events for a change the loop has just made live: one per slot or skill
+/// that starts or stops running a community policy, oldest-first in slot then skill order.
+///
+/// Only community, because that is the question the book answers — "did this duck run somebody
+/// else's network, and which" — and the events list is capped: logging every official reset
+/// would push out the updates and notes it exists to keep. Stopping is logged too, so the book
+/// says how long one ran and not only that it started.
+fn community_policy_events(
+    old: &params::ResolvedPolicy,
+    new: &params::ResolvedPolicy,
+) -> Vec<String> {
+    let mut events = Vec::new();
+    let mut compare = |what: String, before: Option<PathBuf>, after: Option<PathBuf>| {
+        if before == after {
+            return;
+        }
+        let community =
+            |p: &Option<PathBuf>| p.as_deref().is_some_and(|p| origin_of(p) == "community");
+        if community(&after) {
+            let source = library_source(after.as_deref().expect("community is a path"));
+            events.push(format!("{what} now runs {source} (community)"));
+        } else if community(&before) {
+            let source = library_source(before.as_deref().expect("community is a path"));
+            events.push(format!("{what} no longer runs {source} (community)"));
+        }
+    };
+    for slot in Slot::ALL {
+        compare(
+            slot.as_str().to_owned(),
+            old.slot(slot).map(PathBuf::from),
+            new.slot(slot).map(PathBuf::from),
+        );
+    }
+    let path_of = |cfg: &params::ResolvedPolicy, name: &str| {
+        cfg.skills
+            .iter()
+            .find(|s| s.name == name)
+            .and_then(params::SkillDef::resolved_path)
+    };
+    let mut names: Vec<&str> = old.skills.iter().map(|s| s.name.as_str()).collect();
+    for skill in &new.skills {
+        if !names.contains(&skill.name.as_str()) {
+            names.push(&skill.name);
+        }
+    }
+    for name in names {
+        compare(
+            format!("skill {name}"),
+            path_of(old, name),
+            path_of(new, name),
+        );
+    }
+    events
+}
+
+/// `org/name@revision` for a file in the library, which is where every community policy lives
+/// (`<library>/<org>/<name>/<revision>/<file>`); the path itself for anything else.
+fn library_source(path: &std::path::Path) -> String {
+    let parts: Option<Vec<String>> = path.strip_prefix(params::POLICY_LIBRARY).ok().map(|rest| {
+        rest.components()
+            .map(|c| c.as_os_str().to_string_lossy().into_owned())
+            .collect()
+    });
+    match parts.as_deref() {
+        Some([org, name, revision, ..]) => format!("{org}/{name}@{revision}"),
+        _ => path.display().to_string(),
+    }
+}
+
 /// The per-slot answer to `robot.policies`: what is loaded, from where, and why not.
 ///
 /// Derived rather than stored, from the three things that between them decide it — what config
@@ -3322,6 +3391,11 @@ async fn control_loop<T: RobotIo>(
                         &cfg,
                         &slot_errors,
                     )));
+                    // Here and not where the request was accepted: a load that fails to build
+                    // never ran, and the book is a record of what did.
+                    for text in community_policy_events(&policy_cfg, &cfg) {
+                        state.vetbook.policy(&text);
+                    }
                     policy_cfg = cfg;
                     tracing::warn!(
                         change = describe_change(&change),
@@ -9050,6 +9124,56 @@ mod tests {
             assert!(!slot.overridden, "{slot:?}");
             assert!(slot.error.is_none(), "{slot:?}");
         }
+    }
+
+    /// The book hears when a slot or a skill starts or stops running a community policy, and
+    /// about nothing official.
+    #[test]
+    fn community_policies_coming_and_going_are_vet_book_events() {
+        let library = std::path::Path::new(params::POLICY_LIBRARY);
+        let flamingo = library.join("RemiFabre/microduck-flamingo-cycle/main/policy.onnx");
+        let ours = library.join("pollen-robotics/microduck-flamingo/main/policy.onnx");
+        let bow = library.join("fffiloni/microduck-polite-bow/v2/policy.onnx");
+
+        let base = params::PolicyParams::default();
+        let with = |edit: &dyn Fn(&mut params::PolicyParams)| {
+            let mut p = base.clone();
+            edit(&mut p);
+            p.resolved()
+        };
+        let plain = base.resolved();
+        let community_walk = with(&|p| p.walk = Some(flamingo.clone()));
+        let official_walk = with(&|p| p.walk = Some(ours.clone()));
+        let community_skill = with(&|p| {
+            p.skills.push(params::SkillDef {
+                name: "polite-bow".into(),
+                path: Some(bow.clone()),
+                duration: 4.0,
+                ..Default::default()
+            })
+        });
+
+        assert_eq!(
+            community_policy_events(&plain, &community_walk),
+            vec!["walk now runs RemiFabre/microduck-flamingo-cycle@main (community)"]
+        );
+        assert_eq!(
+            community_policy_events(&community_walk, &plain),
+            vec!["walk no longer runs RemiFabre/microduck-flamingo-cycle@main (community)"]
+        );
+        assert!(
+            community_policy_events(&plain, &official_walk).is_empty(),
+            "an official policy is not what the book is asking about"
+        );
+        assert!(community_policy_events(&community_walk, &community_walk).is_empty());
+        assert_eq!(
+            community_policy_events(&plain, &community_skill),
+            vec!["skill polite-bow now runs fffiloni/microduck-polite-bow@v2 (community)"]
+        );
+        assert_eq!(
+            community_policy_events(&community_skill, &plain),
+            vec!["skill polite-bow no longer runs fffiloni/microduck-polite-bow@v2 (community)"]
+        );
     }
 
     /// The three origins, told apart by the path — because the path is made of the answer.
