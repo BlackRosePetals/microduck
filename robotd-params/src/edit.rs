@@ -1370,14 +1370,14 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let (base, user) = layered(
             dir.path(),
-            "[policy]\nfootstep_control = true\n",
+            "[policy]\nmoonwalk = true\n",
             Some("[kazoo]\nvoice = \"alto\"\n"),
         );
         let m = Model::load_layered(&base, &user).expect("opens like robotd starts");
         assert_eq!(m.ignored(), ["[kazoo]"]);
         let (path, keys) = m.ignored_in_base().expect("the base's are kept apart");
         assert_eq!(path, base);
-        assert_eq!(keys, ["policy.footstep_control"]);
+        assert_eq!(keys, ["policy.moonwalk"]);
     }
 
     /// The editor's gate is the loader's: a user layer that would be set aside is never written.
@@ -1652,7 +1652,7 @@ mod tests {
         );
     }
 
-    /// A key another branch left behind — `policy.footstep_control`, a whole `[kazoo]` — does
+    /// A key another branch left behind — a `policy.moonwalk`, a whole `[kazoo]` — does
     /// not stop the editor opening a file `robotd` itself starts on. The keys are named, an edit
     /// beside them saves, and they are still in the file for the branch that reads them.
     #[test]
@@ -1661,18 +1661,18 @@ mod tests {
         let path = dir.path().join("robotd.toml");
         std::fs::write(
             &path,
-            "[policy]\nmode = \"walk\"\nfootstep_control = true\n\n\
+            "[policy]\nmode = \"walk\"\nmoonwalk = true\n\n\
              [kazoo]\nvoice = \"alto\"\n\n[pad]\nx = \"polite-bow\"\n",
         )
         .unwrap();
 
         let mut m = Model::load(&path).expect("opens like robotd starts");
-        assert_eq!(m.ignored(), ["[kazoo]", "policy.footstep_control"]);
+        assert_eq!(m.ignored(), ["[kazoo]", "policy.moonwalk"]);
         m.edit(entry("audio.enabled"), "false").expect("edits");
         m.save().expect("saves");
 
         let written = std::fs::read_to_string(&path).unwrap();
-        assert!(written.contains("footstep_control = true"), "{written}");
+        assert!(written.contains("moonwalk = true"), "{written}");
         assert!(written.contains("voice = \"alto\""), "{written}");
         assert!(!Params::load(&path, true).unwrap().audio.enabled);
         // The bindings robotd serves over `pad.bind` are the file's, not the defaults.

@@ -381,10 +381,6 @@ enum Focus {
     Apply { plan: Plan },
 }
 
-/// Run the editor. Returns once the user has left, with everything saved or discarded.
-///
-/// `robot_socket` is only reached for a `[policy]` change, and only if the operator accepts the
-/// reload — the editor is useful on a board where nothing is running.
 /// What to say about keys the files set and this build does not know — typically left by a
 /// branch the robot ran before. Kept in the file and ignored, exactly as `robotd` does. The
 /// base's are named with the base, since that is the file to open to drop one.
@@ -404,6 +400,10 @@ fn ignored_note(model: &Model) -> Option<String> {
     })
 }
 
+/// Run the editor. Returns once the user has left, with everything saved or discarded.
+///
+/// `robot_socket` is only reached for a `[policy]` change, and only if the operator accepts the
+/// reload — the editor is useful on a board where nothing is running.
 pub fn run(path: &Path, robot_socket: &Path) -> Result<(), String> {
     // An interactive editor and nothing else: piped in or out, there is no sensible
     // behaviour to fall back to, and ratatui would panic trying to open the terminal.
