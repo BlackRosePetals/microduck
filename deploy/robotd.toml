@@ -203,6 +203,12 @@ mode = "walk"
 # voltage_adapt = true
 # nominal_voltage = 7.4
 
+# Whether `robotctl policy load <slot> <org/name>` may fetch a policy from a Hub repo outside
+# pollen-robotics. Off by default. It gates the download only: a slot already pointing at a
+# community policy keeps running when this is turned off. updaterd reads it before every fetch,
+# so changing it needs no restart.
+# allow_community = false
+
 [safety]
 # The fall verdict: is the robot down? On projected gravity in the trunk frame — upright
 # reads about -1.0 on z, a robot on its side reads near 0. Debounced, because the impulse

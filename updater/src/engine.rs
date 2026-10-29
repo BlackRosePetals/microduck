@@ -1446,8 +1446,14 @@ impl Engine {
         // What the robot is pointed at, so the prune that follows the fetch cannot take a gait
         // out from under it. `None` — a robot that did not answer — prunes nothing at all.
         let in_use = self.robot.policy_paths(ROBOT_QUERY_TIMEOUT).await;
+        // Read every time rather than once at startup, so `robotctl configure` applies without
+        // restarting `updaterd` — the same reason `hw_rev` reads the board each check.
+        let allow_community = robotd_params::PolicyParams::community_allowed(std::path::Path::new(
+            robotd_params::DEFAULT_PATH,
+        ));
         crate::policy::fetch(
             &self.config.policy_library,
+            allow_community,
             repo,
             revision,
             file,

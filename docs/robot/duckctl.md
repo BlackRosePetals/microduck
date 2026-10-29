@@ -594,7 +594,8 @@ Install the newest official set — or `--version v1` to go back:
 duckctl policy update
 ```
 
-Download somebody else's, without running it:
+Download somebody else's, without running it. The robot refuses until
+`policy.allow_community` is `true` in `sudo robotctl configure` on it:
 
 ```bash
 duckctl policy fetch RemiFabre/microduck-flamingo-cycle
