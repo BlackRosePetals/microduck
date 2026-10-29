@@ -2746,7 +2746,7 @@ impl Params {
         // the file somebody edited, with its own line and column — not against a merged document
         // nobody has ever seen. Not validated alone: a partial file is not a robot, and the
         // cross-key checks need the base's values.
-        Self::parse(&user_text, user, false)?;
+        Self::parse_file(&user_text, user, false)?;
         let base_text = read(base)?.unwrap_or_default();
         let table = |text: &str, path: &Path| {
             text.parse::<toml::Table>()
@@ -2758,7 +2758,7 @@ impl Params {
         let merged = merge_layers(table(&base_text, base)?, table(&user_text, user)?).to_string();
         // Errors from here on are named after the user layer: the base passed alone, so whatever
         // fails now is something the user layer brought.
-        let params = Self::parse(&merged, user, true)?;
+        let params = Self::parse_file(&merged, user, true)?;
         params.validate(user)?;
         Ok(Some(params))
     }
@@ -2778,48 +2778,58 @@ impl Params {
                 });
             }
         };
-        let params = Self::parse(&text, path, true)?;
+        let params = Self::parse_file(&text, path, true)?;
         params.validate(path)?;
         Ok(params)
     }
 
-    /// Text into `Params`, tolerating keys this build does not know. `path` names the file in
-    /// errors; `warn` is false for a pass whose unknown keys the next pass will report anyway.
-    fn parse(text: &str, path: &Path, warn: bool) -> Result<Self, ParamsError> {
+    /// Text into `Params` for a file at `path`, as [`Params::parse`] does it, the error naming
+    /// `path`. `warn` is false for a pass whose unknown keys the next pass will report anyway.
+    fn parse_file(text: &str, path: &Path, warn: bool) -> Result<Self, ParamsError> {
+        let (params, ignored) = Self::parse(text).map_err(|source| ParamsError::Parse {
+            path: path.display().to_string(),
+            source,
+        })?;
+        if warn && !ignored.is_empty() {
+            tracing::warn!(
+                path = %path.display(),
+                ignored = %ignored.join(", "),
+                "this build has no such keys; they are ignored and their values do nothing"
+            );
+        }
+        Ok(params)
+    }
+
+    /// Parse the text of a `robotd.toml` the way the daemon does, unknown keys dropped (see
+    /// [`without_unknown_keys`]), and name the ones that were. No range checks — that is
+    /// [`Params::load`]'s second half.
+    ///
+    /// **Everything that reads this file goes through here**, not through `toml::from_str`. The
+    /// editor and the pad bindings once parsed strictly, so a key left behind by another branch
+    /// meant a robot that walked fine and a `robotctl configure` that would not open — and a
+    /// `pad.bind` that showed the phone the default bindings rather than the real ones.
+    pub fn parse(text: &str) -> Result<(Self, Vec<String>), toml::de::Error> {
         // Strict first. A file this build fully understands parses exactly as it always has —
         // one pass, serde's own spans, no second guess — and that is the overwhelmingly common
         // case. The lenient path below only ever runs on a file that has already failed.
-        Ok(match toml::from_str::<Params>(text) {
-            Ok(params) => params,
+        match toml::from_str::<Params>(text) {
+            Ok(params) => Ok((params, Vec::new())),
             // Not an unknown-key problem: a syntax error, or a value of the wrong type. The
             // strict error is what gets reported, because it is the one carrying a line and a
             // column.
             Err(source) => {
                 let Some((reparsed, ignored)) = without_unknown_keys(text) else {
-                    return Err(ParamsError::Parse {
-                        path: path.display().to_string(),
-                        source,
-                    });
+                    return Err(source);
                 };
-                if warn {
-                    tracing::warn!(
-                        path = %path.display(),
-                        ignored = %ignored.join(", "),
-                        "this build has no such keys; they are ignored and their values do nothing"
-                    );
-                }
                 // Pruned, and what is left still does not parse — a real error sharing a file
                 // with an inert one. This reports the real one, which costs the position: serde
                 // is now looking at a table rather than at the text. The alternative was worse.
                 // Returning the strict error here would name the key this release just declared
                 // harmless as the reason the daemon will not start, and send whoever reads it to
                 // delete a section that was never the problem.
-                reparsed.map_err(|source| ParamsError::Parse {
-                    path: path.display().to_string(),
-                    source,
-                })?
+                Ok((reparsed?, ignored))
             }
-        })
+        }
     }
 
     /// Reject values that would produce a loop that cannot work, at startup rather than as

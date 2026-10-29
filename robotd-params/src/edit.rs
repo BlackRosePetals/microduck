@@ -95,12 +95,28 @@ pub struct Model {
     /// the editor has closed — reading `pending` there found nothing every time, so nothing was
     /// ever restarted and a `[duck_detector]` change looked like a no-op.
     written: Vec<String>,
+    /// Keys in the file this build does not know — left there by another branch or release.
+    /// The daemon ignores them, so the editor opens anyway and leaves them in the file.
+    ignored: Vec<String>,
+    /// The same, in the base under a user layer — where [`adopt_base_edits`] leaves them.
+    ignored_in_base: Vec<String>,
 }
 
 impl Model {
     /// Every key written this session, in the order it was first written.
     pub fn written(&self) -> &[String] {
         &self.written
+    }
+
+    /// Keys in the file this build has no place for, as [`Params::parse`] named them.
+    pub fn ignored(&self) -> &[String] {
+        &self.ignored
+    }
+
+    /// The base's unknown keys, with the base's path, when the model is over a user layer.
+    pub fn ignored_in_base(&self) -> Option<(&Path, &[String])> {
+        let (base, _) = self.base.as_ref()?;
+        (!self.ignored_in_base.is_empty()).then_some((base.as_path(), &self.ignored_in_base[..]))
     }
 
     /// Load the file — or start from an empty document when there is none, which is a real
@@ -141,13 +157,15 @@ impl Model {
     /// would refuse — because every value this model calls a default comes from it.
     pub fn load_layered(base: &Path, user: &Path) -> Result<Self, String> {
         let base_text = read_or_empty(base)?;
-        let base_params = Params::parse(&base_text, base, false).map_err(|e| e.to_string())?;
+        let (base_params, ignored_in_base) =
+            Params::parse(&base_text).map_err(|e| format!("{}: {e}", base.display()))?;
         let base_table: toml::Table = base_text
             .parse()
             .map_err(|e| format!("{}: {e}", base.display()))?;
         let mut model = Self::from_text(user, &read_or_empty(user)?)?;
         model.defaults = toml::Value::try_from(base_params).expect("Params serializes");
         model.base = Some((base.to_path_buf(), base_table));
+        model.ignored_in_base = ignored_in_base;
         Ok(model)
     }
 
@@ -208,8 +226,8 @@ impl Model {
     /// a temporary file for saying what a case is about. [`Model::load`] is this plus the read.
     pub fn from_text(path: &Path, text: &str) -> Result<Self, String> {
         // The daemon's own parse first: a file robotd would refuse is not a file to edit
-        // blind, and the error names the line.
-        toml::from_str::<Params>(text).map_err(|e| format!("{}: {e}", path.display()))?;
+        // blind, and the error names the line. One it would start on, unknown keys and all, is.
+        let (_, ignored) = Params::parse(text).map_err(|e| format!("{}: {e}", path.display()))?;
         let mut doc: DocumentMut = text
             .parse()
             .map_err(|e| format!("{}: {e}", path.display()))?;
@@ -221,6 +239,8 @@ impl Model {
             defaults: toml::Value::try_from(Params::default()).expect("Params serializes"),
             pending: BTreeMap::new(),
             written: Vec::new(),
+            ignored,
+            ignored_in_base: Vec::new(),
         })
     }
 
@@ -296,7 +316,7 @@ impl Model {
     /// defaults, release-relative paths, the mic's mode-dependent switch. Parsed from the
     /// pending state, so flipping `mode` updates every hint that depends on it.
     fn resolved_hint(&self, key: &str) -> Option<String> {
-        let params: Params = toml::from_str(&self.merged()).ok()?;
+        let (params, _) = Params::parse(&self.merged()).ok()?;
         let policy = params.policy.resolved();
         let path = |p: Option<std::path::PathBuf>| {
             Some(match p {
@@ -777,8 +797,8 @@ fn writable_hint(path: &Path, e: &std::io::Error) -> String {
 /// The pad's button bindings as the daemon resolves them — config over the defaults.
 pub fn pad_bindings(path: &Path) -> Result<crate::PadParams, String> {
     let text = crate::layered_text(path)?;
-    toml::from_str::<Params>(&text)
-        .map(|params| params.pad)
+    Params::parse(&text)
+        .map(|(params, _)| params.pad)
         .map_err(|e| format!("{}: {e}", path.display()))
 }
 
@@ -927,8 +947,8 @@ fn ever_shipped(key: &str, value: &toml::Value) -> bool {
 ///
 /// What counts as an edit: a key this build knows whose value no release's template ever shipped
 /// ([`EVER_SHIPPED`]). `[board] version` is the installer's and the image's, never adopted. A key
-/// this build does not know is left in the base, where the lenient loader already ignores it — it
-/// cannot go in the user layer, which the editor reads strictly. An owner who had typed exactly a
+/// this build does not know is left in the base, where the loader ignores it and the editor names
+/// it: it is the base's to keep or drop, and no value of it could be checked here. An owner who had typed exactly a
 /// shipped value in is not told apart from the template, and their key goes on following the base;
 /// on a robot without slots that changes nothing.
 ///
@@ -1063,7 +1083,7 @@ fn strip_from_base(base: &Path, keys: &[String]) -> Result<(), String> {
     let text = doc.to_string();
     // robotd validates the base on its own before merging, and refuses to start on one that
     // fails: a kept value may have been valid only beside a moved one.
-    Params::parse(&text, base, false)
+    Params::parse_file(&text, base, false)
         .and_then(|params| params.validate(base))
         .map_err(|e| format!("the base without the moved keys would be invalid: {e}"))?;
     let staged = base.with_extension("toml.adopting");
@@ -1343,6 +1363,23 @@ mod tests {
         assert!(!std::fs::read_to_string(&user).unwrap().contains("hz"));
     }
 
+    /// A key another branch left in the base is named too, and against the base: adoption leaves
+    /// unknown keys there, so on a layered robot that is where they are.
+    #[test]
+    fn unknown_keys_in_the_base_are_named_with_the_base() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (base, user) = layered(
+            dir.path(),
+            "[policy]\nmoonwalk = true\n",
+            Some("[kazoo]\nvoice = \"alto\"\n"),
+        );
+        let m = Model::load_layered(&base, &user).expect("opens like robotd starts");
+        assert_eq!(m.ignored(), ["[kazoo]"]);
+        let (path, keys) = m.ignored_in_base().expect("the base's are kept apart");
+        assert_eq!(path, base);
+        assert_eq!(keys, ["policy.moonwalk"]);
+    }
+
     /// The editor's gate is the loader's: a user layer that would be set aside is never written.
     #[test]
     fn a_user_layer_robotd_would_set_aside_is_never_written() {
@@ -1613,6 +1650,33 @@ mod tests {
             "the comments are gone: {} lines",
             text.lines().count()
         );
+    }
+
+    /// A key another branch left behind — a `policy.moonwalk`, a whole `[kazoo]` — does
+    /// not stop the editor opening a file `robotd` itself starts on. The keys are named, an edit
+    /// beside them saves, and they are still in the file for the branch that reads them.
+    #[test]
+    fn keys_from_another_branch_are_ignored_and_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("robotd.toml");
+        std::fs::write(
+            &path,
+            "[policy]\nmode = \"walk\"\nmoonwalk = true\n\n\
+             [kazoo]\nvoice = \"alto\"\n\n[pad]\nx = \"polite-bow\"\n",
+        )
+        .unwrap();
+
+        let mut m = Model::load(&path).expect("opens like robotd starts");
+        assert_eq!(m.ignored(), ["[kazoo]", "policy.moonwalk"]);
+        m.edit(entry("audio.enabled"), "false").expect("edits");
+        m.save().expect("saves");
+
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(written.contains("moonwalk = true"), "{written}");
+        assert!(written.contains("voice = \"alto\""), "{written}");
+        assert!(!Params::load(&path, true).unwrap().audio.enabled);
+        // The bindings robotd serves over `pad.bind` are the file's, not the defaults.
+        assert_eq!(super::pad_bindings(&path).unwrap().x, "polite-bow");
     }
 
     /// The shipped example loads into the editor, and every value it does set explicitly is
