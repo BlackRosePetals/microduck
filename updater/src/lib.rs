@@ -41,6 +41,7 @@ pub mod ipc;
 pub mod journal;
 pub mod manifest;
 pub mod orphan;
+pub mod os;
 pub mod policy;
 pub mod preflight;
 pub mod reconcile;
