@@ -518,7 +518,11 @@ charge. `mediad` and `tofd` report theirs to `robotd` once a minute (`robot.vetb
 `n` on the page writes a dated line in the diary — "reglued the beak", "new feet" — and Enter
 saves it on the robot.
 
-**`s` shares it.** On a robot signed in to Hugging Face (`robotctl account login`), `updaterd`
+**`s` shares it.** It first asks whether to list the duck in the **gallery**, the Space's front page
+(<https://pollen-robotics-microduck-vetbook.hf.space>), where anybody can search ducks by name, sort
+and filter them by their stats, and follow one to its owner's Hugging Face profile: `y` lists it,
+`n` shares without listing, Esc cancels. Each share asks again, and an unlisted share takes a listed
+duck back out. On a robot signed in to Hugging Face (`robotctl account login`), `updaterd`
 publishes the book to a **public** dataset on that account, `<user>/<robot name>-vetbook`, and the
 page shows a link to its card on the `microduck-vetbook` Space, with a QR code to open it on a
 phone. The card is one of eight designs, drawn at random each share, in a palette the duck's name
@@ -574,6 +578,34 @@ The steering binding keeps its default inversion; set `invert = false` to revers
 An invalid edit is logged and the previous mapping stays active.
 The full evaluation order and IMU behavior are in
 [controller configuration](../design/robotd-design.md#42-params).
+
+### Battery and heat test
+
+```
+sudo robotctl endurance
+robotctl endurance status
+sudo robotctl endurance stop
+```
+
+Walks, stands and sits at random, for random lengths, within half a metre of where it started, until
+the battery is empty — and logs the charge, every thermal zone, the CPU clock and throttle, servo
+temperature and current, and odometry every 10 s. It starts in the background as the
+`robotctl-endurance` unit and returns, so you can close the ssh session; `journalctl -u
+robotctl-endurance -f` is the live view. Put the robot on clear floor first, with no pad connected:
+an idle pad sends zero velocities that cancel these.
+
+At 0% `robotd` sits the robot down and powers off by itself; from 2% on the test stops driving so as
+not to fight that, and only logs. Every row is on disk as it is written, so after the reboot the run
+is in `/var/lib/endurance/<hostname>-<time>/` — `samples.csv`, `events.csv`, `meta.json`. Copy it
+off and draw it on your machine:
+
+```
+scp -r microduck@<duck>:/var/lib/endurance/ . && uv run scripts/endurance-plot.py endurance/<run>
+```
+
+`stop` leaves the robot standing. `--dry-run` logs without moving — the idle-drain baseline — and
+`--out` on an existing run directory appends to it, so a restarted test stays one battery curve.
+Walk speed, turn rate, the radius and the activity mix are options; `--help` lists them.
 
 ### Gamepad (`configd`)
 
@@ -655,7 +687,8 @@ nobody steering the head, it glances about every second or few — mostly left a
 and down, the neck leaning and the beak opening a touch with each look, now and then with a curious tilt — and while it
 holds a look its gaze keeps shifting a little around it. It drifts slightly and breathes (a
 millimetre of height, standing only). The longer nothing happens the calmer it gets, and after a
-while it yawns now and then — beak open, head back, silently. It fades in and out, and any stick or
+while it yawns now and then — beak open, head back, silently. It looks around the straight head:
+a head you left turned eases back to the middle as it starts. It fades in and out, and any stick or
 head command takes the head back. In the D-pad's head modes the pad keeps the head, so this only
 happens in move mode. `journalctl -fu robotd` logs each spell starting and stopping. Every number is
 in `[idle]` — `sudo robotctl configure`, then restart `robotd`.

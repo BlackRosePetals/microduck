@@ -49,6 +49,11 @@ ratatui = { version = "0.30.2", default-features = false, features = [
     "layout-cache",
 ] }
 
+# `udp-pad` plays the quack and the wheee on this machine too, in a voice of its own rendered by
+# the robot's synth — the crate the robot renders its bank with, so the two sound like one kind of
+# duck. Pure Rust; the output is per-platform, below.
+sounds = { path = "../sounds" }
+
 # `btleplug` rather than `bluer`, because this runs on a developer's machine: CoreBluetooth on
 # macOS, BlueZ on Linux, WinRT on Windows. `bluer` would make the client Linux-only, which defeats
 # the point of having one.
@@ -90,6 +95,15 @@ tempfile = "3.27.0"
 # what a `cargo install` needs. Not a dependency of ours to call — only its feature matters here.
 [target.'cfg(target_os = "linux")'.dependencies]
 libdbus-sys = { version = "0.2", features = ["vendored"] }
+# The laptop's voice on Linux: libasound opened at run time, never linked. A linked one would be
+# grafted into the wheel, and that copy cannot find the PipeWire or PulseAudio plugin a
+# Debian-family desktop plays through — `src/udp_pad/voice/alsa.rs` has the whole of it.
+libloading = "0.9"
+
+# The laptop's voice elsewhere: CoreAudio and WASAPI, which every such machine has. Not on Linux,
+# where `cpal` links libasound unconditionally.
+[target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
+cpal = "0.18"
 
 # `advwatch` measures how often an advertisement actually arrives. It lives here rather than with
 # `btd` for the same reason the client does: it is a scanner, and scanners run on laptops.

@@ -228,6 +228,12 @@ impl Receiver {
         self.peer
     }
 
+    /// Whether the client plays the triggers' sounds itself (`wire::SENDER_SOUNDS`), as its
+    /// latest datagram says.
+    pub fn sender_sounds(&self) -> bool {
+        self.latest.sender_sounds()
+    }
+
     /// Button bits this build does not know, OR-ed over everything accepted — for one log line.
     pub fn reserved_bits_seen(&self) -> u16 {
         self.reserved_seen

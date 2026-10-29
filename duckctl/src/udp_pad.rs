@@ -8,6 +8,9 @@
 //!
 //! Which pad is the one sent is `--pad N`, or else the first pad a button is pressed on, so that
 //! several instances on one laptop each drive their own duck with their own pad (`claim.rs`).
+//!
+//! The quack and the wheee play from this laptop, in a voice of its own (`voice.rs`), and the
+//! duck only opens its mouth for them (`wire::SENDER_SOUNDS`) unless `--robot-sound-on`.
 
 use std::hash::{BuildHasher, Hasher};
 use std::net::UdpSocket;
@@ -21,6 +24,7 @@ use pad_map::wire::{DEFAULT_PORT, Packet, RobotReport, Status};
 mod claim;
 mod link;
 mod panel;
+mod voice;
 
 use claim::Claims;
 use link::{Link, State};
@@ -211,6 +215,23 @@ pub enum Pick {
     Press,
 }
 
+/// Whether this laptop plays the quack and the wheee too, and in which voice: `None` is this
+/// machine's own, kept between runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Sound {
+    Mute,
+    Voice(Option<u32>),
+}
+
+/// `--mute` and `--voice`, given or not.
+pub fn sound(mute: bool, voice: Option<u32>) -> Sound {
+    if mute {
+        Sound::Mute
+    } else {
+        Sound::Voice(voice)
+    }
+}
+
 /// `--pad`, given or not.
 pub fn pick(pad: Option<u64>) -> Pick {
     pad.map_or(Pick::Press, |n| Pick::Nth(n as usize))
@@ -326,6 +347,8 @@ pub fn run(
     hz: u32,
     invert_y: bool,
     pick: Pick,
+    sound: Sound,
+    robot_sound: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut gilrs = Gilrs::new().map_err(|e| format!("no gamepad subsystem: {e}"))?;
     let mut claims =
@@ -365,6 +388,39 @@ pub fn run(
         &mut screen,
         format!("sending {which} to {to}, at most {hz} Hz — Ctrl-C to stop"),
     );
+    let voice = match sound {
+        Sound::Mute => None,
+        Sound::Voice(seed) => {
+            let seed = seed.unwrap_or_else(voice::seed);
+            match voice::Voice::open(seed) {
+                Ok(v) => {
+                    say(
+                        &mut screen,
+                        format!(
+                            "quacking here too, in voice {seed} — --voice N for another, --mute for none"
+                        ),
+                    );
+                    Some(v)
+                }
+                Err(e) => {
+                    say(&mut screen, format!("no sound on this machine: {e}"));
+                    None
+                }
+            }
+        }
+    };
+    if voice.is_none() && !robot_sound {
+        say(
+            &mut screen,
+            "the triggers make no sound anywhere — --robot-sound-on for the duck's".to_owned(),
+        );
+    }
+    let flags = if robot_sound {
+        0
+    } else {
+        pad_map::wire::SENDER_SOUNDS
+    };
+    let mut triggers = voice::Triggers::default();
 
     loop {
         if screen.as_mut().is_some_and(Screen::quit) {
@@ -467,6 +523,13 @@ pub fn run(
             } else {
                 1.0
             };
+            let (lt, rt) = (
+                trigger(Button::LeftTrigger2),
+                trigger(Button::RightTrigger2),
+            );
+            if let Some(v) = &voice {
+                v.cue(triggers.read(lt, rt));
+            }
             let mut packet = Packet::from_axes(
                 0,
                 now.duration_since(started).as_millis() as u32,
@@ -476,10 +539,7 @@ pub fn run(
                     f64::from(pad.value(Axis::RightStickX)),
                     y * f64::from(pad.value(Axis::RightStickY)),
                 ],
-                [
-                    trigger(Button::LeftTrigger2),
-                    trigger(Button::RightTrigger2),
-                ],
+                [lt, rt],
                 held,
             );
             changed = last.is_none_or(|l| l.axes != packet.axes || l.buttons != packet.buttons);
@@ -487,6 +547,7 @@ pub fn run(
             if pacer.due(now) {
                 seq = seq.wrapping_add(1);
                 packet.seq = seq;
+                packet.flags = flags;
                 // A refused send (no route yet, the duck rebooting, netpadd not running) is not
                 // fatal: the next one tries again. Said once, not per packet — see `Notices`.
                 let result = socket.send(&packet.encode());
@@ -510,6 +571,10 @@ pub fn run(
         } else {
             last = None;
             link.paused();
+            // A pad unplugged mid-ride lets go of it.
+            if let Some(v) = &voice {
+                v.cue(triggers.read(0.0, 0.0));
+            }
         }
         rate.tick(now, sent_now);
 

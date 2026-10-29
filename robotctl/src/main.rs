@@ -45,6 +45,7 @@ mod camera;
 mod cells;
 mod configure;
 mod duck;
+mod endurance;
 mod frame;
 mod imu_view;
 mod led;
@@ -417,6 +418,21 @@ enum Namespace {
         boot: i32,
         #[arg(long)]
         json: bool,
+    },
+
+    /// Battery and heat test: walk, stand and sit at random near the start until the battery is
+    /// empty, logging charge, board temperatures and throttling to disk.
+    ///
+    /// Starts in the background (a transient systemd unit) and returns, so you can disconnect.
+    /// `robotd` sits the robot down and powers off at 0%; the log in /var/lib/endurance survives
+    /// that, and `scripts/endurance-plot.py` draws it. Needs root; no pad connected, since an
+    /// idle pad sends zero velocities that fight this one.
+    #[command(args_conflicts_with_subcommands = true)]
+    Endurance {
+        #[command(subcommand)]
+        command: Option<endurance::EnduranceCommand>,
+        #[command(flatten)]
+        args: endurance::EnduranceArgs,
     },
 
     /// Print a shell completion script on stdout.
@@ -5364,6 +5380,9 @@ fn run(cli: Cli) -> Result<(), Failure> {
         }
         Namespace::Robot { command } => {
             return run_robot(&cli.robot_socket, command);
+        }
+        Namespace::Endurance { command, args } => {
+            return endurance::run(&cli.robot_socket, command, args);
         }
         Namespace::Quack => {
             return run_quack(&cli.robot_socket);

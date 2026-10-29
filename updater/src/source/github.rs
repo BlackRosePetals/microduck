@@ -1,10 +1,15 @@
 //! GitHub Releases source — the daemon channel.
 //!
-//! "Latest" is resolved by listing releases and taking the highest **semver** among
-//! tags matching `tag_prefix`, not by using `/releases/latest`: that endpoint is
-//! repo-wide, so it breaks the moment a second channel shares the repo, and it
-//! answers "most recently published" rather than "highest version" — which differ as
-//! soon as you publish a patch to an older line.
+//! "Latest" is the highest **semver** among tags matching `tag_prefix` that has a published
+//! release, not `/releases/latest`: that endpoint is repo-wide, so it breaks the moment a
+//! second channel shares the repo, and it answers "most recently published" rather than
+//! "highest version" — which differ as soon as you publish a patch to an older line.
+//!
+//! The candidates come from the channel's **tags**, not from listing releases. The release
+//! listing carries every dev build and every asset of each, so its size grows with the whole
+//! repository's activity and nothing on the robot controls it — at 67 releases its first page
+//! passed the 1 MiB metadata cap and every robot stopped updating (#421). The tag list is
+//! filtered by prefix on GitHub's side and costs ~440 bytes a release of *this* channel.
 //! See `docs/design/updater-design.md` §6.
 //!
 //! Nothing here is trusted. Tags, release names and asset URLs are all attacker- or
@@ -19,10 +24,15 @@ use crate::Error;
 use crate::manifest::Manifest;
 use crate::source::{FetchedArtifact, ProgressSink, SignedBytes, Source, http};
 
-/// Releases fetched per page when scanning for the newest tag. One page is plenty
-/// for any real channel; further pages are fetched only if a page comes back full.
-const PER_PAGE: usize = 100;
-const MAX_PAGES: usize = 5;
+/// Where the GitHub API lives. A field rather than a literal only so tests can serve it.
+const API_BASE: &str = "https://api.github.com";
+
+/// Tags tried, newest first, before giving up on finding one with a published release.
+///
+/// A tag without a usable release is normal but rare: a release still building, a tag pushed by
+/// hand (`daemon-v0.5.0` has none), a draft. Each one skipped costs a request against an
+/// unauthenticated limit of 60 an hour, so a run of them is a fault to report, not to walk.
+const MAX_CANDIDATES: usize = 5;
 
 /// The signature that accompanies every signed file.
 const SIG_SUFFIX: &str = ".minisig";
@@ -31,6 +41,7 @@ const SIG_SUFFIX: &str = ".minisig";
 const OCTET_STREAM: &str = "application/octet-stream";
 
 pub struct GithubReleases {
+    api_base: String,
     repo: String,
     tag_prefix: String,
     manifest_asset: String,
@@ -54,6 +65,14 @@ struct Release {
     assets: Vec<Asset>,
 }
 
+/// One entry of `git/matching-refs/tags/<prefix>`.
+#[derive(Debug, Deserialize)]
+struct TagRef {
+    /// `refs/tags/<tag>`.
+    #[serde(rename = "ref")]
+    git_ref: String,
+}
+
 #[derive(Debug, Deserialize)]
 struct Asset {
     name: String,
@@ -75,6 +94,7 @@ impl GithubReleases {
         staging_tag_prefix: String,
     ) -> Self {
         Self {
+            api_base: API_BASE.to_owned(),
             repo,
             tag_prefix,
             ref_tag_prefix,
@@ -114,26 +134,41 @@ impl GithubReleases {
     /// every time. The second request costs nothing on a release that really is empty, and it
     /// is what makes [`Error::ReleaseNotReady`] mean what it says.
     async fn release_for_tag(&self, tag: &str) -> Result<Release, Error> {
-        let url = format!(
-            "https://api.github.com/repos/{}/releases/tags/{tag}",
-            self.repo
-        );
-        let release = self.release_at(&url, tag).await?;
+        self.release_if_any(tag).await?.ok_or_else(|| {
+            Error::Network(format!(
+                "no release for tag {tag} in {} (wrong tag? or a private repo — set GITHUB_TOKEN?)",
+                self.repo
+            ))
+        })
+    }
+
+    /// [`Self::release_for_tag`], with "this tag has no release" as `None`.
+    async fn release_if_any(&self, tag: &str) -> Result<Option<Release>, Error> {
+        let url = format!("{}/repos/{}/releases/tags/{tag}", self.api_base, self.repo);
+        let Some(release) = self.release_at(&url, tag).await? else {
+            return Ok(None);
+        };
         if !release.assets.is_empty() {
-            return Ok(release);
+            return Ok(Some(release));
         }
 
         let url = format!(
-            "https://api.github.com/repos/{}/releases/{}",
-            self.repo, release.id
+            "{}/repos/{}/releases/{}",
+            self.api_base, self.repo, release.id
         );
         tracing::debug!(%tag, id = release.id, "tag lookup listed no assets; asking by id");
         self.release_at(&url, tag).await
     }
 
-    async fn release_at(&self, url: &str, tag: &str) -> Result<Release, Error> {
-        let bytes = http::get_bytes(&self.client, url, Some("application/vnd.github+json")).await?;
+    async fn release_at(&self, url: &str, tag: &str) -> Result<Option<Release>, Error> {
+        let Some(bytes) =
+            http::get_bytes_if_found(&self.client, url, Some("application/vnd.github+json"))
+                .await?
+        else {
+            return Ok(None);
+        };
         serde_json::from_slice(&bytes)
+            .map(Some)
             .map_err(|e| Error::Network(format!("parsing release {tag}: {e}")))
     }
 
@@ -147,7 +182,7 @@ impl GithubReleases {
     /// semver prerelease component — because dev builds (`0.2.0-dev.5.abc1234`) must
     /// never become `latest` for the fleet, and relying on someone remembering a
     /// checkbox is not a safeguard.
-    async fn newest_version(&self) -> Result<semver::Version, Error> {
+    async fn newest_release(&self) -> Result<Release, Error> {
         self.newest_under(&self.tag_prefix, false).await
     }
 
@@ -157,11 +192,16 @@ impl GithubReleases {
     /// version they will be promoted under (`0.3.0`), while dev builds carry `0.3.0-dev.17.abc`
     /// and live under a third prefix. So the two exclusions in [`Self::newest_under`] are not
     /// redundant here — dropping one still excludes branch builds, which is the point.
-    async fn newest_staging_version(&self) -> Result<semver::Version, Error> {
+    async fn newest_staging_release(&self) -> Result<Release, Error> {
         self.newest_under(&self.staging_tag_prefix, true).await
     }
 
-    /// Highest version among tags carrying `prefix`.
+    /// The release of the highest version among tags carrying `prefix`.
+    ///
+    /// Versions come from the tags, newest first; the first whose release exists, is not a
+    /// draft and carries the right prerelease flag is the answer. That is the same choice the
+    /// release listing gave — a tag with no release never appeared in it — made without
+    /// fetching anyone else's releases.
     ///
     /// `allow_flagged_prerelease` is the whole difference between the stable channel and the
     /// staging one, and it is a parameter rather than a field so that the call site — one of
@@ -170,45 +210,45 @@ impl GithubReleases {
         &self,
         prefix: &str,
         allow_flagged_prerelease: bool,
-    ) -> Result<semver::Version, Error> {
-        let mut best: Option<semver::Version> = None;
+    ) -> Result<Release, Error> {
+        // Not paginated: GitHub returns every match in one answer.
+        let url = format!(
+            "{}/repos/{}/git/matching-refs/tags/{prefix}",
+            self.api_base, self.repo
+        );
+        let bytes =
+            http::get_bytes(&self.client, &url, Some("application/vnd.github+json")).await?;
+        let refs: Vec<TagRef> = serde_json::from_slice(&bytes)
+            .map_err(|e| Error::Network(format!("parsing tags: {e}")))?;
 
-        for page in 1..=MAX_PAGES {
-            let url = format!(
-                "https://api.github.com/repos/{}/releases?per_page={PER_PAGE}&page={page}",
-                self.repo
-            );
-            let bytes =
-                http::get_bytes(&self.client, &url, Some("application/vnd.github+json")).await?;
-            let releases: Vec<Release> = serde_json::from_slice(&bytes)
-                .map_err(|e| Error::Network(format!("parsing releases: {e}")))?;
-
-            let count = releases.len();
-            for release in releases {
-                if release.draft || (release.prerelease && !allow_flagged_prerelease) {
-                    continue;
-                }
-                if let Some(version) = version_under(prefix, &release.tag_name)
-                    // A semver prerelease is a dev build, whatever the release was flagged as.
-                    && version.pre.is_empty()
-                    && best.as_ref().is_none_or(|b| version > *b)
-                {
-                    best = Some(version);
-                }
-            }
-
-            // A short page is the last page.
-            if count < PER_PAGE {
-                break;
-            }
-        }
-
-        best.ok_or_else(|| {
-            Error::Network(format!(
+        let candidates = newest_first(prefix, refs.iter().map(|r| r.git_ref.as_str()));
+        if candidates.is_empty() {
+            return Err(Error::Network(format!(
                 "no releases in {} with tag prefix {prefix:?}",
                 self.repo
-            ))
-        })
+            )));
+        }
+
+        let mut skipped = Vec::new();
+        for version in candidates.into_iter().take(MAX_CANDIDATES) {
+            let tag = format!("{prefix}{version}");
+            match self.release_if_any(&tag).await? {
+                Some(release)
+                    if !release.draft && (allow_flagged_prerelease || !release.prerelease) =>
+                {
+                    return Ok(release);
+                }
+                Some(_) => skipped.push(format!("{tag} (draft or prerelease)")),
+                None => skipped.push(format!("{tag} (no release)")),
+            }
+            tracing::debug!(%tag, "newest tag has no usable release; trying the one below");
+        }
+
+        Err(Error::Network(format!(
+            "no usable release among the newest {prefix:?} tags in {}: {}",
+            self.repo,
+            skipped.join(", ")
+        )))
     }
 
     /// The API download URL for a named asset. Pair it with [`OCTET_STREAM`].
@@ -271,10 +311,13 @@ impl GithubReleases {
 
     async fn signed_manifest(&self, tag: &str) -> Result<SignedBytes<Manifest>, Error> {
         let release = self.release_for_tag(tag).await?;
+        self.signed_manifest_of(&release).await
+    }
 
-        let manifest_url = self.asset_url(&release, &self.manifest_asset)?;
+    async fn signed_manifest_of(&self, release: &Release) -> Result<SignedBytes<Manifest>, Error> {
+        let manifest_url = self.asset_url(release, &self.manifest_asset)?;
         let sig_name = format!("{}{SIG_SUFFIX}", self.manifest_asset);
-        let sig_url = self.asset_url(&release, &sig_name)?;
+        let sig_url = self.asset_url(release, &sig_name)?;
 
         let bytes = http::get_bytes(&self.client, &manifest_url, Some(OCTET_STREAM)).await?;
         let signature = http::get_bytes(&self.client, &sig_url, Some(OCTET_STREAM)).await?;
@@ -295,10 +338,9 @@ impl GithubReleases {
 #[async_trait::async_trait]
 impl Source for GithubReleases {
     async fn latest_manifest(&self) -> Result<SignedBytes<Manifest>, Error> {
-        let version = self.newest_version().await?;
-        let tag = self.tag_for(&version);
-        tracing::debug!(repo = %self.repo, %tag, "resolved latest");
-        self.signed_manifest(&tag).await
+        let release = self.newest_release().await?;
+        tracing::debug!(repo = %self.repo, tag = %release.tag_name, "resolved latest");
+        self.signed_manifest_of(&release).await
     }
 
     async fn manifest_for(
@@ -315,10 +357,9 @@ impl Source for GithubReleases {
     }
 
     async fn staging_manifest(&self) -> Result<SignedBytes<Manifest>, Error> {
-        let version = self.newest_staging_version().await?;
-        let tag = self.staging_tag_for(&version);
-        tracing::debug!(repo = %self.repo, %tag, "resolved newest candidate");
-        self.signed_manifest(&tag).await
+        let release = self.newest_staging_release().await?;
+        tracing::debug!(repo = %self.repo, tag = %release.tag_name, "resolved newest candidate");
+        self.signed_manifest_of(&release).await
     }
 
     async fn staging_manifest_for(
@@ -377,6 +418,21 @@ fn version_under(prefix: &str, tag: &str) -> Option<semver::Version> {
     semver::Version::parse(tag.strip_prefix(prefix)?).ok()
 }
 
+/// The release versions among `refs/tags/...` names, highest first.
+///
+/// A semver prerelease is a dev build, whatever its tag prefix, and is never a candidate for
+/// either channel.
+fn newest_first<'a>(prefix: &str, refs: impl Iterator<Item = &'a str>) -> Vec<semver::Version> {
+    let mut versions: Vec<_> = refs
+        .filter_map(|r| r.strip_prefix("refs/tags/"))
+        .filter_map(|tag| version_under(prefix, tag))
+        .filter(|v| v.pre.is_empty())
+        .collect();
+    versions.sort_unstable_by(|a, b| b.cmp(a));
+    versions.dedup();
+    versions
+}
+
 /// Extract a filename from a URL, refusing anything that could escape `dest_dir`.
 ///
 /// A manifest is signed, but this runs *before* verification, and a compromised
@@ -413,6 +469,160 @@ mod tests {
             "daemon-dev-".into(),
             "daemon-staging-v".into(),
         )
+    }
+
+    /// The candidates are this channel's release versions, highest first — by semver, not by
+    /// the order GitHub lists refs in, which is lexical (`0.10.0` before `0.9.3`).
+    #[test]
+    fn candidates_are_release_versions_highest_first() {
+        let refs = [
+            "refs/tags/daemon-v0.10.0",
+            "refs/tags/daemon-v0.17.4",
+            "refs/tags/daemon-v0.9.3",
+            "refs/tags/daemon-v0.18.0-dev.3.abc1234",
+            "refs/tags/daemon-vnot-a-version",
+        ];
+        let got: Vec<String> = newest_first("daemon-v", refs.into_iter())
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(got, ["0.17.4", "0.10.0", "0.9.3"]);
+    }
+
+    /// A fake GitHub serving `tags` as the channel's tag refs and `releases` by tag.
+    async fn fake_github(
+        tags: &'static [&'static str],
+        releases: Vec<(&'static str, serde_json::Value)>,
+    ) -> GithubReleases {
+        use axum::extract::Path;
+        use axum::http::StatusCode;
+        use axum::routing::get;
+
+        let releases: std::collections::HashMap<_, _> = releases.into_iter().collect();
+        let app = axum::Router::new()
+            .route(
+                "/repos/ORG/robot-daemon/git/matching-refs/tags/{prefix}",
+                get(move |Path(prefix): Path<String>| async move {
+                    let refs: Vec<_> = tags
+                        .iter()
+                        .filter(|t| t.starts_with(&prefix))
+                        .map(|t| serde_json::json!({ "ref": format!("refs/tags/{t}") }))
+                        .collect();
+                    axum::Json(refs)
+                }),
+            )
+            .route(
+                "/repos/ORG/robot-daemon/releases/tags/{tag}",
+                get(move |Path(tag): Path<String>| async move {
+                    match releases.get(tag.as_str()) {
+                        Some(r) => Ok(axum::Json(r.clone())),
+                        None => Err(StatusCode::NOT_FOUND),
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await });
+
+        let mut s = source();
+        s.api_base = format!("http://{addr}");
+        s
+    }
+
+    fn release(tag: &str, prerelease: bool, draft: bool) -> serde_json::Value {
+        serde_json::json!({
+            "id": 1, "tag_name": tag, "prerelease": prerelease, "draft": draft,
+            "assets": [{ "name": "manifest.json", "url": "https://example/a/1" }],
+        })
+    }
+
+    /// The newest tag wins when it has a release — even listed after older ones.
+    #[tokio::test]
+    async fn latest_is_the_highest_tag_with_a_release() {
+        let gh = fake_github(
+            &[
+                "daemon-v0.10.0",
+                "daemon-v0.17.4",
+                "daemon-v0.9.3",
+                "daemon-dev-main",
+            ],
+            vec![
+                ("daemon-v0.10.0", release("daemon-v0.10.0", false, false)),
+                ("daemon-v0.17.4", release("daemon-v0.17.4", false, false)),
+                ("daemon-v0.9.3", release("daemon-v0.9.3", false, false)),
+            ],
+        )
+        .await;
+        assert_eq!(
+            gh.newest_release().await.unwrap().tag_name,
+            "daemon-v0.17.4"
+        );
+    }
+
+    /// **A tag without a usable release is passed over, not fatal.** A release is built after
+    /// its tag is pushed, so for its whole build the newest tag has none, and a hand-pushed tag
+    /// never gets one. The fleet must keep seeing the release below rather than fail its check.
+    #[tokio::test]
+    async fn tags_without_a_usable_release_fall_through_to_the_next() {
+        let gh = fake_github(
+            &[
+                "daemon-v0.18.0",
+                "daemon-v0.17.5",
+                "daemon-v0.17.6",
+                "daemon-v0.17.4",
+            ],
+            vec![
+                // 0.18.0 is still building: tag, no release.
+                ("daemon-v0.17.6", release("daemon-v0.17.6", false, true)),
+                ("daemon-v0.17.5", release("daemon-v0.17.5", true, false)),
+                ("daemon-v0.17.4", release("daemon-v0.17.4", false, false)),
+            ],
+        )
+        .await;
+        assert_eq!(
+            gh.newest_release().await.unwrap().tag_name,
+            "daemon-v0.17.4"
+        );
+    }
+
+    /// Staging allows the prerelease flag; stable tags never leak into it.
+    #[tokio::test]
+    async fn staging_reads_only_staging_tags() {
+        let gh = fake_github(
+            &["daemon-v0.18.0", "daemon-staging-v0.17.5"],
+            vec![
+                ("daemon-v0.18.0", release("daemon-v0.18.0", false, false)),
+                (
+                    "daemon-staging-v0.17.5",
+                    release("daemon-staging-v0.17.5", true, false),
+                ),
+            ],
+        )
+        .await;
+        assert_eq!(
+            gh.newest_staging_release().await.unwrap().tag_name,
+            "daemon-staging-v0.17.5"
+        );
+    }
+
+    /// A run of unusable tags is reported, naming each, instead of walked to the bottom.
+    #[tokio::test]
+    async fn a_run_of_releaseless_tags_is_reported() {
+        let gh = fake_github(
+            &[
+                "daemon-v0.1.0",
+                "daemon-v0.2.0",
+                "daemon-v0.3.0",
+                "daemon-v0.4.0",
+                "daemon-v0.5.0",
+                "daemon-v0.6.0",
+            ],
+            vec![("daemon-v0.1.0", release("daemon-v0.1.0", false, false))],
+        )
+        .await;
+        let err = gh.newest_release().await.unwrap_err().to_string();
+        assert!(err.contains("daemon-v0.6.0 (no release)"), "{err}");
+        assert!(!err.contains("daemon-v0.1.0"), "{err}");
     }
 
     #[test]

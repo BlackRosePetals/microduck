@@ -92,6 +92,20 @@ pub async fn get_bytes(
     url: &str,
     accept: Option<&str>,
 ) -> Result<Vec<u8>, Error> {
+    get_bytes_if_found(client, url, accept)
+        .await?
+        .ok_or_else(|| Error::Network(describe_failure(url, reqwest::StatusCode::NOT_FOUND)))
+}
+
+/// [`get_bytes`], with a 404 answered as `None` rather than an error.
+///
+/// For a lookup where absence is an expected answer — a tag with no release — and the caller
+/// moves on to the next candidate instead of failing.
+pub async fn get_bytes_if_found(
+    client: &reqwest::Client,
+    url: &str,
+    accept: Option<&str>,
+) -> Result<Option<Vec<u8>>, Error> {
     let mut request = client.get(url).timeout(METADATA_TIMEOUT);
     if let Some(accept) = accept {
         request = request.header(reqwest::header::ACCEPT, accept);
@@ -109,6 +123,9 @@ pub async fn get_bytes(
         .map_err(|e| Error::Network(format!("GET {url}: {}", describe_error(e))))?;
 
     let status = response.status();
+    if status == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
     if !status.is_success() {
         return Err(Error::Network(describe_failure(url, status)));
     }
@@ -129,7 +146,7 @@ pub async fn get_bytes(
     if bytes.len() as u64 > MAX_METADATA_BYTES {
         return Err(Error::Network(format!("GET {url}: response too large")));
     }
-    Ok(bytes.to_vec())
+    Ok(Some(bytes.to_vec()))
 }
 
 /// Stream a URL to `dest`, reporting progress and resuming across retries.

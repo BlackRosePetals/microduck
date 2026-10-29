@@ -18,7 +18,7 @@ pub use buttons::Buttons;
 pub use continuous::{Continuous, HEARTBEAT};
 pub use hold::{HoldAction, HoldButton};
 pub use loss::{PadLoss, PadLossAction};
-pub use mapper::{Config, Mapper, Out, PadFrame, refusal, report};
+pub use mapper::{Config, Mapper, Out, PadFrame, SOUND_THRESHOLD, refusal, report};
 
 /// Whether `[netpad] enabled` hands the pad to `netpadd`. The one question both units'
 /// `ExecCondition=` ask.

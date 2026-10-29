@@ -210,7 +210,7 @@ fn permits(call: &proto::Call) -> bool {
         // Not sharing, though. A share publishes under the owner's name, in public, and §4 — no
         // authorisation on this transport — would let any LAN peer do that. The phone over BLE
         // and `robotctl` on the robot are where a share comes from.
-        VetbookShare => false,
+        VetbookShare(_) => false,
         // Daemon-to-daemon plumbing, like the chorale's: not a client surface.
         RobotVetbookTally(_) => false,
 

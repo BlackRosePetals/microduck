@@ -470,7 +470,14 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// laser sweep, nearest object — merged into the vet book by `robotd`, which owns it. The book
 /// gains three maps for them ([`vetbook::Life::tallies`], `highs`, `lows`), additive: an older
 /// book loads with them empty. A new route: a `robotd` predating it answers METHOD_NOT_FOUND.
-pub const API_VERSION: u32 = 44;
+///
+/// # v45 — the vet book gallery
+///
+/// [`VetbookShareParams::listed`]: a share can ask to be listed in the `microduck-vetbook` Space's
+/// gallery, where anybody can browse, search and sort the ducks whose owners said yes. Additive:
+/// absent, or sent to an `updaterd` predating it, the book is shared unlisted — the card's link
+/// works as before and the duck stays out of the gallery.
+pub const API_VERSION: u32 = 45;
 
 /// The observation width every policy this robot family runs is built against.
 ///
@@ -1163,7 +1170,7 @@ pub enum Call {
     /// Forget the account; see [`method::ACCOUNT_LOGOUT`].
     AccountLogout,
     /// Publish the vet book; see [`method::VETBOOK_SHARE`].
-    VetbookShare,
+    VetbookShare(VetbookShareParams),
     RobotSubscribe(SubscribeParams),
     // ── net.* ────────────────────────────────────────────────────────────────
     NetStatus,
@@ -1319,7 +1326,7 @@ impl Call {
             Call::AccountLogin(_) => method::ACCOUNT_LOGIN,
             Call::AccountStatus => method::ACCOUNT_STATUS,
             Call::AccountLogout => method::ACCOUNT_LOGOUT,
-            Call::VetbookShare => method::VETBOOK_SHARE,
+            Call::VetbookShare(_) => method::VETBOOK_SHARE,
             Call::RobotSubscribe(_) => method::ROBOT_SUBSCRIBE,
             Call::NetStatus => method::NET_STATUS,
             Call::NetScan => method::NET_SCAN,
@@ -1462,7 +1469,7 @@ impl Call {
             Call::AccountStatus | Call::AccountLogout => (Updater, Prompt),
             // Three or four round trips to Hugging Face: a repo create and a commit, plus a read
             // of the book from `robotd` and of the name from `configd`.
-            Call::VetbookShare => (Updater, Slow),
+            Call::VetbookShare(_) => (Updater, Slow),
             // Owns its connection until the peer goes away and never reads another request.
             Call::Subscribe => (Updater, Stream),
 
@@ -1610,6 +1617,7 @@ impl Call {
             Call::PolicyFetch(p) => encode(p),
             Call::PolicySearch(p) => encode(p),
             Call::AccountLogin(p) => encode(p),
+            Call::VetbookShare(p) => encode(p),
             Call::RobotSound(p) => encode(p),
             Call::RobotFlashlight(p) => encode(p),
             Call::RobotVetbookNote(p) => encode(p),
@@ -1649,7 +1657,6 @@ impl Call {
             | Call::DetectorCheck
             | Call::AccountStatus
             | Call::AccountLogout
-            | Call::VetbookShare
             | Call::RobotMode => Value::Object(serde_json::Map::new()),
             Call::NetStatus
             | Call::NetScan
@@ -1733,7 +1740,12 @@ impl Call {
             method::ACCOUNT_LOGIN => Call::AccountLogin(decode(params)?),
             method::ACCOUNT_STATUS => Call::AccountStatus,
             method::ACCOUNT_LOGOUT => Call::AccountLogout,
-            method::VETBOOK_SHARE => Call::VetbookShare,
+            // Took no parameters before v45, so `null` and an absent member still mean the
+            // default share — unlisted — rather than a refusal.
+            method::VETBOOK_SHARE => Call::VetbookShare(match params {
+                None | Some(Value::Null) => VetbookShareParams::default(),
+                params => decode(params)?,
+            }),
             method::ROBOT_SUBSCRIBE => Call::RobotSubscribe(decode(params)?),
             method::NET_STATUS => Call::NetStatus,
             method::NET_SCAN => Call::NetScan,
@@ -1914,7 +1926,7 @@ pub mod test_support {
             Call::AccountLogin(AccountLoginParams { force: false }),
             Call::AccountStatus,
             Call::AccountLogout,
-            Call::VetbookShare,
+            Call::VetbookShare(VetbookShareParams { listed: true }),
             Call::RobotLoadPolicy(LoadPolicyParams {
                 slot: Some("walk".into()),
                 path: Some("/var/lib/robot/policies/bouncy.onnx".into()),
@@ -2861,6 +2873,17 @@ pub struct Account {
     pub refreshable: bool,
 }
 
+/// What to pass [`Call::VetbookShare`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct VetbookShareParams {
+    /// List the duck in the Space's gallery, where anybody can find it by name and sort it by its
+    /// stats. The book is public either way — the card's link needs it to be — but unlisted, only
+    /// somebody given the link finds it. Each share decides again: sharing unlisted takes a listed
+    /// duck back out.
+    pub listed: bool,
+}
+
 /// Answer to [`Call::VetbookShare`]: where the book went, and the link to show people.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -2875,6 +2898,9 @@ pub struct VetbookShareResult {
     /// Which of the cards this share drew, as the Space names it: `notebook`, `purikura`,
     /// `profile`, `receipt`, `passport`, `gameboy`, `polaroid` or `fifa`.
     pub card: String,
+    /// Whether the duck is in the gallery after this share. `false` from an `updaterd` predating
+    /// v45, which never lists.
+    pub listed: bool,
 }
 
 /// Answer to [`Call::AccountLogout`].

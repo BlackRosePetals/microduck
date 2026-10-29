@@ -705,10 +705,12 @@ impl Server {
             },
             // No engine lock, like the account: it reads two daemons and talks to the Hub, and
             // touches nothing an update owns.
-            Call::VetbookShare => match crate::vetbook::share(&self.account, &self.vetbook).await {
-                Ok(result) => Response::ok(Some(id), &result),
-                Err(e) => Response::err(Some(id), e.to_rpc_error()),
-            },
+            Call::VetbookShare(params) => {
+                match crate::vetbook::share(&self.account, &self.vetbook, &params).await {
+                    Ok(result) => Response::ok(Some(id), &result),
+                    Err(e) => Response::err(Some(id), e.to_rpc_error()),
+                }
+            }
 
             // Read-only and no engine lock: asking the Hub what exists changes nothing here.
             Call::PolicySearch(params) => match crate::policy::search(&params.query).await {

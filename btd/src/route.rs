@@ -421,7 +421,7 @@ fn permits(call: &proto::Call) -> bool {
         // Sharing the vet book is the phone's job more than anyone's: the share sheet that posts
         // the card is on the phone. PIN-bonded and in the room, like the login it depends on, and
         // the reply is a link and a dataset name — a few hundred bytes.
-        VetbookShare => true,
+        VetbookShare(_) => true,
         // Daemon-to-daemon: how `mediad` and `tofd` report to the book. Nothing a phone sends.
         RobotVetbookTally(_) => false,
 

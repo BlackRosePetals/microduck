@@ -296,6 +296,11 @@ pub const REGISTRY: &[Entry] = &[
         "How long the fall verdict holds before the gains drop",
     ),
     entry(
+        "safety.limp_fall_arm_ms",
+        Kind::Integer,
+        "How long the robot must stand before a fall can fire",
+    ),
+    entry(
         "safety.limp_fall_still_rate",
         Kind::Float,
         "Angular rate below which the robot counts as landed, rad/s",

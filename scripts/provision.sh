@@ -168,6 +168,18 @@ LOG="${STATE_DIR}/provision.log"
 UNIT=/etc/systemd/system/robot-provision.service
 UNIT_NAME=robot-provision.service
 
+# How a run started by `provision-board.sh` ended, for it to read once ssh returns:
+# `<run id> rebooting`, `<run id> done`, or `<run id> ended <status>`. ssh cannot say on its own —
+# a run that reboots drops the connection, so its exit status is ignored — and without this the
+# launcher assumed every run rebooted into an unattended phase 2 and went to read its log. A
+# re-run on a board whose phase 1 had already run does phase 2 right here instead, so that log
+# was the *previous* attempt's, and its old failure was shown as today's result (2026-10-17).
+#
+# Keyed by the launcher's run id, so an outcome left by an earlier run never answers for this one.
+OUTCOME="${STATE_DIR}/provision.outcome"
+RUN_ID="${DUCK_RUN_ID:-}"
+OUTCOME_SAID=""
+
 # Set when systemd resumed us rather than a human. Changes two things: output goes to $LOG, and
 # a failed wifi cutover is reported rather than retried. See the header.
 RESUMED=0
@@ -183,13 +195,27 @@ DEV_KEY_KEPT="${STATE_DIR}/team.dev.pub"
 SETUP_SELF=/usr/local/sbin/robot-setup-board
 MIGRATE_SELF=/usr/local/sbin/robot-migrate-network
 GST_SELF=/usr/local/sbin/robot-setup-gstreamer
-RKAIQ_SELF=/usr/local/sbin/robot-setup-rkaiq
 
 say()  { printf '\033[1m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[33mwarning:\033[0m %s\n' "$*" >&2; }
 die()  { printf '\033[31merror:\033[0m %s\n' "$*" >&2; exit 1; }
 
 # ── helpers ──────────────────────────────────────────────────────────────────
+
+# Record how this run ended; see `OUTCOME`. Nothing without a run id: systemd's resume and a
+# human typing the command have no launcher waiting to read it.
+say_outcome() {
+    OUTCOME_SAID=1
+    [ -n "$RUN_ID" ] || return 0
+    mkdir -p "$STATE_DIR"
+    printf '%s %s\n' "$RUN_ID" "$1" > "$OUTCOME" 2>/dev/null || true
+}
+
+# Whatever exit was not a reboot or a finished phase 2 — a `die`, a Ctrl-C, a failed command
+# under `set -e` — is an ending the launcher must hear about rather than wait out.
+on_exit() {
+    [ -n "$OUTCOME_SAID" ] || say_outcome "ended $1"
+}
 
 # Fetch one sibling script into $2. Unlike the `fetch_cmd` in setup-board.sh, which prints a
 # command for a human, this one runs it.
@@ -452,6 +478,19 @@ EOF
         || die "could not enable ${UNIT_NAME}; nothing would finish this after the reboot"
 }
 
+# Phase 2 run from a terminal, on a board whose phase 1 already ran: in practice a re-run after a
+# phase 2 that failed, since the state file is removed only on success. Its output goes to that
+# terminal, so `$LOG` would still hold the previous attempt in full — which anyone reading it, by
+# hand or through an older `provision-board.sh`, takes for this one. Start it over, with a line
+# saying where this attempt's output went.
+restart_log() {
+    : > "$LOG"
+    chmod 640 "$LOG"
+    chgrp robot "$LOG" 2>/dev/null || true
+    printf '%s phase 2 re-run from a terminal; its output went there, not here\n' \
+        "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$LOG"
+}
+
 # Disabled *before* phase 2 does anything, so there is at most one automatic attempt ever.
 #
 # The unit file stays on disk as a record of what ran. What must not survive is the enablement:
@@ -488,6 +527,7 @@ reboot_now() {
 EOF
     sleep 10
     say "rebooting"
+    say_outcome rebooting
     systemctl reboot
 }
 
@@ -567,15 +607,16 @@ phase_two() {
     #
     # Two files, not one: the script builds an LD_PRELOAD shim from the C source beside it, and
     # fetching the script alone would leave it with nothing to compile.
+    #
+    # Always fetched, never the persisted copy the others prefer. Until 2026-10-17 that copy could
+    # not find its own shim source and died on every run, and a board keeps whichever copy it has
+    # until a release replaces it — so preferring it would leave every board provisioned once
+    # before the fix unable to finish a re-run. Phase 2 needs the network for install.sh anyway.
     if [ -n "$RKAIQ" ] && [ "$RKAIQ" != 0 ]; then
-        if [ -x "$RKAIQ_SELF" ]; then
-            "$RKAIQ_SELF"
-        else
-            tmp=/tmp/setup-rkaiq.sh
-            fetch setup-rkaiq.sh "$tmp"
-            fetch rkaiq-modinfo-shim.c /tmp/rkaiq-modinfo-shim.c
-            sh "$tmp"
-        fi
+        tmp=/tmp/setup-rkaiq.sh
+        fetch setup-rkaiq.sh "$tmp"
+        fetch rkaiq-modinfo-shim.c /tmp/rkaiq-modinfo-shim.c
+        sh "$tmp"
     fi
 
     # This run is what retires the wifi backstop. Left armed, any later boot where wifi is
@@ -775,6 +816,7 @@ ${_stored}"
 finish() {
     rm -f "$STATE"
     say "provisioning complete; removed ${STATE}"
+    say_outcome "done"
 
     _dropin=/etc/systemd/system/updaterd.service.d/token.conf
     if [ -n "$TOKEN" ]; then
@@ -829,6 +871,11 @@ main() {
         say "resumed by systemd after the reboot; logging to ${LOG}"
     fi
 
+    trap 'on_exit $?' EXIT
+    # A signal skips an EXIT trap in dash unless it is turned into an exit first.
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+
     if load_state; then
         if same_boot_as_phase_one; then
             die "phase 1 has run but this board has not rebooted since.
@@ -840,6 +887,9 @@ main() {
     sudo ${SELF}"
         fi
         persist_self
+        if [ "$RESUMED" != 1 ]; then
+            restart_log
+        fi
         phase_two
         return 0
     fi

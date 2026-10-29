@@ -492,6 +492,18 @@ done only when genuinely needed, never unconditionally on every update.
   - **GitHub API** query for the newest tag matching a channel prefix
     (`daemon-v*`) — works with a single shared repo. Preferred if we keep both
     channels in one repo.
+
+  **Decided: the API, by tags.** `updaterd` reads `git/matching-refs/tags/<prefix>` — the
+  channel's tags only, filtered by GitHub — and takes the highest semver whose release exists,
+  is not a draft, and is not flagged prerelease (staging allows the flag). A tag with no release,
+  which is every release while it builds, falls through to the one below; five in a row is
+  reported. It does **not** list releases: that listing carries every dev build with all of its
+  assets, ~35 KB each, so its size follows the repository's activity rather than the channel's.
+  At 67 releases its first page passed the 1 MiB metadata cap and every robot stopped updating
+  (#421). Robots on 0.17.4 and older still read it, 100 per page, and 0.17.5 reads it 20 per
+  page; either breaks again when a page outgrows the cap, and only deleting releases unblocks
+  them. A dev ref never used either list: `--ref <branch>` asks
+  for `releases/tags/daemon-dev-<branch>` directly.
 - CI side: `cargo-dist` can build and publish signed artifacts to GitHub
   Releases; we host manifests as additional assets.
 

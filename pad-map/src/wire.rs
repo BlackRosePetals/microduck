@@ -24,6 +24,11 @@ pub const TOS: u32 = 46 << 2;
 
 const FULL: f64 = 32767.0;
 
+/// `flags` bit 0: the sender plays the triggers' sounds itself, so the robot keeps quiet. RT and
+/// LT still open the mouth — only the quack and the wheee are not played. `duckctl udp-pad` sets
+/// it unless `--robot-sound-on`, since the laptop quacks for it.
+pub const SENDER_SOUNDS: u8 = 1 << 0;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Packet {
     /// +1 per datagram, wrapping. The receiver drops anything not newer than what it has, or
@@ -35,6 +40,8 @@ pub struct Packet {
     /// lx ly rx ry (±32767 is ±1, up positive), lt rt (0..32767 is 0..1).
     pub axes: [i16; 6],
     pub buttons: u16,
+    /// [`SENDER_SOUNDS`]; the other bits are reserved, sent 0 and ignored.
+    pub flags: u8,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,6 +66,7 @@ impl Packet {
         let mut b = [0u8; LEN];
         b[..4].copy_from_slice(&MAGIC);
         b[4] = VERSION;
+        b[5] = self.flags;
         b[6..10].copy_from_slice(&self.seq.to_le_bytes());
         b[10..14].copy_from_slice(&self.t_ms.to_le_bytes());
         for (i, a) in self.axes.iter().enumerate() {
@@ -89,7 +97,13 @@ impl Packet {
             t_ms: u32_at(10),
             axes,
             buttons: u16::from_le_bytes([b[26], b[27]]),
+            flags: b[5],
         })
+    }
+
+    /// Whether the sender plays the trigger sounds, and the robot should not.
+    pub fn sender_sounds(&self) -> bool {
+        self.flags & SENDER_SOUNDS != 0
     }
 
     pub fn held(&self) -> Buttons {
@@ -140,6 +154,7 @@ impl Packet {
                 q(triggers[1], 0.0),
             ],
             buttons: held.0,
+            flags: 0,
         }
     }
 }
@@ -419,6 +434,7 @@ mod tests {
             t_ms: 42,
             axes: [32767, -32767, 0, 100, 32767, 0],
             buttons: 0b1_0100_0001,
+            flags: SENDER_SOUNDS,
         }
     }
 
@@ -441,6 +457,14 @@ mod tests {
         assert_eq!(u32::from_le_bytes(b[10..14].try_into().unwrap()), 42);
         assert_eq!(i16::from_le_bytes([b[14], b[15]]), 32767);
         assert_eq!(u16::from_le_bytes([b[26], b[27]]), 0b1_0100_0001);
+        assert_eq!(b[5], 1, "flags");
+    }
+
+    /// A sender that knows nothing of the flags sends 0, and the robot sounds as it always has.
+    #[test]
+    fn flags_zero_leaves_the_sound_to_the_robot() {
+        assert!(!Packet::default().sender_sounds());
+        assert!(sample().sender_sounds());
     }
 
     #[test]

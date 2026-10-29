@@ -100,6 +100,11 @@ pub struct PadFrame {
     pub has_imu: bool,
 }
 
+/// How far a trigger goes down before it sounds: RT quacks on crossing it, LT rides the wheee
+/// while past it. The prototype's threshold, and `duckctl udp-pad`'s, which plays the same cues
+/// on the laptop it reads the pad from.
+pub const SOUND_THRESHOLD: f64 = 0.3;
+
 /// Everything the mapping reads that is not the pad: the controller sections of `robotd.toml`,
 /// read by [`Config::reload`], and the robot's drive mode, which the daemon asks for.
 #[derive(Debug, Clone)]
@@ -397,7 +402,6 @@ impl Mapper {
         // press, then a hold notification per tick — the robot treats the hold as a level
         // that decays, so a padd that dies mid-ride leaves a ride that lands. Release cuts
         // it instantly, as the prototype does.
-        const SOUND_THRESHOLD: f64 = 0.3;
         if self.prev_rt < SOUND_THRESHOLD && rt >= SOUND_THRESHOLD {
             out.push(Out::Notify(proto::Call::RobotSound(proto::SoundParams {
                 tag: proto::SoundTag::Chirp,

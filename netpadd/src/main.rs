@@ -355,6 +355,9 @@ async fn serve(
             }
             Step::Tick(pad) => {
                 mapper.tick(&pad, &config, now, &mut out, &mut frame);
+                if rx.sender_sounds() {
+                    out.retain(|o| !trigger_sound(o));
+                }
                 for o in out.drain(..) {
                     let result = match &o {
                         Out::Notify(call) => robot.notify(call).await.map(|()| None),
@@ -508,6 +511,19 @@ fn robot_report(
                 ago_ms: now.duration_since(*at).as_millis() as u64,
             }),
     }
+}
+
+/// The quack and the wheee the triggers ask for — what a client that plays them itself
+/// (`wire::SENDER_SOUNDS`) has the robot leave out. The mouth is a separate call and still
+/// opens; the robot's own cues, a client gone and come back, are not the triggers' and still play.
+fn trigger_sound(o: &Out) -> bool {
+    matches!(
+        o,
+        Out::Notify(proto::Call::RobotSound(proto::SoundParams {
+            tag: proto::SoundTag::Chirp | proto::SoundTag::Wheee,
+            ..
+        }))
+    )
 }
 
 /// Play one of the robot's sounds, best effort: a cue, not something worth stopping for.
@@ -756,6 +772,53 @@ mod tests {
                 return Some(s);
             }
         }
+    }
+
+    /// RT and LT pulled, then let go, with `flags` on every datagram; what robotd was sent.
+    async fn triggers(flags: u8) -> Vec<(String, serde_json::Value)> {
+        let (_dir, mut seen, serving, client) = start().await;
+        let mut seq = 1u32;
+        for (ms, t) in [(200, 0.0), (300, 1.0), (200, 0.0)] {
+            let until = tokio::time::Instant::now() + Duration::from_millis(ms);
+            while tokio::time::Instant::now() < until {
+                let mut p = Packet::from_axes(seq, 0, [0.0; 4], [t, t], pad_map::Buttons::NONE);
+                p.flags = flags;
+                client.send(&p.encode()).await.unwrap();
+                seq += 1;
+                tokio::time::sleep(Duration::from_millis(33)).await;
+            }
+        }
+        assert!(!serving.is_finished());
+        drain(&mut seen)
+    }
+
+    /// `SENDER_SOUNDS`: the laptop quacks, so the robot does not — but its mouth still opens.
+    #[tokio::test]
+    async fn a_client_that_plays_the_sounds_keeps_the_mouth_and_drops_the_quack() {
+        let opened = |calls: &[(String, serde_json::Value)]| {
+            calls
+                .iter()
+                .any(|(m, p)| m == "robot.mouth" && p["open"].as_f64() > Some(0.5))
+        };
+        let tags = |calls: &[(String, serde_json::Value)]| -> Vec<String> {
+            calls
+                .iter()
+                .filter(|(m, _)| m == "robot.sound")
+                .filter_map(|(_, p)| p["tag"].as_str().map(str::to_owned))
+                .collect()
+        };
+
+        let robot = triggers(0).await;
+        assert!(opened(&robot), "{robot:?}");
+        let t = tags(&robot);
+        assert!(
+            t.iter().any(|t| t == "chirp") && t.iter().any(|t| t == "wheee"),
+            "{t:?}"
+        );
+
+        let laptop = triggers(pad_map::wire::SENDER_SOUNDS).await;
+        assert!(opened(&laptop), "the mouth still opens: {laptop:?}");
+        assert_eq!(tags(&laptop), Vec::<String>::new(), "no quack, no wheee");
     }
 
     /// Each datagram from the driving client is answered with its seq; a second sender hears

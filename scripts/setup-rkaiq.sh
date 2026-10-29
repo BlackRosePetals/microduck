@@ -100,6 +100,15 @@ done
 HERE="$(cd "$(dirname "$0")" && pwd)"
 SHIM_SRC="${HERE}/rkaiq-modinfo-shim.c"
 
+# The source kept beside the built shim; see below. It is also what the persisted copy in
+# /usr/local/sbin builds from, since nothing puts a C file beside *that*. Without this fallback the
+# copy this script tells people to re-run — and that provision.sh's phase 2 prefers — died on
+# every run, so a board could be provisioned once and never again (2026-10-17).
+SHIM_BUILT_SRC=/usr/local/lib/rkaiq-modinfo-shim.c
+if [ ! -f "$SHIM_SRC" ] && [ -f "$SHIM_BUILT_SRC" ]; then
+    SHIM_SRC="$SHIM_BUILT_SRC"
+fi
+
 # ── the engine and its tuning ─────────────────────────────────────────────────
 
 fetch_deb() {
@@ -211,14 +220,14 @@ fi
 # kernel it was built against: it brute-forces the kernel's struct size at *runtime*, once, on
 # the first intercepted ioctl. It is built on the board because it must be aarch64, which is the
 # only reason.
-SHIM_BUILT_SRC=/usr/local/lib/rkaiq-modinfo-shim.c
 if [ -f "$SHIM_SO" ] && cmp -s "$SHIM_SRC" "$SHIM_BUILT_SRC"; then
     say "the ioctl shim is current"
 else
     say "building the ioctl shim"
     gcc -shared -fPIC -O2 -o "$SHIM_SO" "$SHIM_SRC" -ldl \
         || die "could not build ${SHIM_SRC}"
-    install -m 644 "$SHIM_SRC" "$SHIM_BUILT_SRC"
+    # Not onto itself: `install` refuses a source that is its destination.
+    [ "$SHIM_SRC" = "$SHIM_BUILT_SRC" ] || install -m 644 "$SHIM_SRC" "$SHIM_BUILT_SRC"
 fi
 
 # ── the sensor-mode pin ───────────────────────────────────────────────────────

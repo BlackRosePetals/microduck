@@ -2234,6 +2234,11 @@ pub struct SafetyParams {
     /// longer than a footfall impulse, short enough to leave most of the fall to limp
     /// through.
     pub limp_fall_debounce_ms: u64,
+    /// How long the robot must have stood (inside `limp_fall_tilt_z`) before a fall can
+    /// fire, again after every limp. A fall happens to a robot that was up: without this, a
+    /// robot the limp pose leaves lying on its front at ~58° — not `fallen` — sagging as the
+    /// policy takes it reads as a fall, and limps, poses and limps again.
+    pub limp_fall_arm_ms: u64,
     /// Angular-rate magnitude below which the robot counts as having landed, rad/s.
     pub limp_fall_still_rate: f64,
     /// How long it has to stay that still before the limp ends.
@@ -2294,6 +2299,7 @@ impl Default for SafetyParams {
             limp_fall_predict_z: -0.5,
             limp_fall_lookahead_ms: 300,
             limp_fall_debounce_ms: 60,
+            limp_fall_arm_ms: 200,
             limp_fall_still_rate: 1.0,
             limp_fall_still_ms: 200,
             limp_fall_max_ms: 1500,
