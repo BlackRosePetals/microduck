@@ -278,7 +278,12 @@ pub fn summary(model: &Model) -> Vec<String> {
 pub fn list(path: &Path, json: bool) -> Result<(), String> {
     let model = Model::load(path)?;
     if let Some(note) = ignored_note(&model) {
-        eprintln!("{note}");
+        // Yellow on a terminal, as in the editor: ignored is not an error.
+        if std::io::IsTerminal::is_terminal(&std::io::stderr()) {
+            eprintln!("\x1b[33m{note}\x1b[0m");
+        } else {
+            eprintln!("{note}");
+        }
     }
     let changed: Vec<Row> = model.rows().into_iter().filter(Row::differs).collect();
 
@@ -380,14 +385,21 @@ enum Focus {
 ///
 /// `robot_socket` is only reached for a `[policy]` change, and only if the operator accepts the
 /// reload — the editor is useful on a board where nothing is running.
-/// What to say about keys the file sets and this build does not know — typically left by a
-/// branch the robot ran before. Kept in the file and ignored, exactly as `robotd` does.
+/// What to say about keys the files set and this build does not know — typically left by a
+/// branch the robot ran before. Kept in the file and ignored, exactly as `robotd` does. The
+/// base's are named with the base, since that is the file to open to drop one.
 fn ignored_note(model: &Model) -> Option<String> {
-    let ignored = model.ignored();
-    (!ignored.is_empty()).then(|| {
+    let mut parts = Vec::new();
+    if !model.ignored().is_empty() {
+        parts.push(model.ignored().join(", "));
+    }
+    if let Some((base, keys)) = model.ignored_in_base() {
+        parts.push(format!("{} (in {})", keys.join(", "), base.display()));
+    }
+    (!parts.is_empty()).then(|| {
         format!(
             "ignored, unknown to this build (kept in the file): {}",
-            ignored.join(", ")
+            parts.join("; ")
         )
     })
 }
@@ -407,7 +419,7 @@ pub fn run(path: &Path, robot_socket: &Path) -> Result<(), String> {
         .unwrap_or(0);
     let mut focus = Focus::List;
     let mut saved = false;
-    let mut status: Option<String> = ignored_note(&model);
+    let mut status: Option<String> = None;
 
     let mut terminal = ratatui::init();
     let outcome = loop {
@@ -795,8 +807,13 @@ fn draw(
     focus: &Focus,
     status: Option<&str>,
 ) {
+    // Ignored keys stay on screen in a line of their own, in yellow: they are not an error to
+    // clear with a keypress, and not something this editor can fix.
+    let ignored = ignored_note(model);
+    let footer_height = if ignored.is_some() { 5 } else { 4 };
     let [list_area, footer_area] =
-        Layout::vertical([Constraint::Min(3), Constraint::Length(4)]).areas(frame.area());
+        Layout::vertical([Constraint::Min(3), Constraint::Length(footer_height)])
+            .areas(frame.area());
 
     // The visible window of the list, kept around the cursor.
     let height = list_area.height.saturating_sub(2) as usize;
@@ -880,7 +897,7 @@ fn draw(
     );
 
     // Footer: what the selected key is, and what the keys do — or the active prompt.
-    let footer: Vec<Line> = match focus {
+    let mut footer: Vec<Line> = match focus {
         Focus::Editing { buffer, error } => vec![
             Line::from(format!("new value: {buffer}▏")),
             Line::from(match error {
@@ -943,6 +960,9 @@ fn draw(
             ]
         }
     };
+    if let Some(note) = ignored {
+        footer.insert(0, Line::from(Span::styled(note, Style::new().yellow())));
+    }
     frame.render_widget(
         Paragraph::new(footer).block(Block::default().borders(Borders::ALL)),
         footer_area,

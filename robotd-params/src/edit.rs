@@ -98,6 +98,8 @@ pub struct Model {
     /// Keys in the file this build does not know — left there by another branch or release.
     /// The daemon ignores them, so the editor opens anyway and leaves them in the file.
     ignored: Vec<String>,
+    /// The same, in the base under a user layer — where [`adopt_base_edits`] leaves them.
+    ignored_in_base: Vec<String>,
 }
 
 impl Model {
@@ -109,6 +111,12 @@ impl Model {
     /// Keys in the file this build has no place for, as [`Params::parse`] named them.
     pub fn ignored(&self) -> &[String] {
         &self.ignored
+    }
+
+    /// The base's unknown keys, with the base's path, when the model is over a user layer.
+    pub fn ignored_in_base(&self) -> Option<(&Path, &[String])> {
+        let (base, _) = self.base.as_ref()?;
+        (!self.ignored_in_base.is_empty()).then_some((base.as_path(), &self.ignored_in_base[..]))
     }
 
     /// Load the file — or start from an empty document when there is none, which is a real
@@ -149,13 +157,15 @@ impl Model {
     /// would refuse — because every value this model calls a default comes from it.
     pub fn load_layered(base: &Path, user: &Path) -> Result<Self, String> {
         let base_text = read_or_empty(base)?;
-        let base_params = Params::parse_file(&base_text, base, false).map_err(|e| e.to_string())?;
+        let (base_params, ignored_in_base) =
+            Params::parse(&base_text).map_err(|e| format!("{}: {e}", base.display()))?;
         let base_table: toml::Table = base_text
             .parse()
             .map_err(|e| format!("{}: {e}", base.display()))?;
         let mut model = Self::from_text(user, &read_or_empty(user)?)?;
         model.defaults = toml::Value::try_from(base_params).expect("Params serializes");
         model.base = Some((base.to_path_buf(), base_table));
+        model.ignored_in_base = ignored_in_base;
         Ok(model)
     }
 
@@ -230,6 +240,7 @@ impl Model {
             pending: BTreeMap::new(),
             written: Vec::new(),
             ignored,
+            ignored_in_base: Vec::new(),
         })
     }
 
@@ -936,8 +947,8 @@ fn ever_shipped(key: &str, value: &toml::Value) -> bool {
 ///
 /// What counts as an edit: a key this build knows whose value no release's template ever shipped
 /// ([`EVER_SHIPPED`]). `[board] version` is the installer's and the image's, never adopted. A key
-/// this build does not know is left in the base, where the lenient loader already ignores it — it
-/// cannot go in the user layer, which the editor reads strictly. An owner who had typed exactly a
+/// this build does not know is left in the base, where the loader ignores it and the editor names
+/// it: it is the base's to keep or drop, and no value of it could be checked here. An owner who had typed exactly a
 /// shipped value in is not told apart from the template, and their key goes on following the base;
 /// on a robot without slots that changes nothing.
 ///
@@ -1350,6 +1361,23 @@ mod tests {
         assert!(matches!(m.pending.get("control.hz"), Some(Edit::Clear)));
         m.save().expect("saves");
         assert!(!std::fs::read_to_string(&user).unwrap().contains("hz"));
+    }
+
+    /// A key another branch left in the base is named too, and against the base: adoption leaves
+    /// unknown keys there, so on a layered robot that is where they are.
+    #[test]
+    fn unknown_keys_in_the_base_are_named_with_the_base() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (base, user) = layered(
+            dir.path(),
+            "[policy]\nfootstep_control = true\n",
+            Some("[kazoo]\nvoice = \"alto\"\n"),
+        );
+        let m = Model::load_layered(&base, &user).expect("opens like robotd starts");
+        assert_eq!(m.ignored(), ["[kazoo]"]);
+        let (path, keys) = m.ignored_in_base().expect("the base's are kept apart");
+        assert_eq!(path, base);
+        assert_eq!(keys, ["policy.footstep_control"]);
     }
 
     /// The editor's gate is the loader's: a user layer that would be set aside is never written.
