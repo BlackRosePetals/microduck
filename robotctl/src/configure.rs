@@ -274,6 +274,9 @@ pub fn summary(model: &Model) -> Vec<String> {
 /// lines that matter under the ones that do not.
 pub fn list(path: &Path, json: bool) -> Result<(), String> {
     let model = Model::load(path)?;
+    if let Some(note) = ignored_note(&model) {
+        eprintln!("{note}");
+    }
     let changed: Vec<Row> = model.rows().into_iter().filter(Row::differs).collect();
 
     if json {
@@ -374,6 +377,18 @@ enum Focus {
 ///
 /// `robot_socket` is only reached for a `[policy]` change, and only if the operator accepts the
 /// reload — the editor is useful on a board where nothing is running.
+/// What to say about keys the file sets and this build does not know — typically left by a
+/// branch the robot ran before. Kept in the file and ignored, exactly as `robotd` does.
+fn ignored_note(model: &Model) -> Option<String> {
+    let ignored = model.ignored();
+    (!ignored.is_empty()).then(|| {
+        format!(
+            "ignored, unknown to this build (kept in the file): {}",
+            ignored.join(", ")
+        )
+    })
+}
+
 pub fn run(path: &Path, robot_socket: &Path) -> Result<(), String> {
     // An interactive editor and nothing else: piped in or out, there is no sensible
     // behaviour to fall back to, and ratatui would panic trying to open the terminal.
@@ -389,7 +404,7 @@ pub fn run(path: &Path, robot_socket: &Path) -> Result<(), String> {
         .unwrap_or(0);
     let mut focus = Focus::List;
     let mut saved = false;
-    let mut status: Option<String> = None;
+    let mut status: Option<String> = ignored_note(&model);
 
     let mut terminal = ratatui::init();
     let outcome = loop {

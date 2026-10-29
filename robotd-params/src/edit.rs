@@ -86,12 +86,20 @@ pub struct Model {
     /// the editor has closed — reading `pending` there found nothing every time, so nothing was
     /// ever restarted and a `[duck_detector]` change looked like a no-op.
     written: Vec<String>,
+    /// Keys in the file this build does not know — left there by another branch or release.
+    /// The daemon ignores them, so the editor opens anyway and leaves them in the file.
+    ignored: Vec<String>,
 }
 
 impl Model {
     /// Every key written this session, in the order it was first written.
     pub fn written(&self) -> &[String] {
         &self.written
+    }
+
+    /// Keys in the file this build has no place for, as [`Params::parse`] named them.
+    pub fn ignored(&self) -> &[String] {
+        &self.ignored
     }
 
     /// Load the file — or start from an empty document when there is none, which is a real
@@ -110,8 +118,8 @@ impl Model {
     /// a temporary file for saying what a case is about. [`Model::load`] is this plus the read.
     pub fn from_text(path: &Path, text: &str) -> Result<Self, String> {
         // The daemon's own parse first: a file robotd would refuse is not a file to edit
-        // blind, and the error names the line.
-        toml::from_str::<Params>(text).map_err(|e| format!("{}: {e}", path.display()))?;
+        // blind, and the error names the line. One it would start on, unknown keys and all, is.
+        let (_, ignored) = Params::parse(text).map_err(|e| format!("{}: {e}", path.display()))?;
         let mut doc: DocumentMut = text
             .parse()
             .map_err(|e| format!("{}: {e}", path.display()))?;
@@ -122,6 +130,7 @@ impl Model {
             defaults: toml::Value::try_from(Params::default()).expect("Params serializes"),
             pending: BTreeMap::new(),
             written: Vec::new(),
+            ignored,
         })
     }
 
@@ -197,7 +206,7 @@ impl Model {
     /// defaults, release-relative paths, the mic's mode-dependent switch. Parsed from the
     /// pending state, so flipping `mode` updates every hint that depends on it.
     fn resolved_hint(&self, key: &str) -> Option<String> {
-        let params: Params = toml::from_str(&self.rendered()).ok()?;
+        let (params, _) = Params::parse(&self.rendered()).ok()?;
         let policy = params.policy.resolved();
         let path = |p: Option<std::path::PathBuf>| {
             Some(match p {
@@ -646,8 +655,8 @@ pub fn pad_bindings(path: &Path) -> Result<crate::PadParams, String> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(e) => return Err(format!("cannot read {}: {e}", path.display())),
     };
-    toml::from_str::<Params>(&text)
-        .map(|params| params.pad)
+    Params::parse(&text)
+        .map(|(params, _)| params.pad)
         .map_err(|e| format!("{}: {e}", path.display()))
 }
 
@@ -888,6 +897,33 @@ mod tests {
             "the comments are gone: {} lines",
             text.lines().count()
         );
+    }
+
+    /// A key another branch left behind — `policy.footstep_control`, a whole `[kazoo]` — does
+    /// not stop the editor opening a file `robotd` itself starts on. The keys are named, an edit
+    /// beside them saves, and they are still in the file for the branch that reads them.
+    #[test]
+    fn keys_from_another_branch_are_ignored_and_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("robotd.toml");
+        std::fs::write(
+            &path,
+            "[policy]\nmode = \"walk\"\nfootstep_control = true\n\n\
+             [kazoo]\nvoice = \"alto\"\n\n[pad]\nx = \"polite-bow\"\n",
+        )
+        .unwrap();
+
+        let mut m = Model::load(&path).expect("opens like robotd starts");
+        assert_eq!(m.ignored(), ["[kazoo]", "policy.footstep_control"]);
+        m.edit(entry("audio.enabled"), "false").expect("edits");
+        m.save().expect("saves");
+
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(written.contains("footstep_control = true"), "{written}");
+        assert!(written.contains("voice = \"alto\""), "{written}");
+        assert!(!Params::load(&path, true).unwrap().audio.enabled);
+        // The bindings robotd serves over `pad.bind` are the file's, not the defaults.
+        assert_eq!(super::pad_bindings(&path).unwrap().x, "polite-bow");
     }
 
     /// The shipped example loads into the editor, and every value it does set explicitly is
