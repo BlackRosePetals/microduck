@@ -118,11 +118,7 @@ pub struct ConfigStamp {
 /// A user layer that does not parse is left out, as [`Params::load`] leaves it out. `Ok("")`
 /// when neither file exists.
 pub fn layered_text(path: &Path) -> Result<String, String> {
-    let read = |p: &Path| match std::fs::read_to_string(p) {
-        Ok(text) => Ok(Some(text)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(format!("cannot read {}: {e}", p.display())),
-    };
+    let read = |p: &Path| read_optional(p).map_err(|e| format!("cannot read {}: {e}", p.display()));
     let base = read(path)?.unwrap_or_default();
     let Some(user) = user_layer_for(path)
         .map(|u| read(&u))
@@ -137,6 +133,15 @@ pub fn layered_text(path: &Path) -> Result<String, String> {
     match user.parse::<toml::Table>() {
         Ok(user_table) => Ok(merge_layers(base_table, user_table).to_string()),
         Err(_) => Ok(base),
+    }
+}
+
+/// A file's text, or `None` when there is no file — a real state for either layer.
+fn read_optional(path: &Path) -> std::io::Result<Option<String>> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(Some(text)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
     }
 }
 
@@ -2671,31 +2676,21 @@ impl Params {
     /// this before renaming it into place, so nothing it writes is a layer the daemon would set
     /// aside.
     pub fn with_user_layer(base: &Path, user: &Path) -> Result<Option<Self>, ParamsError> {
-        let user_text = match std::fs::read_to_string(user) {
-            Ok(text) => text,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(source) => {
-                return Err(ParamsError::Read {
-                    path: user.display().to_string(),
-                    source,
-                });
-            }
+        let read = |path: &Path| {
+            read_optional(path).map_err(|source| ParamsError::Read {
+                path: path.display().to_string(),
+                source,
+            })
+        };
+        let Some(user_text) = read(user)? else {
+            return Ok(None);
         };
         // The user layer on its own first, so a syntax error or a wrong type is reported against
         // the file somebody edited, with its own line and column — not against a merged document
         // nobody has ever seen. Not validated alone: a partial file is not a robot, and the
         // cross-key checks need the base's values.
         Self::parse(&user_text, user, false)?;
-        let base_text = match std::fs::read_to_string(base) {
-            Ok(text) => text,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-            Err(source) => {
-                return Err(ParamsError::Read {
-                    path: base.display().to_string(),
-                    source,
-                });
-            }
-        };
+        let base_text = read(base)?.unwrap_or_default();
         let table = |text: &str, path: &Path| {
             text.parse::<toml::Table>()
                 .map_err(|source| ParamsError::Parse {

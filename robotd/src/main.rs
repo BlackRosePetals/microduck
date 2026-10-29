@@ -1031,10 +1031,9 @@ async fn main() -> ExitCode {
         .params
         .clone()
         .unwrap_or_else(|| PathBuf::from(params::DEFAULT_PATH));
-    // Before the load, and here rather than in any other daemon: robotd is the first thing a
-    // release starts that writes this file, and a phone's edit saved before the adoption ran
-    // would create the user layer and make the old edits look adopted. Only where there is a
-    // `/var/lib/robot` — on a laptop running the default path there is nothing to adopt into.
+    // At startup as well as on the first edit, so the old edits move to the layer an OS update
+    // keeps even on a robot nobody edits. Only where there is a `/var/lib/robot` — on a laptop
+    // running the default path there is nothing to adopt into.
     if let Some(user) = params::user_layer_for(&params_path)
         && user.parent().is_some_and(std::path::Path::is_dir)
     {

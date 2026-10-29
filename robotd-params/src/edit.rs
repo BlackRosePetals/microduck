@@ -563,6 +563,10 @@ impl Model {
     /// whatever the file says.
     pub fn save(&mut self) -> Result<(), String> {
         let lock = lock(&self.path)?;
+        // Before the re-read below, so the edits are rebased onto whatever adoption copied.
+        if let Some((base, _)) = &self.base {
+            adopt_locked(&lock, base, &self.path)?;
+        }
         if let Ok(fresh) = std::fs::read_to_string(&self.path)
             && let Ok(mut doc) = fresh.parse::<DocumentMut>()
         {
@@ -630,11 +634,21 @@ fn written_path(path: &Path) -> PathBuf {
 
 /// A file's text, or nothing when there is no file.
 fn read_or_empty(path: &Path) -> Result<String, String> {
-    match std::fs::read_to_string(path) {
-        Ok(text) => Ok(text),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
-        Err(e) => Err(format!("cannot read {}: {e}", path.display())),
+    crate::read_optional(path)
+        .map(Option::unwrap_or_default)
+        .map_err(|e| format!("cannot read {}: {e}", path.display()))
+}
+
+/// The lock for an edit to the config at `path`, with any old edits adopted under it
+/// ([`adopt_base_edits`]) — so this edit cannot be the one that creates the user layer and
+/// strands them in the base.
+fn lock_for_edit(path: &Path) -> Result<Lock, String> {
+    let written = written_path(path);
+    let lock = lock(&written)?;
+    if written != path {
+        adopt_locked(&lock, path, &written)?;
     }
+    Ok(lock)
 }
 
 /// Take it.
@@ -665,7 +679,7 @@ fn lock(path: &Path) -> Result<Lock, String> {
 /// as a keyed edit and so cannot be rebased the way [`Model::save`] rebases one. `robotctl
 /// policy add` and `robot.setSkill` both come through here.
 pub fn set_skill(path: &Path, skill: &crate::SkillDef) -> Result<(), String> {
-    let lock = lock(&written_path(path))?;
+    let lock = lock_for_edit(path)?;
     let mut model = Model::load(path)?;
     model.put_skill(skill)?;
     let text = model.doc.to_string();
@@ -675,7 +689,7 @@ pub fn set_skill(path: &Path, skill: &crate::SkillDef) -> Result<(), String> {
 /// Take a skill out of the table. `false` if there was none, which is not a failure — it is the
 /// answer to "is this robot's own back", and the caller says so differently.
 pub fn remove_skill(path: &Path, name: &str) -> Result<bool, String> {
-    let lock = lock(&written_path(path))?;
+    let lock = lock_for_edit(path)?;
     let mut model = Model::load(path)?;
     if !model.drop_skill(name)? {
         return Ok(false);
@@ -890,8 +904,15 @@ fn ever_shipped(key: &str, value: &toml::Value) -> bool {
 /// on a robot without slots that changes nothing.
 ///
 /// The user layer is written even when nothing is copied, so the question is asked once.
+///
+/// `robotd` calls this at startup, and every writer calls it under its own hold of the lock
+/// before its first write: whichever runs first, no edit can create the user layer ahead of it.
 pub fn adopt_base_edits(base: &Path, user: &Path) -> Result<Vec<String>, String> {
-    let lock = lock(user)?;
+    adopt_locked(&lock(user)?, base, user)
+}
+
+/// [`adopt_base_edits`], for a caller already holding the user layer's lock.
+fn adopt_locked(lock: &Lock, base: &Path, user: &Path) -> Result<Vec<String>, String> {
     match user.try_exists() {
         Ok(false) => {}
         Ok(true) => return Ok(Vec::new()),
@@ -920,7 +941,7 @@ pub fn adopt_base_edits(base: &Path, user: &Path) -> Result<Vec<String>, String>
         },
     );
     let model = Model::load_layered(base, user)?;
-    model.write_through(&lock, &format!("{header}{picked}"))?;
+    model.write_through(lock, &format!("{header}{picked}"))?;
     Ok(keys)
 }
 
@@ -1176,7 +1197,9 @@ mod tests {
         let mut m = Model::load_layered(&base, &user).expect("loads");
         m.edit(entry("control.hz"), "0").expect("row-level ok");
         assert!(m.save().is_err());
-        assert!(!user.exists(), "nothing written");
+        // The adoption before the write did run and wrote its (empty) layer; the edit did not.
+        let written = std::fs::read_to_string(&user).expect("adopted");
+        assert!(!written.contains("hz"), "nothing of the edit: {written}");
         assert!(
             !user.with_extension("toml.new").exists(),
             "nothing staged left behind"
@@ -1275,6 +1298,22 @@ mod tests {
             .find(|r| r.entry.key == "control.hz")
             .unwrap();
         assert!(hz.overridden());
+    }
+
+    /// An edit made before `robotd` ever adopted — `robotctl configure` with the daemon stopped —
+    /// must not create the user layer over the old edits and strand them in the base.
+    #[test]
+    fn the_first_edit_adopts_the_old_edits_before_writing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (base, user) = layered(dir.path(), "[control]\nhz = 100\n", None);
+        let mut m = Model::load_layered(&base, &user).expect("loads");
+        m.edit(entry("policy.gain"), "150").expect("valid");
+        m.save().expect("saves");
+        let p = Params::load_layered(&base, &user, true).unwrap();
+        assert_eq!(p.control.hz, 100, "the old edit, adopted");
+        assert_eq!(p.policy.gain, 150, "and the new one");
+        let written = std::fs::read_to_string(&user).unwrap();
+        assert!(written.contains("hz = 100"), "in the user layer: {written}");
     }
 
     /// Once there is a user layer, this never runs again — not over the owner's later edits.

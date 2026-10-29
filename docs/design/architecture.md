@@ -124,8 +124,8 @@ anything an *owner* decides lives there, and anything the *image* decides stays 
   The editors validate a user layer against its base before writing it, so only a hand edit can
   produce one.
 - **A robot that predates the layers has its edits in the base**, mixed in with the template it
-  was installed from. The first time `robotd` starts with no user layer, it *copies* the keys
-  somebody changed into a new one (`robotd_params::edit::adopt_base_edits`): a known key whose
+  was installed from. The first time `robotd` starts with no user layer — or an editor writes
+  one, whichever comes first — the keys somebody changed are *copied* into a new one (`robotd_params::edit::adopt_base_edits`): a known key whose
   value no release's template ever shipped live, never `[board] version`. The base is left as it
   was, so a rollback to a release without layers finds the robot unchanged. On an A/B robot this
   only saves the edits if the release reaches the robot as a daemon update before its next OS
